@@ -52,10 +52,12 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | FR-3.1 | Shell execution with SafePolicy | Done |
 | FR-3.2 | File read/write/edit operations | Done |
 | FR-3.3 | Glob and grep search | Done |
+| FR-3.3b | Directory listing | Done |
 | FR-3.4 | Web search and fetch | Done |
 | FR-3.5 | Cross-channel messaging | Done |
 | FR-3.6 | Background subagent spawning | Done |
-| FR-3.7 | Cron job scheduling | Done |
+| FR-3.7 | Cron job scheduling (interval, one-shot, cron expressions) | Done |
+| FR-3.7b | Cron enable/disable | Done |
 | FR-3.8 | Task delegation (coordinator mode) | Done |
 | FR-3.9 | Parallel batch delegation | Done |
 
@@ -84,13 +86,15 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | FR-5.5 | Recent memory (7-day window) | Done |
 | FR-5.6 | Bootstrap files (AGENTS.md, SOUL.md, USER.md, TOOLS.md, IDENTITY.md) | Done |
 | FR-5.7 | Skills system (SKILL.md with YAML frontmatter) | Done |
+| FR-5.8 | Built-in skills (cron, github, skill-creator, summarize, tmux, weather) | Done |
 
 ### FR-6: Infrastructure
 
 | ID | Requirement | Status |
 |----|-------------|--------|
 | FR-6.1 | Heartbeat service (periodic HEARTBEAT.md check) | Done |
-| FR-6.2 | Cron scheduler (every/at schedules) | Done |
+| FR-6.2 | Cron scheduler (every/at/cron expression schedules) | Done |
+| FR-6.5 | Config migration framework (versioned) | Done |
 | FR-6.3 | Message bus (mpsc channels) | Done |
 | FR-6.4 | Session persistence (JSONL) | Done |
 
@@ -107,6 +111,8 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | FR-7.7 | `crew list` - list resumable tasks | Done |
 | FR-7.8 | `crew clean` - cleanup state files | Done |
 | FR-7.9 | Shell completions (bash/zsh/fish/powershell) | Done |
+| FR-7.10 | `crew cron` - cron job management (list/add/remove/enable) | Done |
+| FR-7.11 | `crew channels status` - channel status display | Done |
 
 ## Non-Functional Requirements
 
@@ -137,7 +143,7 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 ### Completed
 - [x] Core type system and task model
 - [x] 4 native LLM providers + 8 OpenAI-compatible
-- [x] 13 built-in tools
+- [x] 14 built-in tools
 - [x] 6 messaging channels
 - [x] Memory system (episodic + daily + long-term + bootstrap)
 - [x] Skills system
@@ -146,9 +152,13 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 - [x] System status command
 - [x] Provider auto-detect
 - [x] Coordinator/worker pattern
+- [x] Cron expression support (`"0 9 * * *"`)
+- [x] Cron CLI subcommands (list/add/remove/enable)
+- [x] Channels CLI subcommands (status)
+- [x] Built-in skills (6 bundled)
+- [x] Config migration framework
 
 ### Planned
-- [ ] Cron expression support (`"0 9 * * *"`)
 - [ ] Telegram media handling (photos, voice)
 - [ ] MCP server mode
 - [ ] Streaming responses

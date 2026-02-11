@@ -72,18 +72,18 @@ Agent runtime and tool system.
 - `with_coordinator_tools()` - Adds delegate_task/delegate_batch
 - `register_arc()` - For tools needing shared references (message, spawn)
 
-**Built-in tools** (13):
+**Built-in tools** (14):
 
 | Category | Tools |
 |----------|-------|
 | File ops | read_file, write_file, edit_file |
-| Search | glob, grep |
+| Search | glob, grep, list_dir |
 | Execution | shell (with SafePolicy) |
 | Web | web_search, web_fetch |
 | Gateway | message, spawn, cron |
 | Coordination | delegate_task, delegate_batch |
 
-**Skills**: Markdown files with YAML frontmatter, loaded from `.crew/skills/`. Support `always: true` for auto-inclusion in system prompt.
+**Skills**: Markdown files with YAML frontmatter, loaded from `.crew/skills/`. Support `always: true` for auto-inclusion in system prompt. 6 built-in skills bundled at compile time via `include_str!()` (cron, github, skill-creator, summarize, tmux, weather). Workspace skills override built-ins with the same name.
 
 ### crew-bus
 
@@ -109,7 +109,7 @@ pub trait Channel: Send + Sync {
 
 **SessionManager**: JSONL persistence at `.crew/sessions/{key}.jsonl`. In-memory cache with disk sync.
 
-**CronService**: JSON persistence, supports `Every` (interval) and `At` (one-shot) schedules. Timer-based execution.
+**CronService**: JSON persistence, supports `Every` (interval), `At` (one-shot), and `Cron` (cron expression via `cron` crate) schedules. Timer-based execution. Supports enable/disable per job.
 
 **HeartbeatService**: Periodic check of HEARTBEAT.md (default: 30 min). Sends to agent if non-empty.
 
@@ -117,9 +117,9 @@ pub trait Channel: Send + Sync {
 
 CLI interface and configuration.
 
-**Commands**: chat, init, run, resume, list, status, gateway, clean, completions
+**Commands**: chat, init, run, resume, list, status, gateway, clean, completions, cron (list/add/remove/enable), channels (status)
 
-**Config**: Loaded from `.crew/config.json` or `~/.config/crew/config.json`. Supports `${VAR}` expansion. Provider auto-detect via `detect_provider()`.
+**Config**: Loaded from `.crew/config.json` or `~/.config/crew/config.json`. Supports `${VAR}` expansion. Provider auto-detect via `detect_provider()`. Versioned config with automatic migration framework (`migrate_config()`).
 
 ## Data Flows
 
@@ -189,8 +189,9 @@ crates/
 ├── crew-memory/src/
 │   ├── lib.rs, episode.rs, store.rs, task_store.rs, memory_store.rs
 ├── crew-agent/src/
-│   ├── lib.rs, agent.rs, progress.rs, policy.rs, skills.rs
-│   └── tools/ (mod, shell, read_file, write_file, edit_file,
+│   ├── lib.rs, agent.rs, progress.rs, policy.rs, skills.rs, builtin_skills.rs
+│   ├── skills/ (cron, github, skill-creator, summarize, tmux, weather SKILL.md)
+│   └── tools/ (mod, shell, read_file, write_file, edit_file, list_dir,
 │               glob_tool, grep_tool, web_search, web_fetch,
 │               delegate, delegate_batch, message, spawn)
 ├── crew-bus/src/
@@ -201,7 +202,7 @@ crates/
 └── crew-cli/src/
     ├── main.rs, config.rs, cron_tool.rs
     └── commands/ (mod, chat, init, run, resume, list, status,
-                   gateway, clean, completions)
+                   gateway, clean, completions, cron, channels)
 ```
 
 ## Security
@@ -213,7 +214,7 @@ crates/
 
 ## Testing
 
-130+ tests across all crates. Categories:
+133+ tests across all crates. Categories:
 - Unit: type serde, tool arg parsing, config validation, provider detection
 - Integration: CLI commands, file tools, session persistence, cron jobs
 - Channel: allowed_senders, message parsing, dedup logic

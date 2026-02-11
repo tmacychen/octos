@@ -303,6 +303,11 @@ crew resume [task-id]          # Resume interrupted task
 crew list                      # List resumable tasks
 crew clean [--all] [--dry-run] # Clean state files
 crew completions <shell>       # Generate completions (bash/zsh/fish/powershell)
+crew cron list [--all]         # List cron jobs
+crew cron add [OPTIONS]        # Add a cron job
+crew cron remove <job-id>      # Remove a cron job
+crew cron enable <job-id>      # Enable/disable a cron job
+crew channels status           # Show channel compile/config status
 ```
 
 ---
@@ -426,11 +431,39 @@ Use `allowed_senders` to restrict access. Empty list = allow all.
 
 The agent can schedule recurring tasks via the `cron` tool:
 
-- `add` - Create a scheduled job with `every_seconds` or `at` timestamp
+- `add` - Create a scheduled job with `every_seconds`, `cron_expr`, or `at` timestamp
 - `list` - Show all scheduled jobs
 - `remove` - Delete a job by ID
+- `enable` / `disable` - Toggle job active state
+
+Cron expressions use standard syntax (e.g., `"0 0 9 * * * *"` for daily at 9am).
 
 Cron jobs send messages through the bus and can deliver responses to any channel.
+
+#### Cron CLI
+
+Manage jobs directly from the command line (no running gateway needed):
+
+```bash
+crew cron list                          # List active jobs
+crew cron list --all                    # Include disabled
+crew cron add --name "report" --message "Generate daily report" --cron "0 0 9 * * * *"
+crew cron add --name "check" --message "Check status" --every 3600
+crew cron add --name "once" --message "Run migration" --at "2025-03-01T09:00:00Z"
+crew cron remove <job-id>
+crew cron enable <job-id>               # Enable
+crew cron enable <job-id> --disable     # Disable
+```
+
+### Channel Status
+
+Check configured channels and their compile/config status:
+
+```bash
+crew channels status
+```
+
+Shows a table with channel name, compile status (feature flags), and config summary (env vars set/missing).
 
 ### Heartbeat
 
@@ -478,6 +511,21 @@ Your skill content here...
 
 Skills with `always: true` are included in every prompt. Others are available for the agent to read on demand.
 
+### Built-in Skills
+
+crew-rs bundles 6 skills at compile time. These are available without any setup:
+
+| Skill | Description | Requirements |
+|-------|-------------|-------------|
+| cron | Cron tool usage examples | (none, always-on) |
+| github | gh CLI patterns (PR, issue, API) | `gh` binary |
+| skill-creator | How to create custom skills | (none) |
+| summarize | URL/file summarization | `summarize` binary |
+| tmux | tmux session automation | `tmux` binary |
+| weather | Weather via wttr.in | `curl` binary |
+
+Workspace skills in `.crew/skills/` override built-in skills with the same name.
+
 ---
 
 ## Task Management
@@ -496,7 +544,8 @@ crew run "goal" → Task created → Agent loop → State saved each iteration
 
 ```
 .crew/
-├── config.json          # Configuration
+├── config.json          # Configuration (versioned, auto-migrated)
+├── cron.json            # Cron job store
 ├── AGENTS.md            # Agent instructions
 ├── SOUL.md              # Personality
 ├── USER.md              # User info

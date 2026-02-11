@@ -10,12 +10,13 @@ Rust-native AI agent framework with multi-channel gateway, 12+ LLM providers, an
 - **Task execution**: Run coding tasks with coordinator/worker pattern
 - **Resumable tasks**: Interrupt with Ctrl+C and resume later
 - **Memory system**: Episodic memory, daily notes, long-term memory, bootstrap files
-- **Skills system**: Markdown-based skills with YAML frontmatter
-- **Cron & heartbeat**: Scheduled tasks and periodic background checks
+- **Skills system**: Markdown-based skills with YAML frontmatter + 6 built-in skills
+- **Cron & heartbeat**: Scheduled tasks (interval, one-shot, cron expressions) and periodic background checks
 - **Subagent spawning**: Background agents for long-running tasks
 - **Cross-channel messaging**: Send messages across any connected channel
 - **Provider auto-detect**: Automatically selects provider from model name
-- **Built-in tools**: Shell, file ops, glob, grep, web search/fetch, message, spawn, cron
+- **Built-in tools**: Shell, file ops, glob, grep, list_dir, web search/fetch, message, spawn, cron
+- **Config migration**: Versioned config with automatic migration
 
 ## Installation
 
@@ -109,6 +110,28 @@ crew status              # System status (config, API keys, bootstrap files)
 crew status abc123       # Task details
 ```
 
+### `crew cron`
+
+Manage scheduled cron jobs directly:
+
+```bash
+crew cron list                          # List active jobs
+crew cron list --all                    # Include disabled jobs
+crew cron add --name "daily" --message "Run report" --cron "0 0 9 * * * *"
+crew cron add --name "check" --message "Check status" --every 3600
+crew cron remove <job-id>
+crew cron enable <job-id>               # Enable a job
+crew cron enable <job-id> --disable     # Disable a job
+```
+
+### `crew channels status`
+
+Show configured gateway channels and their compile/config status:
+
+```bash
+crew channels status
+```
+
 ### Other Commands
 
 ```bash
@@ -192,6 +215,7 @@ crew-rs/
 | `edit_file` | Edit files with search/replace |
 | `glob` | Find files by pattern |
 | `grep` | Search file contents (regex) |
+| `list_dir` | List directory contents |
 | `web_search` | Internet search |
 | `web_fetch` | Fetch and parse web content |
 | `message` | Send cross-channel messages |
@@ -215,7 +239,7 @@ crew-rs/
 
 ```bash
 cargo build --workspace           # Build
-cargo test --workspace            # Test (130+ tests)
+cargo test --workspace            # Test (133+ tests)
 cargo clippy --workspace          # Lint
 cargo fmt --all                   # Format
 ```
