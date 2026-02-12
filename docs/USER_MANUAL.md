@@ -53,10 +53,16 @@ cd crew-rs
 cargo install --path crates/crew-cli
 
 # With messaging channels
-cargo install --path crates/crew-cli --features telegram,discord,slack,whatsapp,feishu
+cargo install --path crates/crew-cli --features telegram,discord,slack,whatsapp,feishu,email
 
 # Verify
 crew --version
+```
+
+### Docker
+
+```bash
+docker compose --profile gateway up -d
 ```
 
 ### API Keys
@@ -69,6 +75,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export OPENAI_API_KEY="sk-..."
 
 # Or any other supported provider (see Providers section)
+# Or use OAuth: crew auth login --provider openai
 ```
 
 Add to `~/.bashrc` or `~/.zshrc` for persistence.
@@ -274,7 +281,34 @@ crew cron add [OPTIONS]        # Add a cron job
 crew cron remove <job-id>      # Remove a cron job
 crew cron enable <job-id>      # Enable/disable a cron job
 crew channels status           # Show channel compile/config status
+crew channels login            # WhatsApp QR code login
 ```
+
+### `crew auth`
+
+OAuth login and API key management.
+
+```bash
+crew auth login --provider openai           # PKCE browser OAuth
+crew auth login --provider openai --device-code  # Device code flow
+crew auth login --provider anthropic        # Paste-token (stdin)
+crew auth logout --provider openai          # Remove stored credential
+crew auth status                            # Show authenticated providers
+```
+
+Credentials are stored in `~/.crew/auth.json` (file mode 0600). The auth store is checked before environment variables when resolving API keys.
+
+### `crew skills`
+
+Manage skills.
+
+```bash
+crew skills list                            # List installed skills
+crew skills install user/repo/skill-name    # Install from GitHub
+crew skills remove skill-name               # Remove a skill
+```
+
+Fetches `SKILL.md` from the GitHub repo's main branch and installs to `.crew/skills/`.
 
 ---
 
@@ -383,6 +417,42 @@ export FEISHU_APP_SECRET="..."
 Config:
 ```json
 {"type": "feishu", "settings": {"app_id_env": "FEISHU_APP_ID", "app_secret_env": "FEISHU_APP_SECRET"}}
+```
+
+#### Email (IMAP/SMTP)
+
+Requires IMAP for inbound and SMTP for outbound. Feature-gated behind `email`.
+
+Config:
+```json
+{
+  "type": "email",
+  "allowed_senders": ["trusted@example.com"],
+  "settings": {
+    "imap_host": "imap.gmail.com",
+    "imap_port": 993,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 465,
+    "username_env": "EMAIL_USERNAME",
+    "password_env": "EMAIL_PASSWORD",
+    "from_address": "bot@example.com",
+    "poll_interval_secs": 30,
+    "max_body_chars": 10000
+  }
+}
+```
+
+```bash
+export EMAIL_USERNAME="bot@example.com"
+export EMAIL_PASSWORD="app-specific-password"
+```
+
+### Voice Transcription
+
+When `GROQ_API_KEY` is set, voice and audio messages from channels are automatically transcribed using Groq Whisper before being sent to the agent. The transcription is prepended as `[transcription: ...]`.
+
+```bash
+export GROQ_API_KEY="gsk_..."
 ```
 
 ### Access Control
@@ -568,3 +638,5 @@ RUST_LOG=crew_agent=trace crew chat --message "task"
 | `SLACK_APP_TOKEN` | Slack app-level token |
 | `FEISHU_APP_ID` | Feishu app ID |
 | `FEISHU_APP_SECRET` | Feishu app secret |
+| `EMAIL_USERNAME` | Email account username |
+| `EMAIL_PASSWORD` | Email account password |

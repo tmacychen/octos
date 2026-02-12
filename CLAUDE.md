@@ -31,6 +31,10 @@ crew-memory   crew-llm  (redb episodes + memory store | LLM providers)
 
 crew-bus (Message bus, channels, sessions, cron, heartbeat) sits alongside crew-agent.
 
+Commands: chat, init, status, gateway, clean, completions, cron, channels, auth (login/logout/status), skills (list/install/remove).
+
+Auth module (`crew-cli/src/auth/`): OAuth PKCE + device code for OpenAI, paste-token for others. Stored in `~/.crew/auth.json`. `config.rs` checks auth store before env vars.
+
 ### Key Flow: Agent Loop (`crew-agent/src/agent.rs`)
 
 1. Build messages (system prompt + conversation history + memory context)
@@ -65,5 +69,6 @@ All tools implement `Tool` trait (`spec() -> ToolSpec`, `execute(&Value) -> Tool
 - `eyre`/`color-eyre` for error handling (not `anyhow`)
 - `Arc<dyn Trait>` for shared providers/tools/reporters
 - `AtomicBool` for shutdown signaling
-- API keys always from env vars via `api_key_env` config field
+- API keys from env vars via `api_key_env` or OAuth via `crew auth login`
+- Email channel feature-gated: `async-imap` + `lettre` + `mailparse`
 - `ShellTool` has `SafePolicy` that denies dangerous commands (rm -rf /, dd, mkfs, fork bomb)

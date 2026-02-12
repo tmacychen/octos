@@ -30,7 +30,7 @@ RUN cargo build --release --bin crew 2>/dev/null || true
 COPY . .
 RUN touch crates/*/src/*.rs && \
     cargo build --release --bin crew \
-      --features telegram,discord,slack,whatsapp,feishu
+      --features telegram,discord,slack,whatsapp,feishu,email
 
 # ============================================================
 # Stage 2: Minimal runtime image

@@ -5,17 +5,23 @@ Rust-native AI agent framework with multi-channel gateway, 12+ LLM providers, an
 ## Features
 
 - **12+ LLM providers**: Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, Moonshot, DashScope, MiniMax, Zhipu, Ollama, vLLM
-- **Multi-channel gateway**: CLI, Telegram, Discord, Slack, WhatsApp, Feishu/Lark
+- **Multi-channel gateway**: CLI, Telegram, Discord, Slack, WhatsApp, Feishu/Lark, Email (IMAP/SMTP)
+- **OAuth login**: `crew auth login` with PKCE browser flow, device code flow, or paste-token
+- **Vision support**: Send images to vision-capable LLMs (Anthropic, OpenAI, Gemini, OpenRouter)
+- **Voice transcription**: Groq Whisper auto-transcription for voice messages
+- **Media handling**: Auto-download photos, voice, audio, documents from channels
 - **Interactive chat**: Multi-turn conversation with readline history
 - **Single-message mode**: Non-interactive `crew chat --message "..."` for scripting
 - **Memory system**: Episodic memory, daily notes, long-term memory, bootstrap files
 - **Skills system**: Markdown-based skills with YAML frontmatter + 6 built-in skills
+- **Skill install**: Install skills from GitHub repos with `crew skills install`
 - **Cron & heartbeat**: Scheduled tasks (interval, one-shot, cron expressions) and periodic background checks
 - **Subagent spawning**: Background agents for long-running tasks
 - **Cross-channel messaging**: Send messages across any connected channel
 - **Provider auto-detect**: Automatically selects provider from model name
 - **Built-in tools**: Shell, file ops, glob, grep, list_dir, web search/fetch, message, spawn, cron
 - **Config migration**: Versioned config with automatic migration
+- **Docker deployment**: Multi-stage Dockerfile + docker-compose for gateway and agent profiles
 
 ## Installation
 
@@ -24,11 +30,14 @@ Rust-native AI agent framework with multi-channel gateway, 12+ LLM providers, an
 cargo install --path crates/crew-cli
 
 # With channel support
-cargo install --path crates/crew-cli --features telegram,discord,slack
+cargo install --path crates/crew-cli --features telegram,discord,slack,email
 
 # Or build locally
 cargo build --release
 ./target/release/crew --help
+
+# Docker
+docker compose --profile gateway up -d
 ```
 
 ## Quick Start
@@ -37,8 +46,9 @@ cargo build --release
 # Initialize configuration and workspace
 crew init
 
-# Set your API key
+# Set your API key (or use OAuth login)
 export ANTHROPIC_API_KEY=your-key-here
+# Or: crew auth login -p anthropic
 
 # Interactive chat
 crew chat
@@ -110,6 +120,28 @@ crew cron add --name "check" --message "Check status" --every 3600
 crew cron remove <job-id>
 crew cron enable <job-id>               # Enable a job
 crew cron enable <job-id> --disable     # Disable a job
+```
+
+### `crew auth`
+
+OAuth login and API key management:
+
+```bash
+crew auth login --provider openai         # PKCE browser OAuth flow
+crew auth login --provider openai --device-code  # Device code flow
+crew auth login --provider anthropic      # Paste-token flow
+crew auth logout --provider openai        # Remove stored credential
+crew auth status                          # Show authenticated providers
+```
+
+### `crew skills`
+
+Manage skills:
+
+```bash
+crew skills list                          # List installed skills
+crew skills install user/repo/skill-name  # Install from GitHub
+crew skills remove skill-name             # Remove a skill
 ```
 
 ### `crew channels status`
@@ -218,12 +250,13 @@ crew-rs/
 | Slack | `slack` | WebSocket (Socket Mode) |
 | WhatsApp | `whatsapp` | WebSocket (Node.js bridge) |
 | Feishu/Lark | `feishu` | WebSocket + REST |
+| Email | `email` | IMAP polling + SMTP |
 
 ## Development
 
 ```bash
 cargo build --workspace           # Build
-cargo test --workspace            # Test (129+ tests)
+cargo test --workspace            # Test (133+ tests)
 cargo clippy --workspace          # Lint
 cargo fmt --all                   # Format
 ```

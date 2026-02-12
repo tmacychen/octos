@@ -70,6 +70,10 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | FR-4.7 | Access control (allowed_senders) | Done |
 | FR-4.8 | Session management per channel:chat_id | Done |
 | FR-4.9 | Outbound message dispatch | Done |
+| FR-4.10 | Email channel (IMAP/SMTP) | Done |
+| FR-4.11 | Media download from channels | Done |
+| FR-4.12 | Voice transcription (Groq Whisper) | Done |
+| FR-4.13 | Vision support (image to LLM) | Done |
 
 ### FR-5: Memory & Context
 
@@ -106,6 +110,9 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | FR-7.9 | Shell completions (bash/zsh/fish/powershell) | Done |
 | FR-7.10 | `crew cron` - cron job management (list/add/remove/enable) | Done |
 | FR-7.11 | `crew channels status` - channel status display | Done |
+| FR-7.12 | `crew auth` - OAuth login (PKCE, device code, paste-token) | Done |
+| FR-7.13 | `crew skills` - skill install from GitHub | Done |
+| FR-7.14 | `crew channels login` - WhatsApp QR login | Done |
 
 ## Non-Functional Requirements
 
@@ -119,6 +126,7 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | NFR-3.2 | Shell command policy | SafePolicy implemented | Met |
 | NFR-4.1 | Linux/macOS support | Required | Met |
 | NFR-4.2 | Rust 1.85.0 MSRV | Required | Met |
+| NFR-5.1 | Docker deployment support | Required | Met |
 
 ## Technology Stack
 
@@ -128,7 +136,8 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 - **Database**: redb (embedded)
 - **CLI**: Clap 4
 - **Readline**: rustyline
-- **Channels**: teloxide, serenity, tokio-tungstenite
+- **Channels**: teloxide, serenity, tokio-tungstenite, async-imap, lettre
+- **Auth**: sha2, open (browser), base64
 - **Errors**: eyre/color-eyre
 
 ## Roadmap
@@ -150,9 +159,17 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 - [x] Built-in skills (6 bundled)
 - [x] Config migration framework
 
+- [x] Media download from channels (Telegram, Discord, Slack)
+- [x] Vision support (Anthropic, OpenAI, Gemini, OpenRouter)
+- [x] Voice transcription (Groq Whisper)
+- [x] OAuth login (`crew auth` with PKCE, device code, paste-token)
+- [x] Skill install from GitHub (`crew skills install`)
+- [x] Email channel (IMAP/SMTP)
+- [x] WhatsApp QR login (`crew channels login`)
+- [x] Docker deployment (multi-stage Dockerfile + docker-compose)
+
 ### Planned
-- [ ] Telegram media handling (photos, voice)
 - [ ] MCP server mode
 - [ ] Streaming responses
 - [ ] Custom tool plugins
-- [ ] DingTalk, Email, QQ channels
+- [ ] DingTalk, QQ channels

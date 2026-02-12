@@ -100,7 +100,11 @@ pub trait Channel: Send + Sync {
 }
 ```
 
-**Channels**: CliChannel, TelegramChannel, DiscordChannel, SlackChannel, WhatsAppChannel, FeishuChannel
+**Channels**: CliChannel, TelegramChannel, DiscordChannel, SlackChannel, WhatsAppChannel, FeishuChannel, EmailChannel
+
+**Media**: `media.rs` provides shared `download_media()` helper for downloading photos, voice, audio, and documents from channels to `.crew/media/`.
+
+**Transcription**: Voice/audio messages are auto-transcribed via Groq Whisper (configured in crew-llm `transcription` module) before being sent to the agent.
 
 **ChannelManager**: Registers channels, dispatches outbound messages.
 
@@ -114,7 +118,9 @@ pub trait Channel: Send + Sync {
 
 CLI interface and configuration.
 
-**Commands**: chat, init, status, gateway, clean, completions, cron (list/add/remove/enable), channels (status)
+**Commands**: chat, init, status, gateway, clean, completions, cron (list/add/remove/enable), channels (status/login), auth (login/logout/status), skills (list/install/remove)
+
+**Auth module** (`auth/`): OAuth PKCE browser flow, device code flow, and paste-token for API key management. Credentials stored in `~/.crew/auth.json` (mode 0600). `config.rs` checks auth store before env vars for API keys.
 
 **Config**: Loaded from `.crew/config.json` or `~/.config/crew/config.json`. Supports `${VAR}` expansion. Provider auto-detect via `detect_provider()`. Versioned config with automatic migration framework (`migrate_config()`).
 
@@ -154,7 +160,7 @@ crates/
 ├── crew-core/src/
 │   ├── lib.rs, task.rs, types.rs, error.rs, gateway.rs
 ├── crew-llm/src/
-│   ├── lib.rs, provider.rs, config.rs, types.rs, retry.rs
+│   ├── lib.rs, provider.rs, config.rs, types.rs, retry.rs, transcription.rs
 │   ├── anthropic.rs, openai.rs, gemini.rs, openrouter.rs
 ├── crew-memory/src/
 │   ├── lib.rs, episode.rs, store.rs, memory_store.rs
@@ -167,12 +173,14 @@ crates/
 ├── crew-bus/src/
 │   ├── lib.rs, bus.rs, channel.rs, session.rs
 │   ├── cli_channel.rs, telegram_channel.rs, discord_channel.rs
-│   ├── slack_channel.rs, whatsapp_channel.rs, feishu_channel.rs
+│   ├── slack_channel.rs, whatsapp_channel.rs, feishu_channel.rs, email_channel.rs
+│   ├── media.rs
 │   ├── cron_service.rs, cron_types.rs, heartbeat.rs
 └── crew-cli/src/
     ├── main.rs, config.rs, cron_tool.rs
+    ├── auth/ (mod, store, oauth, token)
     └── commands/ (mod, chat, init, status, gateway,
-                   clean, completions, cron, channels)
+                   clean, completions, cron, channels, auth, skills)
 ```
 
 ## Security
@@ -184,7 +192,7 @@ crates/
 
 ## Testing
 
-129+ tests across all crates. Categories:
+133+ tests across all crates. Categories:
 - Unit: type serde, tool arg parsing, config validation, provider detection
 - Integration: CLI commands, file tools, session persistence, cron jobs
 - Channel: allowed_senders, message parsing, dedup logic
