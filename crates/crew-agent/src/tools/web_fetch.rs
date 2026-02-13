@@ -188,6 +188,14 @@ fn is_private_host(host: &str) -> bool {
             std::net::IpAddr::V6(v6) => {
                 v6.is_loopback()           // ::1
                     || v6.is_unspecified() // ::
+                    // ULA fc00::/7
+                    || matches!(v6.segments()[0], 0xfc00..=0xfdff)
+                    // Link-local fe80::/10
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    // IPv4-mapped ::ffff:x.x.x.x — check wrapped IPv4
+                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                    })
             }
         };
     }
@@ -255,6 +263,42 @@ mod tests {
         let tool = WebFetchTool::new();
         let result = tool.execute(&serde_json::json!({})).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_private_host_localhost() {
+        assert!(is_private_host("localhost"));
+        assert!(is_private_host("LOCALHOST"));
+        assert!(is_private_host("localhost."));
+    }
+
+    #[test]
+    fn test_private_host_ipv4() {
+        assert!(is_private_host("127.0.0.1"));
+        assert!(is_private_host("10.0.0.1"));
+        assert!(is_private_host("172.16.0.1"));
+        assert!(is_private_host("192.168.1.1"));
+        assert!(is_private_host("169.254.169.254"));
+        assert!(is_private_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn test_private_host_ipv6() {
+        assert!(is_private_host("::1"));              // loopback
+        assert!(is_private_host("::"));               // unspecified
+        assert!(is_private_host("fc00::1"));           // ULA
+        assert!(is_private_host("fd12:3456::1"));      // ULA
+        assert!(is_private_host("fe80::1"));           // link-local
+        assert!(is_private_host("::ffff:127.0.0.1")); // IPv4-mapped loopback
+        assert!(is_private_host("::ffff:192.168.1.1"));// IPv4-mapped private
+    }
+
+    #[test]
+    fn test_public_host_allowed() {
+        assert!(!is_private_host("8.8.8.8"));
+        assert!(!is_private_host("1.1.1.1"));
+        assert!(!is_private_host("example.com"));
+        assert!(!is_private_host("2001:4860:4860::8888"));
     }
 
     #[test]
