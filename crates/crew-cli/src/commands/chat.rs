@@ -114,8 +114,25 @@ impl ChatCommand {
                 .wrap_err("failed to open episode store")?,
         );
 
-        // Create tool registry
-        let tools = ToolRegistry::with_builtins(&cwd);
+        // Create tool registry (with sandbox if configured)
+        let sandbox = crew_agent::create_sandbox(&config.sandbox);
+        let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+
+        // Register MCP tools
+        if !config.mcp_servers.is_empty() {
+            match crew_agent::McpClient::start(&config.mcp_servers).await {
+                Ok(client) => client.register_tools(&mut tools),
+                Err(e) => eprintln!("Warning: MCP initialization failed: {e}"),
+            }
+        }
+
+        // Load plugins
+        let plugin_dirs = Config::plugin_dirs(&cwd);
+        if !plugin_dirs.is_empty() {
+            if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs) {
+                eprintln!("Warning: plugin loading failed: {e}");
+            }
+        }
 
         // Set up Ctrl+C handler
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -237,7 +254,7 @@ impl ChatCommand {
 }
 
 /// Create an LLM provider from name and config.
-fn create_provider(
+pub(crate) fn create_provider(
     name: &str,
     config: &Config,
     model: Option<String>,

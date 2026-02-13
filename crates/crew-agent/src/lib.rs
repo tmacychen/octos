@@ -12,14 +12,21 @@ pub mod builtin_skills;
 pub mod policy;
 pub mod progress;
 pub mod skills;
+pub mod mcp;
+pub mod plugins;
+pub mod sandbox;
 pub mod tools;
 
 pub use agent::{Agent, AgentConfig, ConversationResponse};
+pub use mcp::{McpClient, McpServerConfig};
+pub use plugins::PluginLoader;
+pub use sandbox::{Sandbox, SandboxConfig, create_sandbox};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use tools::{
-    EditFileTool, GlobTool, GrepTool, ListDirTool, MessageTool, ReadFileTool, ShellTool,
-    SpawnTool, Tool, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool, WriteFileTool,
+    DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, MessageTool, ReadFileTool,
+    ShellTool, SpawnTool, Tool, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 
 #[cfg(test)]

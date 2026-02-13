@@ -34,6 +34,32 @@ pub struct Config {
     /// Gateway configuration (optional).
     #[serde(default)]
     pub gateway: Option<GatewayConfig>,
+
+    /// MCP server configurations.
+    #[serde(default)]
+    pub mcp_servers: Vec<crew_agent::McpServerConfig>,
+
+    /// Sandbox configuration.
+    #[serde(default)]
+    pub sandbox: crew_agent::SandboxConfig,
+}
+
+impl Config {
+    /// Directories to scan for plugins: local (.crew/plugins/) then global (~/.crew/plugins/).
+    pub fn plugin_dirs(cwd: &Path) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        let local = cwd.join(".crew").join("plugins");
+        if local.exists() {
+            dirs.push(local);
+        }
+        if let Some(home) = dirs::home_dir() {
+            let global = home.join(".crew").join("plugins");
+            if global.exists() {
+                dirs.push(global);
+            }
+        }
+        dirs
+    }
 }
 
 /// Gateway mode configuration.
@@ -207,6 +233,45 @@ impl Config {
             }
         }
 
+        // Check model/provider mismatch
+        if let (Some(provider), Some(model)) = (&self.provider, &self.model) {
+            if !is_valid_model_for_provider(provider, model) {
+                warnings.push(format!(
+                    "Model '{}' may not be valid for provider '{}'. Check provider docs.",
+                    model, provider
+                ));
+            }
+        }
+
+        // Check base_url format
+        if let Some(ref url) = self.base_url {
+            if !(url.starts_with("http://") || url.starts_with("https://")) || url.contains(' ') {
+                warnings.push(format!("base_url '{}' is not a valid URL", url));
+            }
+        }
+
+        // Check gateway config
+        if let Some(ref gw) = self.gateway {
+            const VALID_CHANNELS: &[&str] = &[
+                "cli", "telegram", "discord", "slack", "whatsapp", "email", "feishu",
+            ];
+            for ch in &gw.channels {
+                if !VALID_CHANNELS.contains(&ch.channel_type.as_str()) {
+                    warnings.push(format!(
+                        "Unknown channel type '{}'. Valid: {}",
+                        ch.channel_type,
+                        VALID_CHANNELS.join(", ")
+                    ));
+                }
+            }
+            if gw.max_history == 0 || gw.max_history > 1000 {
+                warnings.push(format!(
+                    "max_history {} is out of range (1-1000)",
+                    gw.max_history
+                ));
+            }
+        }
+
         // Check API key is set
         let provider = self.provider.as_deref().unwrap_or("anthropic");
         if self.get_api_key(provider).is_err() {
@@ -241,6 +306,27 @@ fn migrate_config(value: &mut serde_json::Value) -> bool {
     // Set version to current
     value["version"] = serde_json::json!(CURRENT_CONFIG_VERSION);
     true
+}
+
+/// Check if a model name looks reasonable for a given provider.
+/// Not exhaustive -- warns on clear mismatches only.
+fn is_valid_model_for_provider(provider: &str, model: &str) -> bool {
+    let m = model.to_lowercase();
+    match provider {
+        "anthropic" => m.contains("claude"),
+        "openai" => {
+            m.contains("gpt") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+        }
+        "gemini" | "google" => m.contains("gemini"),
+        "deepseek" => m.contains("deepseek"),
+        "moonshot" | "kimi" => m.contains("kimi") || m.contains("moonshot"),
+        "dashscope" | "qwen" => m.contains("qwen"),
+        "zhipu" | "glm" => m.contains("glm"),
+        "minimax" => m.contains("minimax"),
+        // These host many models, accept any
+        "groq" | "ollama" | "vllm" | "openrouter" => true,
+        _ => true,
+    }
 }
 
 /// Detect LLM provider from model name when no explicit provider is set.
@@ -370,5 +456,58 @@ mod tests {
         };
         let warnings = config.validate().unwrap();
         assert!(warnings.iter().any(|w| w.contains("Unknown provider")));
+    }
+
+    #[test]
+    fn test_validate_model_mismatch() {
+        let config = Config {
+            provider: Some("anthropic".to_string()),
+            model: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
+        let warnings = config.validate().unwrap();
+        assert!(warnings.iter().any(|w| w.contains("may not be valid")));
+    }
+
+    #[test]
+    fn test_validate_invalid_base_url() {
+        let config = Config {
+            base_url: Some("not a url".to_string()),
+            ..Default::default()
+        };
+        let warnings = config.validate().unwrap();
+        assert!(warnings.iter().any(|w| w.contains("not a valid URL")));
+    }
+
+    #[test]
+    fn test_validate_invalid_channel_type() {
+        let config = Config {
+            gateway: Some(GatewayConfig {
+                channels: vec![ChannelEntry {
+                    channel_type: "irc".to_string(),
+                    allowed_senders: vec![],
+                    settings: serde_json::json!({}),
+                }],
+                max_history: 50,
+                system_prompt: None,
+            }),
+            ..Default::default()
+        };
+        let warnings = config.validate().unwrap();
+        assert!(warnings.iter().any(|w| w.contains("Unknown channel type")));
+    }
+
+    #[test]
+    fn test_validate_max_history_out_of_range() {
+        let config = Config {
+            gateway: Some(GatewayConfig {
+                channels: vec![],
+                max_history: 0,
+                system_prompt: None,
+            }),
+            ..Default::default()
+        };
+        let warnings = config.validate().unwrap();
+        assert!(warnings.iter().any(|w| w.contains("out of range")));
     }
 }

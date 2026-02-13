@@ -79,6 +79,21 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Number of registered tools.
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Whether the registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+
+    /// Retain only tools whose names satisfy the predicate.
+    pub fn retain(&mut self, f: impl Fn(&str) -> bool) {
+        self.tools.retain(|name, _| f(name));
+    }
+
     /// Execute a tool by name.
     pub async fn execute(&self, name: &str, args: &serde_json::Value) -> Result<ToolResult> {
         let tool = self
@@ -90,6 +105,7 @@ impl ToolRegistry {
 }
 
 // Built-in tools
+pub mod diff_edit;
 pub mod edit_file;
 pub mod glob_tool;
 pub mod grep_tool;
@@ -102,6 +118,7 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
 
+pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
@@ -116,13 +133,21 @@ pub use write_file::WriteFileTool;
 
 use std::path::Path;
 
+use crate::sandbox::{NoSandbox, Sandbox};
+
 impl ToolRegistry {
     /// Create a registry with built-in tools for the given working directory.
     pub fn with_builtins(cwd: impl AsRef<Path>) -> Self {
+        Self::with_builtins_and_sandbox(cwd, Box::new(NoSandbox))
+    }
+
+    /// Create a registry with built-in tools and a custom sandbox for shell commands.
+    pub fn with_builtins_and_sandbox(cwd: impl AsRef<Path>, sandbox: Box<dyn Sandbox>) -> Self {
         let cwd = cwd.as_ref();
         let mut registry = Self::new();
-        registry.register(ShellTool::new(cwd));
+        registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
         registry.register(ReadFileTool::new(cwd));
+        registry.register(DiffEditTool::new(cwd));
         registry.register(EditFileTool::new(cwd));
         registry.register(WriteFileTool::new(cwd));
         registry.register(GlobTool::new(cwd));

@@ -8,6 +8,7 @@
 
 mod config;
 pub mod context;
+pub mod pricing;
 mod provider;
 mod retry;
 pub mod sse;

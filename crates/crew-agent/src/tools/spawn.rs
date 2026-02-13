@@ -53,6 +53,19 @@ struct Input {
     task: String,
     #[serde(default)]
     label: Option<String>,
+    /// "background" (default) or "sync".
+    #[serde(default = "default_mode")]
+    mode: String,
+    /// Tool names the subagent is allowed to use. Empty = all builtins.
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    /// Extra context injected as a system-level prefix.
+    #[serde(default)]
+    context: Option<String>,
+}
+
+fn default_mode() -> String {
+    "background".into()
 }
 
 #[async_trait]
@@ -62,7 +75,7 @@ impl Tool for SpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a background subagent to work on a task. Returns immediately while the task runs in the background. Results are announced when complete."
+        "Spawn a subagent to work on a task. Use mode='sync' to wait for the result, or 'background' (default) for fire-and-forget."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -71,11 +84,26 @@ impl Tool for SpawnTool {
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "The task for the background agent to complete"
+                    "description": "The task for the subagent to complete"
                 },
                 "label": {
                     "type": "string",
                     "description": "Optional short label for display"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["background", "sync"],
+                    "description": "background: returns immediately, result announced later. sync: waits and returns the result.",
+                    "default": "background"
+                },
+                "allowed_tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Tool names the subagent may use. Empty = all builtins."
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Extra context prepended to the task prompt."
                 }
             },
             "required": ["task"]
@@ -90,21 +118,29 @@ impl Tool for SpawnTool {
         let worker_id = AgentId::new(format!("subagent-{worker_num}"));
         let label = input.label.unwrap_or_else(|| input.task.chars().take(60).collect());
 
-        let (origin_channel, origin_chat_id) = self.origin.lock().unwrap().clone();
+        // Build the task prompt (optionally prepend context)
+        let task_desc = match &input.context {
+            Some(ctx) => format!("{ctx}\n\n{}", input.task),
+            None => input.task.clone(),
+        };
 
-        // Clone what the background task needs
-        let llm = self.llm.clone();
-        let memory = self.memory.clone();
-        let working_dir = self.working_dir.clone();
-        let inbound_tx = self.inbound_tx.clone();
-        let task_desc = input.task.clone();
-        let wid = worker_id.clone();
+        let allowed_tools = input.allowed_tools.clone();
+        let is_sync = input.mode == "sync";
 
-        info!(worker_id = %worker_id, task = %task_desc, "spawning background agent");
+        info!(
+            worker_id = %worker_id,
+            mode = %input.mode,
+            task = %input.task,
+            "spawning subagent"
+        );
 
-        tokio::spawn(async move {
-            let tools = ToolRegistry::with_builtins(&working_dir);
-            let worker = Agent::new(wid.clone(), llm, tools, memory);
+        if is_sync {
+            // Sync mode: run subagent inline and return the result directly
+            let mut tools = ToolRegistry::with_builtins(&self.working_dir);
+            if !allowed_tools.is_empty() {
+                tools.retain(|name| allowed_tools.iter().any(|a| a == name));
+            }
+            let worker = Agent::new(worker_id, self.llm.clone(), tools, self.memory.clone());
 
             let subtask = Task::new(
                 TaskKind::Code {
@@ -112,50 +148,92 @@ impl Tool for SpawnTool {
                     files: vec![],
                 },
                 TaskContext {
-                    working_dir,
+                    working_dir: self.working_dir.clone(),
                     ..Default::default()
                 },
             );
 
             let result = worker.run_task(&subtask).await;
-
-            let content = match &result {
-                Ok(r) => format!(
-                    "[Subagent {} completed]\nTask: {}\nStatus: {}\n\nResult:\n{}\n\nPlease summarize this result naturally for the user.",
-                    wid,
-                    task_desc,
-                    if r.success { "SUCCESS" } else { "FAILED" },
-                    r.output
-                ),
-                Err(e) => format!(
-                    "[Subagent {} failed]\nTask: {}\nError: {e}\n\nPlease inform the user about this failure.",
-                    wid, task_desc
-                ),
-            };
-
-            let announce = InboundMessage {
-                channel: "system".into(),
-                sender_id: "subagent".into(),
-                chat_id: format!("{origin_channel}:{origin_chat_id}"),
-                content,
-                timestamp: chrono::Utc::now(),
-                media: vec![],
-                metadata: serde_json::json!({
-                    "deliver_to_channel": origin_channel,
-                    "deliver_to_chat_id": origin_chat_id,
+            match result {
+                Ok(r) => Ok(ToolResult {
+                    output: r.output,
+                    success: r.success,
+                    tokens_used: Some(r.token_usage),
+                    ..Default::default()
                 }),
-            };
-
-            if let Err(e) = inbound_tx.send(announce).await {
-                warn!(error = %e, "failed to announce subagent result");
+                Err(e) => Ok(ToolResult {
+                    output: format!("Subagent failed: {e}"),
+                    success: false,
+                    ..Default::default()
+                }),
             }
-        });
+        } else {
+            // Background mode: fire-and-forget
+            let (origin_channel, origin_chat_id) = self.origin.lock().unwrap().clone();
+            let llm = self.llm.clone();
+            let memory = self.memory.clone();
+            let working_dir = self.working_dir.clone();
+            let inbound_tx = self.inbound_tx.clone();
+            let wid = worker_id.clone();
 
-        Ok(ToolResult {
-            output: format!("Spawned background task: {label}"),
-            success: true,
-            ..Default::default()
-        })
+            tokio::spawn(async move {
+                let mut tools = ToolRegistry::with_builtins(&working_dir);
+                if !allowed_tools.is_empty() {
+                    tools.retain(|name| allowed_tools.iter().any(|a| a == name));
+                }
+                let worker = Agent::new(wid.clone(), llm, tools, memory);
+
+                let subtask = Task::new(
+                    TaskKind::Code {
+                        instruction: task_desc.clone(),
+                        files: vec![],
+                    },
+                    TaskContext {
+                        working_dir,
+                        ..Default::default()
+                    },
+                );
+
+                let result = worker.run_task(&subtask).await;
+
+                let content = match &result {
+                    Ok(r) => format!(
+                        "[Subagent {} completed]\nTask: {}\nStatus: {}\n\nResult:\n{}\n\nPlease summarize this result naturally for the user.",
+                        wid,
+                        task_desc,
+                        if r.success { "SUCCESS" } else { "FAILED" },
+                        r.output
+                    ),
+                    Err(e) => format!(
+                        "[Subagent {} failed]\nTask: {}\nError: {e}\n\nPlease inform the user about this failure.",
+                        wid, task_desc
+                    ),
+                };
+
+                let announce = InboundMessage {
+                    channel: "system".into(),
+                    sender_id: "subagent".into(),
+                    chat_id: format!("{origin_channel}:{origin_chat_id}"),
+                    content,
+                    timestamp: chrono::Utc::now(),
+                    media: vec![],
+                    metadata: serde_json::json!({
+                        "deliver_to_channel": origin_channel,
+                        "deliver_to_chat_id": origin_chat_id,
+                    }),
+                };
+
+                if let Err(e) = inbound_tx.send(announce).await {
+                    warn!(error = %e, "failed to announce subagent result");
+                }
+            });
+
+            Ok(ToolResult {
+                output: format!("Spawned background task: {label}"),
+                success: true,
+                ..Default::default()
+            })
+        }
     }
 }
 

@@ -3,6 +3,8 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
 
+#[cfg(feature = "api")]
+pub mod api;
 pub mod auth;
 mod commands;
 pub mod compaction;

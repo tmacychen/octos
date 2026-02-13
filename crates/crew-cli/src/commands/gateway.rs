@@ -293,8 +293,26 @@ impl GatewayCommand {
         ));
         heartbeat_service.start();
 
-        // Build tool registry
-        let mut tools = ToolRegistry::with_builtins(&cwd);
+        // Build tool registry (with sandbox if configured)
+        let sandbox = crew_agent::create_sandbox(&config.sandbox);
+        let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+
+        // Register MCP tools
+        if !config.mcp_servers.is_empty() {
+            match crew_agent::McpClient::start(&config.mcp_servers).await {
+                Ok(client) => client.register_tools(&mut tools),
+                Err(e) => warn!("MCP initialization failed: {e}"),
+            }
+        }
+
+        // Load plugins
+        let plugin_dirs = crate::config::Config::plugin_dirs(&cwd);
+        if !plugin_dirs.is_empty() {
+            if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs) {
+                warn!("plugin loading failed: {e}");
+            }
+        }
+
         tools.register(CronTool::new(cron_service.clone()));
 
         // Message tool (cross-channel messaging)

@@ -7,11 +7,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 use super::{Tool, ToolResult};
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
+use crate::sandbox::{NoSandbox, Sandbox};
 
 /// Tool for executing shell commands.
 pub struct ShellTool {
@@ -21,6 +21,8 @@ pub struct ShellTool {
     cwd: std::path::PathBuf,
     /// Policy for command approval.
     policy: Arc<dyn CommandPolicy>,
+    /// Sandbox for command isolation.
+    sandbox: Box<dyn Sandbox>,
 }
 
 impl ShellTool {
@@ -30,6 +32,7 @@ impl ShellTool {
             timeout: Duration::from_secs(120),
             cwd: cwd.into(),
             policy: Arc::new(SafePolicy::default()),
+            sandbox: Box::new(NoSandbox),
         }
     }
 
@@ -42,6 +45,12 @@ impl ShellTool {
     /// Set a custom command policy.
     pub fn with_policy(mut self, policy: Arc<dyn CommandPolicy>) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Set a sandbox for command isolation.
+    pub fn with_sandbox(mut self, sandbox: Box<dyn Sandbox>) -> Self {
+        self.sandbox = sandbox;
         self
     }
 }
@@ -111,13 +120,9 @@ impl Tool for ShellTool {
             .map(Duration::from_secs)
             .unwrap_or(self.timeout);
 
-        // Execute command
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&input.command)
-            .current_dir(&self.cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        // Execute command (through sandbox)
+        let mut cmd = self.sandbox.wrap_command(&input.command, &self.cwd);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let result = timeout(timeout_duration, cmd.output()).await;
 

@@ -111,6 +111,16 @@ impl Agent {
         self
     }
 
+    /// The LLM model ID in use.
+    pub fn model_id(&self) -> &str {
+        self.llm.model_id()
+    }
+
+    /// The LLM provider name in use.
+    pub fn provider_name(&self) -> &str {
+        self.llm.provider_name()
+    }
+
     /// Process a single message in conversation mode (chat/gateway).
     /// Takes the user's message, conversation history, and optional media paths.
     pub async fn process_message(
@@ -185,6 +195,7 @@ impl Agent {
 
             match response.stop_reason {
                 StopReason::EndTurn | StopReason::StopSequence => {
+                    self.emit_cost_update(&total_usage, &response.usage);
                     return Ok(ConversationResponse {
                         content: response.content.unwrap_or_default(),
                         token_usage: total_usage,
@@ -202,6 +213,7 @@ impl Agent {
                     total_usage.output_tokens += tool_tokens.output_tokens;
                 }
                 StopReason::MaxTokens => {
+                    self.emit_cost_update(&total_usage, &response.usage);
                     return Ok(ConversationResponse {
                         content: response.content.unwrap_or_default(),
                         token_usage: total_usage,
@@ -324,6 +336,7 @@ impl Agent {
                             }
                         }
 
+                        self.emit_cost_update(&total_usage, &response.usage);
                         self.reporter.report(ProgressEvent::TaskCompleted {
                             success: true,
                             iterations: iteration,
@@ -352,6 +365,7 @@ impl Agent {
                         total_usage.output_tokens += tool_tokens.output_tokens;
                     }
                     StopReason::MaxTokens => {
+                        self.emit_cost_update(&total_usage, &response.usage);
                         self.reporter.report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -740,6 +754,20 @@ impl Agent {
             },
             streamed,
         ))
+    }
+
+    fn emit_cost_update(&self, total_usage: &TokenUsage, response_usage: &crew_llm::TokenUsage) {
+        let pricing = crew_llm::pricing::model_pricing(self.llm.model_id());
+        let response_cost =
+            pricing.map(|p| p.cost(response_usage.input_tokens, response_usage.output_tokens));
+        let session_cost =
+            pricing.map(|p| p.cost(total_usage.input_tokens, total_usage.output_tokens));
+        self.reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: total_usage.input_tokens,
+            session_output_tokens: total_usage.output_tokens,
+            response_cost,
+            session_cost,
+        });
     }
 
     fn build_result(

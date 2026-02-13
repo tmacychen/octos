@@ -6,8 +6,11 @@ mod chat;
 mod clean;
 mod completions;
 mod cron;
+mod docs;
 mod gateway;
 mod init;
+#[cfg(feature = "api")]
+mod serve;
 mod skills;
 mod status;
 
@@ -20,8 +23,11 @@ pub use chat::ChatCommand;
 pub use clean::CleanCommand;
 pub use completions::CompletionsCommand;
 pub use cron::CronCommand;
+pub use docs::DocsCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
+#[cfg(feature = "api")]
+pub use serve::ServeCommand;
 pub use skills::SkillsCommand;
 pub use status::StatusCommand;
 
@@ -45,8 +51,13 @@ pub enum Command {
     Chat(ChatCommand),
     /// Manage scheduled cron jobs.
     Cron(CronCommand),
+    /// Generate documentation for tools and providers.
+    Docs(DocsCommand),
     /// Initialize a new .crew configuration.
     Init(InitCommand),
+    /// Start the REST API server (requires --features api).
+    #[cfg(feature = "api")]
+    Serve(ServeCommand),
     /// Manage agent skills (list, install, remove).
     Skills(SkillsCommand),
     /// Show system status.
@@ -71,7 +82,10 @@ impl Executable for Command {
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
             Self::Cron(cmd) => cmd.execute(),
+            Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            #[cfg(feature = "api")]
+            Self::Serve(cmd) => cmd.execute(),
             Self::Skills(cmd) => cmd.execute(),
             Self::Status(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),

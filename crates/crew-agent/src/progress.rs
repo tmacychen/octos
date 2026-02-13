@@ -59,6 +59,16 @@ pub enum ProgressEvent {
 
     /// Streaming completed.
     StreamDone { iteration: u32 },
+
+    /// Cost update after a response.
+    CostUpdate {
+        session_input_tokens: u32,
+        session_output_tokens: u32,
+        /// Cost of this response (None if pricing unknown).
+        response_cost: Option<f64>,
+        /// Cumulative session cost.
+        session_cost: Option<f64>,
+    },
 }
 
 /// Trait for receiving progress updates.
@@ -320,6 +330,24 @@ impl ProgressReporter for ConsoleReporter {
                     let _ = writeln!(buf);
                     let _ = buf.flush();
                 }
+            }
+            ProgressEvent::CostUpdate {
+                session_input_tokens,
+                session_output_tokens,
+                session_cost,
+                ..
+            } => {
+                let cost_str = match session_cost {
+                    Some(c) => format!("${:.4}", c),
+                    None => "N/A".to_string(),
+                };
+                println!(
+                    "  {} {} in / {} out | Cost: {}",
+                    self.dim("Tokens:"),
+                    session_input_tokens,
+                    session_output_tokens,
+                    cost_str,
+                );
             }
         }
     }

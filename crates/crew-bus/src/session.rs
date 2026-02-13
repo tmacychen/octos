@@ -64,6 +64,25 @@ impl SessionManager {
         })
     }
 
+    /// List all sessions (ID + message count) from disk.
+    pub fn list_sessions(&self) -> Vec<(String, usize)> {
+        let mut result = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                    if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
+                        let count = std::fs::read_to_string(&path)
+                            .map(|c| c.lines().count())
+                            .unwrap_or(0);
+                        result.push((name.to_string(), count));
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// Get or create a session. Loads from disk on first access.
     pub fn get_or_create(&mut self, key: &SessionKey) -> &mut Session {
         let key_str = key.0.clone();
