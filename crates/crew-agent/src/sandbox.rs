@@ -253,8 +253,12 @@ impl Sandbox for DockerSandbox {
         cmd.arg("--security-opt").arg("no-new-privileges");
         cmd.arg("--cap-drop").arg("ALL");
 
-        // Clear dangerous environment variables
-        for var in &["LD_PRELOAD", "LD_LIBRARY_PATH", "NODE_OPTIONS", "PYTHONSTARTUP"] {
+        // Clear dangerous environment variables (code injection vectors)
+        for var in &[
+            "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+            "NODE_OPTIONS", "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT",
+            "JAVA_TOOL_OPTIONS", "BASH_ENV", "ENV", "ZDOTDIR",
+        ] {
             cmd.arg("--env").arg(format!("{var}="));
         }
 
@@ -534,9 +538,12 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        assert!(args.contains(&"LD_PRELOAD=".to_string()));
-        assert!(args.contains(&"LD_LIBRARY_PATH=".to_string()));
-        assert!(args.contains(&"NODE_OPTIONS=".to_string()));
-        assert!(args.contains(&"PYTHONSTARTUP=".to_string()));
+        for var in &[
+            "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+            "NODE_OPTIONS", "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT",
+            "JAVA_TOOL_OPTIONS", "BASH_ENV", "ENV", "ZDOTDIR",
+        ] {
+            assert!(args.contains(&format!("{var}=")), "missing env clear for {var}");
+        }
     }
 }

@@ -160,13 +160,13 @@ impl SessionManager {
         use std::io::Write;
 
         let path = self.session_path(key);
-        let is_new = !path.exists();
-
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
 
+        // Check file size after open to avoid TOCTOU race with exists() check
+        let is_new = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
         if is_new {
             let parent_key = self.cache.get(&key.0).and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
             let meta = SessionMeta {
