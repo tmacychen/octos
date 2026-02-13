@@ -612,9 +612,9 @@ Control which tools are available to the agent via `tools` in config:
 **Named groups** expand to tool sets:
 - `group:fs` -> read_file, write_file, edit_file, diff_edit
 - `group:runtime` -> shell
+- `group:search` -> glob, grep, list_dir
 - `group:web` -> web_search, web_fetch
 - `group:sessions` -> spawn
-- `group:memory` -> memory_search, memory_get
 
 **Wildcard matching**: `exec*` matches `exec`, `exec_bg`, etc.
 
@@ -695,8 +695,8 @@ Long responses are automatically split into channel-safe chunks before sending:
 | Channel | Max chars per message |
 |---------|-----------------------|
 | Telegram | 4000 |
-| Slack | 3900 |
 | Discord | 1900 |
+| Slack | 3900 |
 
 Split preference: paragraph boundary > newline > sentence end > space > hard cut. Messages exceeding 50 chunks are truncated with a marker.
 

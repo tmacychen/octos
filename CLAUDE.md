@@ -47,7 +47,7 @@ Auth module (`crew-cli/src/auth/`): OAuth PKCE + device code for OpenAI, paste-t
 
 All tools implement `Tool` trait (`spec() -> ToolSpec`, `execute(&Value) -> ToolResult`). Registered in `ToolRegistry` (HashMap). Tools: shell, read_file, write_file, edit_file, glob, grep, list_dir, web_search, web_fetch, message, spawn, cron.
 
-**Tool Policies** (`tools/policy.rs`): Allow/deny lists with deny-wins semantics, wildcard matching (`exec*`), and named groups (`group:fs`, `group:runtime`, `group:web`, `group:sessions`, `group:memory`). Provider-specific policies via `tools.byProvider` in config.
+**Tool Policies** (`tools/policy.rs`): Allow/deny lists with deny-wins semantics, wildcard matching (`exec*`), and named groups (`group:fs`, `group:runtime`, `group:search`, `group:web`, `group:sessions`). Provider-specific policies via `tools.byProvider` in config.
 
 ### Sandbox (`crew-agent/src/sandbox.rs`)
 

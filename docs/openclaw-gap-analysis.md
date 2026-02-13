@@ -17,7 +17,7 @@ Implemented in `crew-agent/src/tools/policy.rs`.
 
 ### 2. Tool Groups - DONE
 
-Named groups (`group:fs`, `group:runtime`, `group:web`, `group:sessions`, `group:memory`) expanding to tool sets. Integrated with ToolPolicy.
+Named groups (`group:fs`, `group:runtime`, `group:search`, `group:web`, `group:sessions`) expanding to tool sets. Integrated with ToolPolicy.
 Implemented in `crew-agent/src/tools/policy.rs`.
 
 ### 3. Context Compaction - DONE

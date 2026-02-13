@@ -159,7 +159,7 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 ### Completed
 - [x] Core type system and task model
 - [x] 4 native LLM providers + 8 OpenAI-compatible
-- [x] 12 built-in tools
+- [x] 13 built-in tools
 - [x] 6 messaging channels
 - [x] Memory system (episodic + daily + long-term + bootstrap)
 - [x] Skills system

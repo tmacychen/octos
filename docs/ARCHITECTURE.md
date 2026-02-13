@@ -72,17 +72,17 @@ Agent runtime and tool system.
 - `with_builtins()` - Standard tools
 - `register_arc()` - For tools needing shared references (message, spawn)
 
-**Built-in tools** (12):
+**Built-in tools** (13):
 
 | Category | Tools |
 |----------|-------|
-| File ops | read_file, write_file, edit_file |
+| File ops | read_file, write_file, edit_file, diff_edit |
 | Search | glob, grep, list_dir |
 | Execution | shell (with SafePolicy) |
 | Web | web_search, web_fetch |
 | Gateway | message, spawn, cron |
 
-**Tool Policies** (`tools/policy.rs`): Allow/deny lists with deny-wins semantics, wildcard matching (`exec*`), and named groups (`group:fs`, `group:runtime`, `group:web`, `group:sessions`, `group:memory`). Provider-specific policies via `tools.byProvider` in config — applied at both spec filtering and execution time, propagated to subagents.
+**Tool Policies** (`tools/policy.rs`): Allow/deny lists with deny-wins semantics, wildcard matching (`exec*`), and named groups (`group:fs`, `group:runtime`, `group:search`, `group:web`, `group:sessions`). Provider-specific policies via `tools.byProvider` in config — applied at both spec filtering and execution time, propagated to subagents.
 
 **Context Compaction** (`compaction.rs`): Token-aware message compaction when context window fills. Estimates tokens, strips tool arguments, summarizes to first lines, preserves recent tool call/result pairs.
 
