@@ -1,7 +1,8 @@
 //! MCP (Model Context Protocol) client for external tool integration.
 //!
-//! Spawns MCP servers via stdio, discovers tools via JSON-RPC,
-//! and wraps them as `Tool` implementations for the agent.
+//! Supports two transport modes:
+//! - **stdio**: Spawns MCP servers as child processes, communicates via stdin/stdout JSON-RPC.
+//! - **HTTP**: Connects to remote MCP servers via HTTP POST for JSON-RPC requests.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -24,23 +25,66 @@ use crate::sandbox::BLOCKED_ENV_VARS;
 /// Configuration for a single MCP server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpServerConfig {
-    pub command: String,
+    /// Stdio transport: command to spawn.
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// HTTP transport: URL of the MCP server endpoint.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// HTTP transport: additional headers (e.g. Authorization).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
-/// A running MCP server connection.
-struct McpConnection {
+impl McpServerConfig {
+    fn display_name(&self) -> &str {
+        if let Some(cmd) = &self.command {
+            cmd
+        } else if let Some(url) = &self.url {
+            url
+        } else {
+            "unknown"
+        }
+    }
+}
+
+/// A running MCP server connection (stdio or HTTP).
+enum McpConnection {
+    Stdio(StdioMcpConnection),
+    Http(HttpMcpConnection),
+}
+
+impl McpConnection {
+    async fn rpc_call(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match self {
+            McpConnection::Stdio(c) => c.rpc_call(method, params).await,
+            McpConnection::Http(c) => c.rpc_call(method, params).await,
+        }
+    }
+}
+
+/// Stdio-based MCP connection (child process).
+struct StdioMcpConnection {
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
     child: tokio::process::Child,
     next_id: u64,
 }
 
-impl McpConnection {
-    async fn rpc_call(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+impl StdioMcpConnection {
+    async fn rpc_call(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -98,7 +142,7 @@ async fn read_line_limited(
     String::from_utf8(buf).wrap_err("MCP response is not valid UTF-8")
 }
 
-impl Drop for McpConnection {
+impl Drop for StdioMcpConnection {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
         // Reap child to avoid zombie processes
@@ -106,9 +150,114 @@ impl Drop for McpConnection {
     }
 }
 
+/// HTTP-based MCP connection (remote server).
+struct HttpMcpConnection {
+    client: reqwest::Client,
+    url: String,
+    headers: HashMap<String, String>,
+    next_id: u64,
+    /// Session ID returned by the server for request affinity.
+    session_id: Option<String>,
+}
+
+impl HttpMcpConnection {
+    async fn rpc_call(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id,
+            method: method.into(),
+            params,
+        };
+
+        let mut req = self
+            .client
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid.as_str());
+        }
+
+        let resp = req
+            .json(&request)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .wrap_err("failed to send HTTP request to MCP server")?;
+
+        // Capture session ID from response if present.
+        if let Some(sid) = resp.headers().get("mcp-session-id") {
+            if let Ok(s) = sid.to_str() {
+                self.session_id = Some(s.to_string());
+            }
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            eyre::bail!("MCP HTTP error: {status} - {body}");
+        }
+
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let body = resp
+            .text()
+            .await
+            .wrap_err("failed to read MCP HTTP response")?;
+
+        // SSE responses: extract JSON-RPC message from data events.
+        let json_text = if content_type.contains("text/event-stream") {
+            parse_sse_json_rpc(&body)?
+        } else {
+            body
+        };
+
+        let response: JsonRpcResponse = serde_json::from_str(&json_text)
+            .wrap_err("invalid JSON-RPC response from MCP HTTP server")?;
+
+        if let Some(err) = response.error {
+            eyre::bail!("MCP error {}: {}", err.code, err.message);
+        }
+
+        response
+            .result
+            .ok_or_else(|| eyre::eyre!("MCP response missing result"))
+    }
+}
+
+/// Extract the last JSON-RPC data payload from an SSE response body.
+fn parse_sse_json_rpc(body: &str) -> Result<String> {
+    let mut last_data = None;
+    for line in body.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data != "[DONE]" {
+                last_data = Some(data.to_string());
+            }
+        }
+    }
+    last_data.ok_or_else(|| eyre::eyre!("no JSON-RPC data in SSE response"))
+}
+
 /// MCP client that manages server connections and tool registration.
 pub struct McpClient {
-    /// Kept alive so Drop kills child processes.
+    /// Kept alive so Drop kills child processes (stdio) / holds HTTP clients.
     #[allow(dead_code)]
     connections: Vec<(String, Arc<Mutex<McpConnection>>)>,
     tools: Vec<McpToolSpec>,
@@ -128,9 +277,15 @@ impl McpClient {
         let mut tools = Vec::new();
 
         for config in configs {
-            match Self::start_server(config).await {
+            let result = if config.url.is_some() {
+                Self::start_http_server(config).await
+            } else {
+                Self::start_stdio_server(config).await
+            };
+
+            match result {
                 Ok((conn, server_tools)) => {
-                    let server_name = &config.command;
+                    let server_name = config.display_name().to_string();
                     let conn = Arc::new(Mutex::new(conn));
                     info!(
                         server = server_name,
@@ -141,14 +296,20 @@ impl McpClient {
                         tools.push(McpToolSpec {
                             name: tool.name,
                             description: tool.description.unwrap_or_default(),
-                            input_schema: tool.input_schema.unwrap_or(serde_json::json!({"type": "object"})),
+                            input_schema: tool
+                                .input_schema
+                                .unwrap_or(serde_json::json!({"type": "object"})),
                             connection: conn.clone(),
                         });
                     }
-                    connections.push((server_name.clone(), conn));
+                    connections.push((server_name, conn));
                 }
                 Err(e) => {
-                    warn!(server = config.command, error = %e, "failed to start MCP server, skipping");
+                    warn!(
+                        server = config.display_name(),
+                        error = %e,
+                        "failed to start MCP server, skipping"
+                    );
                 }
             }
         }
@@ -156,60 +317,75 @@ impl McpClient {
         Ok(Self { connections, tools })
     }
 
-    async fn start_server(config: &McpServerConfig) -> Result<(McpConnection, Vec<McpToolDef>)> {
-        let mut cmd = tokio::process::Command::new(&config.command);
+    async fn start_stdio_server(
+        config: &McpServerConfig,
+    ) -> Result<(McpConnection, Vec<McpToolDef>)> {
+        let command = config
+            .command
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("MCP stdio server requires 'command' field"))?;
+
+        let mut cmd = tokio::process::Command::new(command);
         cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()); // Forward stderr for debugging
 
         for (k, v) in &config.env {
-            // Case-insensitive: env vars are case-insensitive on Windows
-            if BLOCKED_ENV_VARS.iter().any(|blocked| k.eq_ignore_ascii_case(blocked)) {
-                warn!(key = k, "blocked dangerous MCP environment variable, skipping");
+            if BLOCKED_ENV_VARS
+                .iter()
+                .any(|blocked| k.eq_ignore_ascii_case(blocked))
+            {
+                warn!(
+                    key = k,
+                    "blocked dangerous MCP environment variable, skipping"
+                );
                 continue;
             }
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn().wrap_err_with(|| {
-            format!("failed to spawn MCP server: {}", config.command)
-        })?;
+        let mut child = cmd
+            .spawn()
+            .wrap_err_with(|| format!("failed to spawn MCP server: {command}"))?;
 
-        let stdin = child.stdin.take().ok_or_else(|| eyre::eyre!("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("no stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| eyre::eyre!("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| eyre::eyre!("no stdout"))?;
         let reader = BufReader::new(stdout);
 
-        let mut conn = McpConnection {
+        let conn = McpConnection::Stdio(StdioMcpConnection {
             stdin,
             reader,
             child,
             next_id: 1,
-        };
+        });
 
-        // Initialize
-        let _init = conn
-            .rpc_call(
-                "initialize",
-                serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "crew-rs", "version": env!("CARGO_PKG_VERSION")}
-                }),
-            )
-            .await
-            .wrap_err("MCP initialize failed")?;
+        initialize_and_list_tools(conn).await
+    }
 
-        // Discover tools
-        let tools_result = conn
-            .rpc_call("tools/list", serde_json::json!({}))
-            .await
-            .wrap_err("MCP tools/list failed")?;
+    async fn start_http_server(
+        config: &McpServerConfig,
+    ) -> Result<(McpConnection, Vec<McpToolDef>)> {
+        let url = config
+            .url
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("MCP HTTP server requires 'url' field"))?;
 
-        let tool_list: McpToolListResponse = serde_json::from_value(tools_result)
-            .wrap_err("failed to parse MCP tools/list response")?;
+        let conn = McpConnection::Http(HttpMcpConnection {
+            client: reqwest::Client::new(),
+            url: url.to_string(),
+            headers: config.headers.clone(),
+            next_id: 1,
+            session_id: None,
+        });
 
-        Ok((conn, tool_list.tools))
+        initialize_and_list_tools(conn).await
     }
 
     /// Register all discovered MCP tools into the given registry.
@@ -223,6 +399,32 @@ impl McpClient {
             });
         }
     }
+}
+
+/// Shared initialization sequence for both transports.
+async fn initialize_and_list_tools(
+    mut conn: McpConnection,
+) -> Result<(McpConnection, Vec<McpToolDef>)> {
+    conn.rpc_call(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "crew-rs", "version": env!("CARGO_PKG_VERSION")}
+        }),
+    )
+    .await
+    .wrap_err("MCP initialize failed")?;
+
+    let tools_result = conn
+        .rpc_call("tools/list", serde_json::json!({}))
+        .await
+        .wrap_err("MCP tools/list failed")?;
+
+    let tool_list: McpToolListResponse = serde_json::from_value(tools_result)
+        .wrap_err("failed to parse MCP tools/list response")?;
+
+    Ok((conn, tool_list.tools))
 }
 
 /// A tool backed by an MCP server.
@@ -322,4 +524,49 @@ struct McpToolDef {
     description: Option<String>,
     #[serde(rename = "inputSchema")]
     input_schema: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_sse_json_rpc() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let result = parse_sse_json_rpc(body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["id"], 1);
+    }
+
+    #[test]
+    fn test_parse_sse_skips_done() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\ndata: [DONE]\n\n";
+        let result = parse_sse_json_rpc(body).unwrap();
+        assert!(result.contains("\"id\":1"));
+    }
+
+    #[test]
+    fn test_parse_sse_empty_body() {
+        let body = "event: ping\n\n";
+        assert!(parse_sse_json_rpc(body).is_err());
+    }
+
+    #[test]
+    fn test_config_deser_stdio() {
+        let json = r#"{"command": "npx", "args": ["-y", "mcp-server"]}"#;
+        let config: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.command.as_deref(), Some("npx"));
+        assert!(config.url.is_none());
+        assert_eq!(config.display_name(), "npx");
+    }
+
+    #[test]
+    fn test_config_deser_http() {
+        let json = r#"{"url": "https://mcp.example.com/sse", "headers": {"Authorization": "Bearer tok"}}"#;
+        let config: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert!(config.command.is_none());
+        assert_eq!(config.url.as_deref(), Some("https://mcp.example.com/sse"));
+        assert_eq!(config.headers.get("Authorization").unwrap(), "Bearer tok");
+        assert_eq!(config.display_name(), "https://mcp.example.com/sse");
+    }
 }
