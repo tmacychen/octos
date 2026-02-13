@@ -201,15 +201,17 @@ impl Sandbox for MacosSandbox {
 
         // Reject paths with control characters or SBPL metacharacters to prevent
         // sandbox profile injection. Fail closed: error instead of running unsandboxed.
-        if cwd_str.bytes().any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')') {
-            tracing::error!("cwd contains control characters, refusing to execute");
+        if cwd_str.bytes().any(|b| {
+            b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"'
+        }) {
+            tracing::error!("cwd contains SBPL metacharacters, refusing to execute");
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg("echo 'sandbox error: cwd contains invalid characters' >&2; exit 1");
             return cmd;
         }
 
-        // Escape characters that could break the SBPL sandbox profile syntax
-        let cwd_escaped = cwd_str.replace('\\', "\\\\").replace('"', "\\\"");
+        // Path is validated above — no escaping needed since \ and " are rejected.
+        let cwd_escaped = &cwd_str;
 
         let network_rule = if self.allow_network {
             "(allow network*)"
@@ -568,19 +570,22 @@ mod tests {
     }
 
     #[test]
-    fn test_macos_sandbox_rejects_parens() {
+    fn test_macos_sandbox_rejects_sbpl_metacharacters() {
         let sb = MacosSandbox {
             allow_network: false,
         };
-        let cmd = sb.wrap_command("ls", Path::new("/tmp/(allow network*)"));
-        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
-        assert_eq!(prog, "sh");
-        let args: Vec<_> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert!(args.iter().any(|a| a.contains("exit 1")));
+        // Parentheses, backslash, and quote should all be rejected
+        for path in &["/tmp/(allow network*)", "/tmp/test\\evil", "/tmp/test\"evil"] {
+            let cmd = sb.wrap_command("ls", Path::new(path));
+            let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+            assert_eq!(prog, "sh", "should reject path: {path}");
+            let args: Vec<_> = cmd
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            assert!(args.iter().any(|a| a.contains("exit 1")), "should exit 1 for path: {path}");
+        }
     }
 
     #[test]
