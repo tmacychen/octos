@@ -31,6 +31,8 @@ crew-rs is a Rust-native AI agent framework that operates in two modes:
 | **Provider** | LLM API service (Anthropic, OpenAI, etc.) |
 | **Channel** | Messaging platform (CLI, Telegram, Slack, etc.) |
 | **Session** | Conversation history per channel:chat_id |
+| **Sandbox** | Isolated execution environment (bwrap, macOS sandbox-exec, Docker) |
+| **Tool Policy** | Allow/deny rules controlling which tools are available |
 | **Skill** | Reusable instruction template (SKILL.md) |
 | **Bootstrap** | Context files loaded into system prompt (AGENTS.md, SOUL.md, etc.) |
 
@@ -592,6 +594,138 @@ Workspace skills in `.crew/skills/` override built-in skills with the same name.
 
 ```bash
 crew chat -v                 # Shows tool execution details
+```
+
+### Tool Policies
+
+Control which tools are available to the agent via `tools` in config:
+
+```json
+{
+  "tools": {
+    "allow": ["group:fs", "group:web", "shell"],
+    "deny": ["spawn"]
+  }
+}
+```
+
+**Named groups** expand to tool sets:
+- `group:fs` -> read_file, write_file, edit_file, diff_edit
+- `group:runtime` -> shell
+- `group:web` -> web_search, web_fetch
+- `group:sessions` -> spawn
+- `group:memory` -> memory_search, memory_get
+
+**Wildcard matching**: `exec*` matches `exec`, `exec_bg`, etc.
+
+**Deny-wins semantics**: If a tool appears in both allow and deny, it is denied.
+
+**Provider-specific policies**: Different tool sets per LLM model:
+
+```json
+{
+  "tools": {
+    "byProvider": {
+      "openai/gpt-4o-mini": {
+        "deny": ["shell", "write_file"]
+      }
+    }
+  }
+}
+```
+
+### Sandbox
+
+Shell commands run inside a sandbox for isolation. Three backends are supported:
+
+| Backend | Platform | Notes |
+|---------|----------|-------|
+| bwrap | Linux | Bubblewrap namespace isolation |
+| macOS | macOS | sandbox-exec with SBPL profiles |
+| Docker | Any | Container isolation with resource limits |
+
+Configure in `config.json`:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "mode": "auto",
+    "allow_network": false,
+    "docker": {
+      "image": "alpine:3.21",
+      "mount_mode": "rw",
+      "cpu_limit": "1.0",
+      "memory_limit": "512m",
+      "pids_limit": 100
+    }
+  }
+}
+```
+
+**Modes**: `auto` (detect best available), `bwrap`, `macos`, `docker`, `none`.
+
+**Mount modes**: `rw` (read-write), `ro` (read-only), `none` (no workspace mount).
+
+**Environment sanitization**: 18 dangerous environment variables (LD_PRELOAD, NODE_OPTIONS, etc.) are automatically cleared in all sandbox backends.
+
+### Session Forking
+
+In gateway mode, send `/new` to create a branched conversation:
+
+```
+/new
+```
+
+This creates a new session that copies the last 10 messages from the current conversation. The child session has a `parent_key` reference to the original. Each fork gets a unique key namespaced by sender and timestamp.
+
+### Config Hot-Reload
+
+The gateway automatically detects config file changes:
+
+- **Hot-reloaded** (no restart): system prompt, AGENTS.md, SOUL.md, USER.md
+- **Restart required**: provider, model, API keys, gateway channels
+
+Changes are detected via SHA-256 hashing with debounce.
+
+### Message Coalescing
+
+Long responses are automatically split into channel-safe chunks before sending:
+
+| Channel | Max chars per message |
+|---------|-----------------------|
+| Telegram | 4000 |
+| Slack | 3900 |
+| Discord | 1900 |
+
+Split preference: paragraph boundary > newline > sentence end > space > hard cut. Messages exceeding 50 chunks are truncated with a marker.
+
+### Context Compaction
+
+When the conversation exceeds the LLM's context window, older messages are automatically compacted:
+
+- Tool arguments are stripped (replaced with `"[stripped]"`)
+- Messages are summarized to first lines
+- Recent tool call/result pairs are preserved intact
+- The agent continues seamlessly without losing critical context
+
+### Hybrid Memory Search
+
+Memory search combines BM25 (keyword) and vector (semantic) scoring:
+
+- **Ranking**: `alpha * vector_score + (1 - alpha) * bm25_score` (default alpha: 0.7)
+- **Index**: HNSW via `hnsw_rs` with L2-normalized embeddings
+- **Fallback**: BM25-only when no embedding provider is configured
+
+Configure an embedding provider to enable vector search:
+
+```json
+{
+  "embedding": {
+    "provider": "openai",
+    "model": "text-embedding-3-small"
+  }
+}
 ```
 
 ---

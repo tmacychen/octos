@@ -56,6 +56,10 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | FR-3.6 | Background subagent spawning | Done |
 | FR-3.7 | Cron job scheduling (interval, one-shot, cron expressions) | Done |
 | FR-3.7b | Cron enable/disable | Done |
+| FR-3.8 | Tool policies (allow/deny, wildcard, deny-wins) | Done |
+| FR-3.9 | Tool groups (group:fs, group:runtime, group:web, etc.) | Done |
+| FR-3.10 | Provider-specific tool policies (tools.byProvider) | Done |
+| FR-3.11 | MCP server support (JSON-RPC stdio) | Done |
 
 ### FR-4: Gateway & Channels
 
@@ -74,6 +78,8 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | FR-4.11 | Media download from channels | Done |
 | FR-4.12 | Voice transcription (Groq Whisper) | Done |
 | FR-4.13 | Vision support (image to LLM) | Done |
+| FR-4.14 | Message coalescing (channel-aware chunking) | Done |
+| FR-4.15 | Session forking (/new command) | Done |
 
 ### FR-5: Memory & Context
 
@@ -86,6 +92,8 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | FR-5.6 | Bootstrap files (AGENTS.md, SOUL.md, USER.md, TOOLS.md, IDENTITY.md) | Done |
 | FR-5.7 | Skills system (SKILL.md with YAML frontmatter) | Done |
 | FR-5.8 | Built-in skills (cron, github, skill-creator, summarize, tmux, weather) | Done |
+| FR-5.9 | Hybrid memory search (BM25 + vector with HNSW) | Done |
+| FR-5.10 | Context compaction (token-aware message summarization) | Done |
 
 ### FR-6: Infrastructure
 
@@ -96,6 +104,9 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | FR-6.5 | Config migration framework (versioned) | Done |
 | FR-6.3 | Message bus (mpsc channels) | Done |
 | FR-6.4 | Session persistence (JSONL) | Done |
+| FR-6.6 | Config hot-reload (SHA-256 change detection) | Done |
+| FR-6.7 | Sandbox isolation (bwrap, macOS sandbox-exec, Docker) | Done |
+| FR-6.8 | Environment variable sanitization (BLOCKED_ENV_VARS) | Done |
 
 ### FR-7: CLI & UX
 
@@ -124,6 +135,9 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 | NFR-2.2 | Retry success rate | > 95% | Met |
 | NFR-3.1 | No secrets in config files | Required | Met |
 | NFR-3.2 | Shell command policy | SafePolicy implemented | Met |
+| NFR-3.3 | Sandbox isolation | bwrap/macOS/Docker | Met |
+| NFR-3.4 | Environment sanitization | 18 blocked vars | Met |
+| NFR-3.5 | Path injection prevention | Per-backend validation | Met |
 | NFR-4.1 | Linux/macOS support | Required | Met |
 | NFR-4.2 | Rust 1.85.0 MSRV | Required | Met |
 | NFR-5.1 | Docker deployment support | Required | Met |
@@ -167,9 +181,15 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 - [x] Email channel (IMAP/SMTP)
 - [x] WhatsApp QR login (`crew channels login`)
 - [x] Docker deployment (multi-stage Dockerfile + docker-compose)
+- [x] Tool policies (allow/deny, groups, provider-specific)
+- [x] Context compaction (token-aware message summarization)
+- [x] Config hot-reload (SHA-256 change detection)
+- [x] Hybrid memory search (BM25 + vector)
+- [x] Message coalescing (channel-aware chunking)
+- [x] Session forking (`/new` command)
+- [x] Docker sandbox (container isolation with resource limits)
+- [x] MCP server support (JSON-RPC stdio)
 
 ### Planned
-- [ ] MCP server mode
 - [ ] Streaming responses
-- [ ] Custom tool plugins
 - [ ] DingTalk, QQ channels
