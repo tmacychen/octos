@@ -214,7 +214,9 @@ impl LlmProvider for OpenRouterProvider {
 
         let mut body = serde_json::to_value(&request)
             .wrap_err("failed to serialize OpenRouter request")?;
-        let obj = body.as_object_mut().unwrap();
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| eyre::eyre!("failed to build OpenRouter request body"))?;
         obj.insert("stream".into(), true.into());
         obj.insert(
             "stream_options".into(),

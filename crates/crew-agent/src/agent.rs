@@ -567,7 +567,14 @@ impl Agent {
         Ok((messages, files_modified, tokens_used))
     }
 
+    /// Minimum number of non-system messages to keep after trimming.
+    const MIN_KEPT_MESSAGES: usize = 2;
+
     fn trim_to_context_window(&self, messages: &mut Vec<Message>) {
+        if messages.len() <= 1 + Self::MIN_KEPT_MESSAGES {
+            return; // Not enough messages to trim
+        }
+
         let window = self.llm.context_window();
         let limit = (window as f64 * 0.8) as u32; // Reserve 20% for output
 
@@ -580,12 +587,18 @@ impl Agent {
             return;
         }
 
-        if messages.is_empty() {
+        // If system prompt alone exceeds limit, warn but don't corrupt messages
+        let system_tokens = crew_llm::context::estimate_message_tokens(&messages[0]);
+        if system_tokens >= limit {
+            warn!(
+                system_tokens,
+                limit,
+                "system prompt exceeds context window budget, cannot trim"
+            );
             return;
         }
 
         // Keep system prompt (index 0) + walk backwards from end
-        let system_tokens = crew_llm::context::estimate_message_tokens(&messages[0]);
         let mut kept_tokens = system_tokens;
         let mut keep_from = messages.len();
 
@@ -596,6 +609,12 @@ impl Agent {
             }
             kept_tokens += msg_tokens;
             keep_from = i;
+        }
+
+        // Ensure we keep at least MIN_KEPT_MESSAGES non-system messages
+        let max_keep_from = messages.len().saturating_sub(Self::MIN_KEPT_MESSAGES);
+        if keep_from > max_keep_from {
+            keep_from = max_keep_from;
         }
 
         if keep_from > 1 {
@@ -675,13 +694,19 @@ impl Agent {
         }
 
         let content = if text.is_empty() { None } else { Some(text) };
-        let tool_calls = tool_calls
+        let tool_calls: Vec<crew_core::ToolCall> = tool_calls
             .into_iter()
             .filter(|(_, name, _)| !name.is_empty())
-            .map(|(id, name, args)| crew_core::ToolCall {
-                id,
-                name,
-                arguments: serde_json::from_str(&args).unwrap_or_default(),
+            .map(|(id, name, args)| {
+                let arguments = serde_json::from_str(&args).unwrap_or_else(|e| {
+                    tracing::warn!(tool = %name, error = %e, "malformed tool call JSON, using empty object");
+                    serde_json::Value::Object(Default::default())
+                });
+                crew_core::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                }
             })
             .collect();
 

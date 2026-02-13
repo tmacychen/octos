@@ -2,6 +2,10 @@
 
 use futures::stream::{self, Stream, StreamExt};
 
+/// Maximum SSE buffer size (1 MB). Prevents unbounded memory growth from
+/// a malicious or buggy server that never sends event delimiters.
+const MAX_BUFFER_SIZE: usize = 1024 * 1024;
+
 /// A parsed SSE event with optional event type and data.
 #[derive(Debug, Clone)]
 pub struct SseEvent {
@@ -25,8 +29,27 @@ pub fn parse_sse_response(
                 match stream.next().await {
                     Some(Ok(bytes)) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        if buffer.len() > MAX_BUFFER_SIZE {
+                            let error = SseEvent {
+                                event: None,
+                                data: format!(
+                                    "{{\"error\":\"SSE buffer exceeded {} bytes\"}}",
+                                    MAX_BUFFER_SIZE
+                                ),
+                            };
+                            buffer.clear();
+                            return Some((error, (stream, buffer)));
+                        }
                     }
-                    Some(Err(_)) | None => {
+                    Some(Err(e)) => {
+                        // Emit error as a synthetic SSE event so consumers can handle it
+                        let error = SseEvent {
+                            event: Some("error".to_string()),
+                            data: format!("{{\"error\":\"Stream error: {e}\"}}"),
+                        };
+                        return Some((error, (stream, buffer)));
+                    }
+                    None => {
                         if !buffer.trim().is_empty() {
                             let block = std::mem::take(&mut buffer);
                             if let Some(event) = parse_event_block(&block) {
@@ -74,18 +97,24 @@ pub fn parse_sse_strings(
 
 /// Try to extract one complete SSE event from the buffer.
 fn try_extract_event(buffer: &mut String) -> Option<SseEvent> {
-    for sep in ["\n\n", "\r\n\r\n"] {
-        if let Some(pos) = buffer.find(sep) {
-            let event_block = buffer[..pos].to_string();
-            *buffer = buffer[pos + sep.len()..].to_string();
+    loop {
+        let mut found = false;
+        for sep in ["\n\n", "\r\n\r\n"] {
+            if let Some(pos) = buffer.find(sep) {
+                let event_block = buffer[..pos].to_string();
+                *buffer = buffer[pos + sep.len()..].to_string();
 
-            if let Some(event) = parse_event_block(&event_block) {
-                return Some(event);
+                if let Some(event) = parse_event_block(&event_block) {
+                    return Some(event);
+                }
+                found = true;
+                break; // Restart outer loop to check for more events
             }
-            return try_extract_event(buffer);
+        }
+        if !found {
+            return None;
         }
     }
-    None
 }
 
 /// Parse a single SSE event block into an SseEvent.

@@ -110,14 +110,15 @@ impl LlmProvider for GeminiProvider {
         };
 
         let url = format!(
-            "{}/models/{}:generateContent?key={}",
-            self.base_url, self.model, self.api_key
+            "{}/models/{}:generateContent",
+            self.base_url, self.model
         );
 
         let response = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &self.api_key)
             .json(&request)
             .send()
             .await
@@ -245,14 +246,15 @@ impl LlmProvider for GeminiProvider {
         };
 
         let url = format!(
-            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, self.model, self.api_key
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, self.model
         );
 
         let response = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &self.api_key)
             .json(&request)
             .send()
             .await

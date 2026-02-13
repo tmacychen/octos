@@ -209,7 +209,9 @@ impl LlmProvider for OpenAIProvider {
 
         let mut body = serde_json::to_value(&request)
             .wrap_err("failed to serialize OpenAI request")?;
-        let obj = body.as_object_mut().unwrap();
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| eyre::eyre!("failed to build OpenAI request body"))?;
         obj.insert("stream".into(), true.into());
         obj.insert(
             "stream_options".into(),

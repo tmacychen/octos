@@ -172,7 +172,7 @@ impl LlmProvider for AnthropicProvider {
         let mut body = serde_json::to_value(&request)
             .wrap_err("failed to serialize Anthropic request")?;
         body.as_object_mut()
-            .unwrap()
+            .ok_or_else(|| eyre::eyre!("failed to build Anthropic request body"))?
             .insert("stream".into(), true.into());
 
         let response = self
