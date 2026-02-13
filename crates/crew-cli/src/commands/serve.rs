@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use clap::Args;
 use colored::Colorize;
-use crew_agent::{Agent, AgentConfig, ToolRegistry};
+use crew_agent::{Agent, AgentConfig, HookExecutor, ToolRegistry};
 use crew_bus::SessionManager;
 use crew_core::AgentId;
 use crew_llm::{LlmProvider, RetryProvider};
@@ -116,13 +116,17 @@ impl ServeCommand {
         }
 
         let broadcaster = Arc::new(SseBroadcaster::new(256));
-        let agent = Agent::new(AgentId::new("api"), llm, tools, memory)
+        let mut agent = Agent::new(AgentId::new("api"), llm, tools, memory)
             .with_config(AgentConfig {
                 max_iterations: 20,
                 save_episodes: false,
                 ..Default::default()
             })
             .with_reporter(broadcaster.clone());
+
+        if !config.hooks.is_empty() {
+            agent = agent.with_hooks(Arc::new(HookExecutor::new(config.hooks.clone())));
+        }
 
         let sessions = Arc::new(tokio::sync::Mutex::new(
             SessionManager::open(&data_dir).wrap_err("failed to open session manager")?,

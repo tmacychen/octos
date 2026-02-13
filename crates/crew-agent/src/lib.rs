@@ -10,20 +10,22 @@
 mod agent;
 pub mod builtin_skills;
 mod compaction;
-mod sanitize;
-pub mod policy;
-pub mod progress;
-pub mod skills;
+pub mod hooks;
 pub mod mcp;
 pub mod plugins;
+pub mod policy;
+pub mod progress;
 pub mod sandbox;
+mod sanitize;
+pub mod skills;
 pub mod tools;
 
 pub use agent::{Agent, AgentConfig, ConversationResponse};
+pub use hooks::{HookConfig, HookEvent, HookExecutor};
 pub use mcp::{McpClient, McpServerConfig};
 pub use plugins::PluginLoader;
-pub use sandbox::{Sandbox, SandboxConfig, create_sandbox};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
+pub use sandbox::{Sandbox, SandboxConfig, create_sandbox};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use tools::{
     DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, MessageTool, ReadFileTool,

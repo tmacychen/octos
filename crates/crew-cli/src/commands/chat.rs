@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Args;
 use colored::Colorize;
-use crew_agent::{Agent, AgentConfig, ConsoleReporter, ToolRegistry};
+use crew_agent::{Agent, AgentConfig, ConsoleReporter, HookExecutor, ToolRegistry};
 use crew_core::{AgentId, Message, MessageRole};
 use crew_llm::{
     EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain, RetryProvider,
@@ -175,15 +175,14 @@ impl ChatCommand {
             save_episodes: false,
             ..Default::default()
         };
-        let mut agent = Agent::new(
-            AgentId::new("chat"),
-            llm,
-            tools,
-            memory,
-        )
-        .with_config(agent_config)
-        .with_reporter(reporter)
-        .with_shutdown(shutdown.clone());
+        let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
+            .with_config(agent_config)
+            .with_reporter(reporter)
+            .with_shutdown(shutdown.clone());
+
+        if !config.hooks.is_empty() {
+            agent = agent.with_hooks(Arc::new(HookExecutor::new(config.hooks.clone())));
+        }
 
         if let Some(embedder) = create_embedder(&config) {
             agent = agent.with_embedder(embedder);
@@ -208,10 +207,7 @@ impl ChatCommand {
 
         // Banner
         println!("{}", "crew-rs chat".cyan().bold());
-        println!(
-            "{}",
-            "(type /exit or Ctrl+C to quit)".dimmed()
-        );
+        println!("{}", "(type /exit or Ctrl+C to quit)".dimmed());
         println!();
 
         // Conversation history
@@ -225,7 +221,10 @@ impl ChatCommand {
 
             let line = match rl.readline("you> ") {
                 Ok(line) => line,
-                Err(rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof) => {
+                Err(
+                    rustyline::error::ReadlineError::Interrupted
+                    | rustyline::error::ReadlineError::Eof,
+                ) => {
                     break;
                 }
                 Err(e) => {
@@ -407,9 +406,8 @@ pub(crate) fn create_provider(
         "deepseek" => {
             let api_key = config.get_api_key("deepseek")?;
             let model_name = model.unwrap_or_else(|| "deepseek-chat".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"),
-            );
+            let p = OpenAIProvider::new(&api_key, &model_name)
+                .with_base_url(base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"));
             println!("{}: {}", "Model".green(), p.model_id());
             Arc::new(p)
         }
@@ -417,7 +415,9 @@ pub(crate) fn create_provider(
             let api_key = config.get_api_key("groq")?;
             let model_name = model.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
             let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                base_url.as_deref().unwrap_or("https://api.groq.com/openai/v1"),
+                base_url
+                    .as_deref()
+                    .unwrap_or("https://api.groq.com/openai/v1"),
             );
             println!("{}: {}", "Model".green(), p.model_id());
             Arc::new(p)
@@ -425,9 +425,8 @@ pub(crate) fn create_provider(
         "moonshot" | "kimi" => {
             let api_key = config.get_api_key("moonshot")?;
             let model_name = model.unwrap_or_else(|| "kimi-k2.5".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                base_url.as_deref().unwrap_or("https://api.moonshot.ai/v1"),
-            );
+            let p = OpenAIProvider::new(&api_key, &model_name)
+                .with_base_url(base_url.as_deref().unwrap_or("https://api.moonshot.ai/v1"));
             println!("{}: {}", "Model".green(), p.model_id());
             Arc::new(p)
         }
@@ -445,9 +444,8 @@ pub(crate) fn create_provider(
         "minimax" => {
             let api_key = config.get_api_key("minimax")?;
             let model_name = model.unwrap_or_else(|| "MiniMax-Text-01".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                base_url.as_deref().unwrap_or("https://api.minimax.io/v1"),
-            );
+            let p = OpenAIProvider::new(&api_key, &model_name)
+                .with_base_url(base_url.as_deref().unwrap_or("https://api.minimax.io/v1"));
             println!("{}: {}", "Model".green(), p.model_id());
             Arc::new(p)
         }
@@ -464,9 +462,8 @@ pub(crate) fn create_provider(
         }
         "ollama" => {
             let model_name = model.unwrap_or_else(|| "llama3.2".to_string());
-            let p = OpenAIProvider::new("ollama", &model_name).with_base_url(
-                base_url.as_deref().unwrap_or("http://localhost:11434/v1"),
-            );
+            let p = OpenAIProvider::new("ollama", &model_name)
+                .with_base_url(base_url.as_deref().unwrap_or("http://localhost:11434/v1"));
             println!("{}: {}", "Model".green(), p.model_id());
             Arc::new(p)
         }
@@ -474,12 +471,10 @@ pub(crate) fn create_provider(
             let api_key = config
                 .get_api_key("vllm")
                 .unwrap_or_else(|_| "token".to_string());
-            let model_name = model.ok_or_else(|| {
-                eyre::eyre!("vllm provider requires --model to be specified")
-            })?;
-            let url = base_url.ok_or_else(|| {
-                eyre::eyre!("vllm provider requires --base-url to be specified")
-            })?;
+            let model_name = model
+                .ok_or_else(|| eyre::eyre!("vllm provider requires --model to be specified"))?;
+            let url = base_url
+                .ok_or_else(|| eyre::eyre!("vllm provider requires --base-url to be specified"))?;
             let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(&url);
             println!("{}: {}", "Model".green(), p.model_id());
             Arc::new(p)

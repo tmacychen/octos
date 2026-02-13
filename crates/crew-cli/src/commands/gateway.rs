@@ -7,13 +7,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
 use clap::Args;
 use colored::Colorize;
-use crew_agent::{Agent, AgentConfig, MessageTool, SilentReporter, SkillsLoader, SpawnTool, ToolRegistry};
-use crew_bus::{ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager, create_bus};
+use crew_agent::{
+    Agent, AgentConfig, HookExecutor, MessageTool, SilentReporter, SkillsLoader, SpawnTool,
+    ToolRegistry,
+};
+use crew_bus::{
+    ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager, create_bus,
+};
 use crew_core::{AgentId, Message, MessageRole, OutboundMessage};
 use crew_llm::{
-    GroqTranscriber, LlmProvider, ProviderChain, RetryProvider,
-    anthropic::AnthropicProvider, gemini::GeminiProvider, openai::OpenAIProvider,
-    openrouter::OpenRouterProvider,
+    GroqTranscriber, LlmProvider, ProviderChain, RetryProvider, anthropic::AnthropicProvider,
+    gemini::GeminiProvider, openai::OpenAIProvider, openrouter::OpenRouterProvider,
 };
 use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
@@ -87,9 +91,7 @@ impl GatewayCommand {
         let provider_name = self
             .provider
             .or(config.provider.clone())
-            .or_else(|| {
-                model.as_deref().and_then(detect_provider).map(String::from)
-            })
+            .or_else(|| model.as_deref().and_then(detect_provider).map(String::from))
             .unwrap_or_else(|| "anthropic".to_string());
 
         let gw_config = config
@@ -154,18 +156,18 @@ impl GatewayCommand {
             "deepseek" => {
                 let api_key = config.get_api_key("deepseek")?;
                 let model_name = model.unwrap_or_else(|| "deepseek-chat".to_string());
-                let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                    base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"),
-                );
+                let p = OpenAIProvider::new(&api_key, &model_name)
+                    .with_base_url(base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"));
                 println!("{}: {}", "Model".green(), p.model_id());
                 Arc::new(p)
             }
             "groq" => {
                 let api_key = config.get_api_key("groq")?;
-                let model_name =
-                    model.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
+                let model_name = model.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
                 let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                    base_url.as_deref().unwrap_or("https://api.groq.com/openai/v1"),
+                    base_url
+                        .as_deref()
+                        .unwrap_or("https://api.groq.com/openai/v1"),
                 );
                 println!("{}: {}", "Model".green(), p.model_id());
                 Arc::new(p)
@@ -173,9 +175,8 @@ impl GatewayCommand {
             "moonshot" | "kimi" => {
                 let api_key = config.get_api_key("moonshot")?;
                 let model_name = model.unwrap_or_else(|| "kimi-k2.5".to_string());
-                let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                    base_url.as_deref().unwrap_or("https://api.moonshot.ai/v1"),
-                );
+                let p = OpenAIProvider::new(&api_key, &model_name)
+                    .with_base_url(base_url.as_deref().unwrap_or("https://api.moonshot.ai/v1"));
                 println!("{}: {}", "Model".green(), p.model_id());
                 Arc::new(p)
             }
@@ -193,17 +194,15 @@ impl GatewayCommand {
             "minimax" => {
                 let api_key = config.get_api_key("minimax")?;
                 let model_name = model.unwrap_or_else(|| "MiniMax-Text-01".to_string());
-                let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                    base_url.as_deref().unwrap_or("https://api.minimax.io/v1"),
-                );
+                let p = OpenAIProvider::new(&api_key, &model_name)
+                    .with_base_url(base_url.as_deref().unwrap_or("https://api.minimax.io/v1"));
                 println!("{}: {}", "Model".green(), p.model_id());
                 Arc::new(p)
             }
             "ollama" => {
                 let model_name = model.unwrap_or_else(|| "llama3.2".to_string());
-                let p = OpenAIProvider::new("ollama", &model_name).with_base_url(
-                    base_url.as_deref().unwrap_or("http://localhost:11434/v1"),
-                );
+                let p = OpenAIProvider::new("ollama", &model_name)
+                    .with_base_url(base_url.as_deref().unwrap_or("http://localhost:11434/v1"));
                 println!("{}: {}", "Model".green(), p.model_id());
                 Arc::new(p)
             }
@@ -211,9 +210,8 @@ impl GatewayCommand {
                 let api_key = config
                     .get_api_key("vllm")
                     .unwrap_or_else(|_| "token".to_string());
-                let model_name = model.ok_or_else(|| {
-                    eyre::eyre!("vllm provider requires --model to be specified")
-                })?;
+                let model_name = model
+                    .ok_or_else(|| eyre::eyre!("vllm provider requires --model to be specified"))?;
                 let url = base_url.ok_or_else(|| {
                     eyre::eyre!("vllm provider requires --base-url to be specified")
                 })?;
@@ -266,12 +264,10 @@ impl GatewayCommand {
         let _ = &media_dir; // used by channel feature gates below
 
         // Create voice transcriber if GROQ_API_KEY is set
-        let transcriber = std::env::var("GROQ_API_KEY")
-            .ok()
-            .map(|key| {
-                println!("{}: Groq Whisper", "Transcriber".green());
-                GroqTranscriber::new(key)
-            });
+        let transcriber = std::env::var("GROQ_API_KEY").ok().map(|key| {
+            println!("{}: Groq Whisper", "Transcriber".green());
+            GroqTranscriber::new(key)
+        });
 
         let memory = Arc::new(
             EpisodeStore::open(&data_dir)
@@ -374,16 +370,15 @@ impl GatewayCommand {
         let shutdown_clone = shutdown.clone();
 
         let llm_for_compaction = llm.clone();
-        let mut agent = Agent::new(
-            AgentId::new("gateway"),
-            llm,
-            tools,
-            memory,
-        )
-        .with_config(agent_config)
-        .with_reporter(Arc::new(SilentReporter))
-        .with_shutdown(shutdown.clone())
-        .with_system_prompt(system_prompt);
+        let mut agent = Agent::new(AgentId::new("gateway"), llm, tools, memory)
+            .with_config(agent_config)
+            .with_reporter(Arc::new(SilentReporter))
+            .with_shutdown(shutdown.clone())
+            .with_system_prompt(system_prompt);
+
+        if !config.hooks.is_empty() {
+            agent = agent.with_hooks(Arc::new(HookExecutor::new(config.hooks.clone())));
+        }
 
         if let Some(embedder) = create_embedder(&config) {
             agent = agent.with_embedder(embedder);
@@ -448,10 +443,8 @@ impl GatewayCommand {
                 }
                 #[cfg(feature = "slack")]
                 "slack" => {
-                    let bot_env =
-                        settings_str(&entry.settings, "bot_token_env", "SLACK_BOT_TOKEN");
-                    let app_env =
-                        settings_str(&entry.settings, "app_token_env", "SLACK_APP_TOKEN");
+                    let bot_env = settings_str(&entry.settings, "bot_token_env", "SLACK_BOT_TOKEN");
+                    let app_env = settings_str(&entry.settings, "app_token_env", "SLACK_APP_TOKEN");
                     let bot_token = std::env::var(&bot_env)
                         .wrap_err_with(|| format!("{bot_env} environment variable not set"))?;
                     let app_token = std::env::var(&app_env)
@@ -466,8 +459,7 @@ impl GatewayCommand {
                 }
                 #[cfg(feature = "whatsapp")]
                 "whatsapp" => {
-                    let url =
-                        settings_str(&entry.settings, "bridge_url", "ws://localhost:3001");
+                    let url = settings_str(&entry.settings, "bridge_url", "ws://localhost:3001");
                     channel_mgr.register(Arc::new(crew_bus::WhatsAppChannel::new(
                         &url,
                         entry.allowed_senders.clone(),
@@ -488,16 +480,13 @@ impl GatewayCommand {
                         .get("smtp_port")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(465) as u16;
-                    let user_env =
-                        settings_str(&entry.settings, "username_env", "EMAIL_USERNAME");
-                    let pass_env =
-                        settings_str(&entry.settings, "password_env", "EMAIL_PASSWORD");
-                    let username = std::env::var(&user_env)
-                        .wrap_err_with(|| format!("{user_env} not set"))?;
-                    let password = std::env::var(&pass_env)
-                        .wrap_err_with(|| format!("{pass_env} not set"))?;
-                    let from_address =
-                        settings_str(&entry.settings, "from_address", &username);
+                    let user_env = settings_str(&entry.settings, "username_env", "EMAIL_USERNAME");
+                    let pass_env = settings_str(&entry.settings, "password_env", "EMAIL_PASSWORD");
+                    let username =
+                        std::env::var(&user_env).wrap_err_with(|| format!("{user_env} not set"))?;
+                    let password =
+                        std::env::var(&pass_env).wrap_err_with(|| format!("{pass_env} not set"))?;
+                    let from_address = settings_str(&entry.settings, "from_address", &username);
                     let poll_interval = entry
                         .settings
                         .get("poll_interval_secs")
@@ -528,16 +517,13 @@ impl GatewayCommand {
                 }
                 #[cfg(feature = "feishu")]
                 "feishu" | "lark" => {
-                    let id_env =
-                        settings_str(&entry.settings, "app_id_env", "FEISHU_APP_ID");
+                    let id_env = settings_str(&entry.settings, "app_id_env", "FEISHU_APP_ID");
                     let secret_env =
                         settings_str(&entry.settings, "app_secret_env", "FEISHU_APP_SECRET");
                     let app_id = std::env::var(&id_env)
                         .wrap_err_with(|| format!("{id_env} environment variable not set"))?;
                     let app_secret = std::env::var(&secret_env)
-                        .wrap_err_with(|| {
-                            format!("{secret_env} environment variable not set")
-                        })?;
+                        .wrap_err_with(|| format!("{secret_env} environment variable not set"))?;
                     channel_mgr.register(Arc::new(crew_bus::FeishuChannel::new(
                         &app_id,
                         &app_secret,
@@ -660,7 +646,9 @@ impl GatewayCommand {
             // Namespace by sender_id so each user gets their own fork.
             if inbound.content.trim() == "/new" {
                 let new_id = format!(
-                    "{}_{}_{}", inbound.sender_id, inbound.chat_id,
+                    "{}_{}_{}",
+                    inbound.sender_id,
+                    inbound.chat_id,
                     chrono::Utc::now().timestamp_millis(),
                 );
                 match session_mgr.fork(&session_key, &new_id, 10) {
@@ -723,9 +711,12 @@ impl GatewayCommand {
                     let _ = session_mgr.add_message(&session_key, assistant_msg);
 
                     // Compact session if it's grown too large
-                    if let Err(e) =
-                        crate::compaction::maybe_compact(&mut session_mgr, &session_key, &*llm_for_compaction)
-                            .await
+                    if let Err(e) = crate::compaction::maybe_compact(
+                        &mut session_mgr,
+                        &session_key,
+                        &*llm_for_compaction,
+                    )
+                    .await
                     {
                         warn!("session compaction failed: {e}");
                     }
@@ -775,7 +766,9 @@ async fn build_system_prompt(
     memory_store: &MemoryStore,
     skills_loader: &SkillsLoader,
 ) -> String {
-    let mut prompt = base.unwrap_or("You are a helpful AI assistant.").to_string();
+    let mut prompt = base
+        .unwrap_or("You are a helpful AI assistant.")
+        .to_string();
 
     // Append bootstrap files (AGENTS.md, SOUL.md, USER.md, etc.)
     let bootstrap = load_bootstrap_files(data_dir);
@@ -833,13 +826,7 @@ fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> Strin
 
 /// Load optional bootstrap/personality files from the .crew/ directory.
 fn load_bootstrap_files(data_dir: &Path) -> String {
-    const FILES: &[&str] = &[
-        "AGENTS.md",
-        "SOUL.md",
-        "USER.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-    ];
+    const FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"];
     let mut parts = Vec::new();
     for filename in FILES {
         let path = data_dir.join(filename);

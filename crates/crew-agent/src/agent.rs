@@ -1,19 +1,20 @@
 //! Agent implementation.
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crew_core::{AgentId, Message, MessageRole, Task, TaskResult, TokenUsage};
 use crew_llm::{
     ChatConfig, ChatResponse, ChatStream, EmbeddingProvider, LlmProvider, StopReason, StreamEvent,
 };
-use futures::StreamExt;
 use crew_memory::{Episode, EpisodeOutcome, EpisodeStore};
 use eyre::Result;
+use futures::StreamExt;
 use tracing::{Instrument, debug, info, info_span, warn};
 
+use crate::hooks::{HookEvent, HookExecutor, HookPayload, HookResult};
 use crate::progress::{ProgressEvent, ProgressReporter, SilentReporter};
 use crate::tools::ToolRegistry;
 
@@ -68,6 +69,8 @@ pub struct Agent {
     config: AgentConfig,
     /// Progress reporter.
     reporter: Arc<dyn ProgressReporter>,
+    /// Lifecycle hooks executor.
+    hooks: Option<Arc<HookExecutor>>,
     /// Shutdown signal.
     shutdown: Arc<AtomicBool>,
 }
@@ -91,6 +94,7 @@ impl Agent {
             system_prompt: RwLock::new(system_prompt),
             config: AgentConfig::default(),
             reporter: Arc::new(SilentReporter),
+            hooks: None,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -119,15 +123,27 @@ impl Agent {
         self
     }
 
+    /// Set lifecycle hooks executor.
+    pub fn with_hooks(mut self, hooks: Arc<HookExecutor>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
     /// Override the system prompt (e.g. for gateway mode).
     pub fn with_system_prompt(self, prompt: String) -> Self {
-        *self.system_prompt.write().unwrap_or_else(|e| e.into_inner()) = prompt;
+        *self
+            .system_prompt
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = prompt;
         self
     }
 
     /// Update the system prompt at runtime (hot-reload).
     pub fn set_system_prompt(&self, prompt: String) {
-        *self.system_prompt.write().unwrap_or_else(|e| e.into_inner()) = prompt;
+        *self
+            .system_prompt
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = prompt;
     }
 
     /// The LLM model ID in use.
@@ -150,7 +166,11 @@ impl Agent {
     ) -> Result<ConversationResponse> {
         let mut messages = vec![Message {
             role: MessageRole::System,
-            content: self.system_prompt.read().unwrap_or_else(|e| e.into_inner()).clone(),
+            content: self
+                .system_prompt
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
@@ -222,10 +242,60 @@ impl Agent {
             iteration += 1;
             let tools_spec = self.tools.specs();
             self.trim_to_context_window(&mut messages);
-            let stream = self.llm.chat_stream(&messages, &tools_spec, &config).await?;
+
+            // Before-LLM hook
+            if let Some(ref hooks) = self.hooks {
+                let payload = HookPayload {
+                    event: HookEvent::BeforeLlmCall,
+                    tool_name: None,
+                    arguments: None,
+                    tool_id: None,
+                    result: None,
+                    success: None,
+                    duration_ms: None,
+                    message_count: Some(messages.len()),
+                    model: Some(self.llm.model_id().to_string()),
+                    iteration: Some(iteration),
+                    stop_reason: None,
+                    has_tool_calls: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                };
+                if let HookResult::Deny(reason) =
+                    hooks.run(HookEvent::BeforeLlmCall, &payload).await
+                {
+                    eyre::bail!("LLM call denied by hook: {reason}");
+                }
+            }
+
+            let stream = self
+                .llm
+                .chat_stream(&messages, &tools_spec, &config)
+                .await?;
             let (response, streamed) = self.consume_stream(stream, iteration).await?;
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
+
+            // After-LLM hook
+            if let Some(ref hooks) = self.hooks {
+                let payload = HookPayload {
+                    event: HookEvent::AfterLlmCall,
+                    tool_name: None,
+                    arguments: None,
+                    tool_id: None,
+                    result: None,
+                    success: None,
+                    duration_ms: None,
+                    message_count: None,
+                    model: Some(self.llm.model_id().to_string()),
+                    iteration: Some(iteration),
+                    stop_reason: Some(format!("{:?}", response.stop_reason)),
+                    has_tool_calls: Some(!response.tool_calls.is_empty()),
+                    input_tokens: Some(response.usage.input_tokens),
+                    output_tokens: Some(response.usage.output_tokens),
+                };
+                let _ = hooks.run(HookEvent::AfterLlmCall, &payload).await;
+            }
 
             match response.stop_reason {
                 StopReason::EndTurn | StopReason::StopSequence => {
@@ -283,8 +353,9 @@ impl Agent {
             loop {
                 if self.shutdown.load(Ordering::Relaxed) {
                     info!(iteration, "shutdown signal received");
-                    self.reporter
-                        .report(ProgressEvent::TaskInterrupted { iterations: iteration });
+                    self.reporter.report(ProgressEvent::TaskInterrupted {
+                        iterations: iteration,
+                    });
                     return Ok(TaskResult {
                         success: false,
                         output: "Task interrupted.".to_string(),
@@ -295,7 +366,11 @@ impl Agent {
                 }
 
                 if iteration >= self.config.max_iterations {
-                    warn!(iteration, max = self.config.max_iterations, "hit max iterations limit");
+                    warn!(
+                        iteration,
+                        max = self.config.max_iterations,
+                        "hit max iterations limit"
+                    );
                     self.reporter.report(ProgressEvent::MaxIterationsReached {
                         limit: self.config.max_iterations,
                     });
@@ -318,7 +393,10 @@ impl Agent {
                         });
                         return Ok(TaskResult {
                             success: false,
-                            output: format!("Task stopped after {} tokens (budget: {}).", used, max_tokens),
+                            output: format!(
+                                "Task stopped after {} tokens (budget: {}).",
+                                used, max_tokens
+                            ),
                             files_modified,
                             subtasks: Vec::new(),
                             token_usage: total_usage,
@@ -333,10 +411,11 @@ impl Agent {
                             limit_s = timeout.as_secs(),
                             "hit wall-clock timeout"
                         );
-                        self.reporter.report(ProgressEvent::WallClockTimeoutReached {
-                            elapsed: task_start.elapsed(),
-                            limit: timeout,
-                        });
+                        self.reporter
+                            .report(ProgressEvent::WallClockTimeoutReached {
+                                elapsed: task_start.elapsed(),
+                                limit: timeout,
+                            });
                         return Ok(TaskResult {
                             success: false,
                             output: format!(
@@ -357,10 +436,60 @@ impl Agent {
 
                 let tools_spec = self.tools.specs();
                 self.trim_to_context_window(&mut messages);
-                let stream = self.llm.chat_stream(&messages, &tools_spec, &config).await?;
+
+                // Before-LLM hook
+                if let Some(ref hooks) = self.hooks {
+                    let payload = HookPayload {
+                        event: HookEvent::BeforeLlmCall,
+                        tool_name: None,
+                        arguments: None,
+                        tool_id: None,
+                        result: None,
+                        success: None,
+                        duration_ms: None,
+                        message_count: Some(messages.len()),
+                        model: Some(self.llm.model_id().to_string()),
+                        iteration: Some(iteration),
+                        stop_reason: None,
+                        has_tool_calls: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                    };
+                    if let HookResult::Deny(reason) =
+                        hooks.run(HookEvent::BeforeLlmCall, &payload).await
+                    {
+                        eyre::bail!("LLM call denied by hook: {reason}");
+                    }
+                }
+
+                let stream = self
+                    .llm
+                    .chat_stream(&messages, &tools_spec, &config)
+                    .await?;
                 let (response, _streamed) = self.consume_stream(stream, iteration).await?;
                 total_usage.input_tokens += response.usage.input_tokens;
                 total_usage.output_tokens += response.usage.output_tokens;
+
+                // After-LLM hook
+                if let Some(ref hooks) = self.hooks {
+                    let payload = HookPayload {
+                        event: HookEvent::AfterLlmCall,
+                        tool_name: None,
+                        arguments: None,
+                        tool_id: None,
+                        result: None,
+                        success: None,
+                        duration_ms: None,
+                        message_count: None,
+                        model: Some(self.llm.model_id().to_string()),
+                        iteration: Some(iteration),
+                        stop_reason: Some(format!("{:?}", response.stop_reason)),
+                        has_tool_calls: Some(!response.tool_calls.is_empty()),
+                        input_tokens: Some(response.usage.input_tokens),
+                        output_tokens: Some(response.usage.output_tokens),
+                    };
+                    let _ = hooks.run(HookEvent::AfterLlmCall, &payload).await;
+                }
 
                 debug!(
                     iteration,
@@ -467,7 +596,11 @@ impl Agent {
     async fn build_initial_messages(&self, task: &Task) -> Vec<Message> {
         let mut messages = vec![Message {
             role: MessageRole::System,
-            content: self.system_prompt.read().unwrap_or_else(|e| e.into_inner()).clone(),
+            content: self
+                .system_prompt
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
@@ -490,15 +623,11 @@ impl Agent {
             match embedder.embed(&[query.as_str()]).await {
                 Ok(vecs) => {
                     let query_emb = vecs.into_iter().next();
-                    self.memory
-                        .find_relevant_hybrid(&query, query_emb, 6)
-                        .await
+                    self.memory.find_relevant_hybrid(&query, query_emb, 6).await
                 }
                 Err(e) => {
                     warn!(error = %e, "embedding failed, falling back to keyword search");
-                    self.memory
-                        .find_relevant_hybrid(&query, None, 6)
-                        .await
+                    self.memory.find_relevant_hybrid(&query, None, 6).await
                 }
             }
         } else {
@@ -605,6 +734,47 @@ impl Agent {
                     tool_id: tool_call.id.clone(),
                 });
 
+                // Before-tool hook: may deny execution
+                if let Some(ref hooks) = self.hooks {
+                    let payload = HookPayload {
+                        event: HookEvent::BeforeToolCall,
+                        tool_name: Some(tool_call.name.clone()),
+                        arguments: Some(tool_call.arguments.clone()),
+                        tool_id: Some(tool_call.id.clone()),
+                        result: None,
+                        success: None,
+                        duration_ms: None,
+                        message_count: None,
+                        model: None,
+                        iteration: None,
+                        stop_reason: None,
+                        has_tool_calls: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                    };
+                    if let HookResult::Deny(reason) =
+                        hooks.run(HookEvent::BeforeToolCall, &payload).await
+                    {
+                        let deny_msg = if reason.is_empty() {
+                            format!("Tool '{}' denied by hook", tool_call.name)
+                        } else {
+                            format!("Tool '{}' denied by hook: {}", tool_call.name, reason)
+                        };
+                        return (
+                            Message {
+                                role: MessageRole::Tool,
+                                content: deny_msg,
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: Some(tool_call.id.clone()),
+                                timestamp: chrono::Utc::now(),
+                            },
+                            None,
+                            None,
+                        );
+                    }
+                }
+
                 let result = self
                     .tools
                     .execute(&tool_call.name, &tool_call.arguments)
@@ -668,6 +838,35 @@ impl Agent {
                     }
                 };
 
+                // After-tool hook (fire-and-forget)
+                if let Some(ref hooks) = self.hooks {
+                    let payload = HookPayload {
+                        event: HookEvent::AfterToolCall,
+                        tool_name: Some(tool_call.name.clone()),
+                        arguments: None,
+                        tool_id: Some(tool_call.id.clone()),
+                        result: Some(if content.len() > 500 {
+                            let mut end = 500;
+                            while !content.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}...", &content[..end])
+                        } else {
+                            content.clone()
+                        }),
+                        success: Some(!content.starts_with("Error: ")),
+                        duration_ms: Some(duration.as_millis() as u64),
+                        message_count: None,
+                        model: None,
+                        iteration: None,
+                        stop_reason: None,
+                        has_tool_calls: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                    };
+                    let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+                }
+
                 let content = crate::sanitize::sanitize_tool_output(&content);
 
                 (
@@ -726,8 +925,7 @@ impl Agent {
         if system_tokens >= budget {
             warn!(
                 system_tokens,
-                budget,
-                "system prompt exceeds context window budget, cannot trim"
+                budget, "system prompt exceeds context window budget, cannot trim"
             );
             return;
         }

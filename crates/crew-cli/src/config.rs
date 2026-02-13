@@ -60,6 +60,10 @@ pub struct Config {
     /// When the primary provider fails with a retriable error, the next model is tried.
     #[serde(default)]
     pub fallback_models: Vec<FallbackModel>,
+
+    /// Lifecycle hooks for agent events.
+    #[serde(default)]
+    pub hooks: Vec<crew_agent::HookConfig>,
 }
 
 /// A fallback model for the provider failover chain.
@@ -258,8 +262,9 @@ impl Config {
             _ => format!("{}_API_KEY", provider.to_uppercase()),
         });
 
-        std::env::var(&env_var)
-            .wrap_err_with(|| format!("{env_var} not set. Run `crew auth login -p {provider}` or set the env var"))
+        std::env::var(&env_var).wrap_err_with(|| {
+            format!("{env_var} not set. Run `crew auth login -p {provider}` or set the env var")
+        })
     }
 
     /// Validate the configuration.
@@ -270,10 +275,21 @@ impl Config {
         // Check provider is valid
         if let Some(ref provider) = self.provider {
             const VALID: &[&str] = &[
-                "anthropic", "openai", "gemini", "openrouter",
-                "deepseek", "groq", "moonshot", "kimi",
-                "dashscope", "qwen", "minimax", "zhipu", "glm",
-                "ollama", "vllm",
+                "anthropic",
+                "openai",
+                "gemini",
+                "openrouter",
+                "deepseek",
+                "groq",
+                "moonshot",
+                "kimi",
+                "dashscope",
+                "qwen",
+                "minimax",
+                "zhipu",
+                "glm",
+                "ollama",
+                "vllm",
             ];
             if !VALID.contains(&provider.as_str()) {
                 warnings.push(format!(
@@ -342,10 +358,7 @@ impl Config {
 
 /// Migrate config to current version. Returns true if anything changed.
 fn migrate_config(value: &mut serde_json::Value) -> bool {
-    let current = value
-        .get("version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    let current = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
     if current >= CURRENT_CONFIG_VERSION {
         return false;
@@ -474,7 +487,10 @@ mod tests {
 
     #[test]
     fn test_detect_provider_claude() {
-        assert_eq!(detect_provider("claude-sonnet-4-20250514"), Some("anthropic"));
+        assert_eq!(
+            detect_provider("claude-sonnet-4-20250514"),
+            Some("anthropic")
+        );
         assert_eq!(detect_provider("claude-3-haiku"), Some("anthropic"));
     }
 
@@ -584,9 +600,11 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.tool_policy_by_provider.len(), 2);
         assert!(config.tool_policy_by_provider.contains_key("gemini"));
-        assert!(config
-            .tool_policy_by_provider
-            .contains_key("claude-sonnet-4-20250514"));
+        assert!(
+            config
+                .tool_policy_by_provider
+                .contains_key("claude-sonnet-4-20250514")
+        );
     }
 
     #[test]

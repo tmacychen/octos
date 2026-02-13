@@ -115,6 +115,9 @@ impl ConfigWatcher {
         if old.mcp_servers != new.mcp_servers {
             restart_fields.push("mcp_servers".into());
         }
+        if old.hooks != new.hooks {
+            restart_fields.push("hooks".into());
+        }
 
         // Hot-reloadable fields (gateway sub-fields)
         let old_gw = old.gateway.as_ref();
