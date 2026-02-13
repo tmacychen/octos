@@ -209,21 +209,21 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
     let mut sorted_hunks: Vec<(usize, &Hunk)> = hunks.iter().enumerate().collect();
     sorted_hunks.sort_by(|a, b| b.1.old_start.cmp(&a.1.old_start));
 
-    // Check for overlapping hunks
+    // Check for overlapping hunks (sorted descending by old_start)
     for window in sorted_hunks.windows(2) {
-        let (_, higher) = window[0];
-        let (_, lower) = window[1];
-        let lower_end = lower.old_start
-            + lower
+        let (_, later_hunk) = window[0]; // higher line number
+        let (_, earlier_hunk) = window[1]; // lower line number
+        let earlier_end = earlier_hunk.old_start
+            + earlier_hunk
                 .lines
                 .iter()
                 .filter(|l| matches!(l, DiffLine::Context(_) | DiffLine::Remove(_)))
                 .count();
-        if lower_end > higher.old_start {
+        if earlier_end > later_hunk.old_start {
             eyre::bail!(
                 "overlapping hunks at lines {} and {}",
-                lower.old_start,
-                higher.old_start
+                earlier_hunk.old_start,
+                later_hunk.old_start
             );
         }
     }

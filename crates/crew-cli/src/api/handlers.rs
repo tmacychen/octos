@@ -153,11 +153,12 @@ pub async fn session_messages(
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Json<Vec<MessageInfo>> {
     let limit = params.limit.min(500);
+    let fetch_count = params.offset.saturating_add(limit);
     let key = SessionKey::new("api", &id);
     let mut sessions = state.sessions.lock().await;
     let session = sessions.get_or_create(&key);
     let messages = session
-        .get_history(1000)
+        .get_history(fetch_count)
         .iter()
         .skip(params.offset)
         .take(limit)

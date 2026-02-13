@@ -114,6 +114,15 @@ pub struct MacosSandbox {
 impl Sandbox for MacosSandbox {
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let cwd_str = cwd.to_string_lossy();
+
+        // Reject paths with control characters to prevent SBPL profile injection
+        if cwd_str.bytes().any(|b| b < 0x20) {
+            tracing::warn!("cwd contains control characters, falling back to unsandboxed");
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(shell_command).current_dir(cwd);
+            return cmd;
+        }
+
         // Escape characters that could break the SBPL sandbox profile syntax
         let cwd_escaped = cwd_str.replace('\\', "\\\\").replace('"', "\\\"");
 

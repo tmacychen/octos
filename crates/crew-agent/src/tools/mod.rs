@@ -137,15 +137,14 @@ use crate::sandbox::{NoSandbox, Sandbox};
 
 /// Resolve a user-provided path, ensuring it stays within base_dir.
 ///
-/// Prevents path traversal attacks via `../` or absolute paths that escape
-/// the working directory.
+/// Rejects absolute paths and prevents traversal via `../`.
+/// Does NOT follow symlinks (normalize only, no filesystem access).
 pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
-    let path = if PathBuf::from(user_path).is_absolute() {
-        PathBuf::from(user_path)
-    } else {
-        base_dir.join(user_path)
-    };
+    if PathBuf::from(user_path).is_absolute() {
+        eyre::bail!("absolute paths are not allowed: {}", user_path);
+    }
 
+    let path = base_dir.join(user_path);
     let normalized = normalize_path(&path);
     let base_normalized = normalize_path(base_dir);
 
@@ -192,5 +191,59 @@ impl ToolRegistry {
         registry.register(WebSearchTool::new());
         registry.register(WebFetchTool::new());
         registry
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_resolve_rejects_absolute_path() {
+        let base = Path::new("/home/user/project");
+        assert!(resolve_path(base, "/etc/passwd").is_err());
+        assert!(resolve_path(base, "/home/user/project/../../../etc/shadow").is_err());
+    }
+
+    #[test]
+    fn test_resolve_blocks_parent_traversal() {
+        let base = Path::new("/home/user/project");
+        assert!(resolve_path(base, "../../../etc/passwd").is_err());
+        assert!(resolve_path(base, "subdir/../../..").is_err());
+        assert!(resolve_path(base, "foo/../../../secret").is_err());
+    }
+
+    #[test]
+    fn test_resolve_allows_valid_relative() {
+        let base = Path::new("/home/user/project");
+        let p = resolve_path(base, "src/main.rs").unwrap();
+        assert_eq!(p, PathBuf::from("/home/user/project/src/main.rs"));
+    }
+
+    #[test]
+    fn test_resolve_allows_dot_segments_within_base() {
+        let base = Path::new("/home/user/project");
+        let p = resolve_path(base, "src/../src/lib.rs").unwrap();
+        assert_eq!(p, PathBuf::from("/home/user/project/src/lib.rs"));
+    }
+
+    #[test]
+    fn test_resolve_allows_current_dir() {
+        let base = Path::new("/home/user/project");
+        let p = resolve_path(base, "./README.md").unwrap();
+        assert_eq!(p, PathBuf::from("/home/user/project/README.md"));
+    }
+
+    #[test]
+    fn test_normalize_handles_complex_paths() {
+        assert_eq!(
+            normalize_path(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/a/b/../../c")),
+            PathBuf::from("/c")
+        );
     }
 }

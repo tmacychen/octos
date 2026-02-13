@@ -19,13 +19,18 @@ use crate::tools::{Tool, ToolRegistry, ToolResult};
 /// Maximum size for a single JSON-RPC response line (1MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
 
-/// Environment variable names blocked for MCP servers (security-sensitive).
+/// Environment variable names blocked for MCP servers (code injection vectors).
 const BLOCKED_ENV_KEYS: &[&str] = &[
+    // Linux: shared library injection
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    // macOS: dylib injection
     "DYLD_INSERT_LIBRARIES",
     "DYLD_LIBRARY_PATH",
     "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_VERSIONED_LIBRARY_PATH",
 ];
 
 /// Configuration for a single MCP server.
@@ -93,14 +98,14 @@ async fn read_line_limited(
             buf.extend_from_slice(&available[..=pos]);
             reader.consume(pos + 1);
             break;
-        } else {
-            buf.extend_from_slice(available);
-            let len = available.len();
-            reader.consume(len);
         }
-        if buf.len() > limit {
+        // Check BEFORE extending to enforce strict limit
+        if buf.len() + available.len() > limit {
             eyre::bail!("MCP response exceeds {}KB limit", limit / 1024);
         }
+        let len = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(len);
     }
     String::from_utf8(buf).wrap_err("MCP response is not valid UTF-8")
 }
