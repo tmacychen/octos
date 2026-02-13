@@ -608,17 +608,97 @@ In the gateway command, skills are loaded during system prompt construction:
 3. `build_skills_summary()` — appends XML skill index to system prompt
 4. Always-on skill content is prepended to the system prompt
 
-### Plugins
+### Plugin System
 
-External tools via directory containing `manifest.json` + executable.
+Plugins extend the agent with external tools via standalone executables. Each plugin is a directory containing a `manifest.json` and an executable file.
 
-```json
-{"name": "plugin-name", "version": "0.1.0", "tools": [
-  {"name": "tool", "description": "desc", "input_schema": {"type": "object"}}
-]}
+#### Directory Layout
+
+```
+.crew/plugins/           # local (project-level)
+~/.crew/plugins/         # global (user-level)
+  └── my-plugin/
+      ├── manifest.json  # plugin metadata + tool definitions
+      └── my-plugin      # executable (or "main" as fallback)
 ```
 
-**Protocol**: Write JSON args to stdin → read `{"output": "...", "success": bool}` from stdout. 30s timeout. Fallback: raw stdout + exit code.
+**Discovery order**: local `.crew/plugins/` first, then global `~/.crew/plugins/`. Both are scanned by `Config::plugin_dirs()`.
+
+#### PluginManifest
+
+```rust
+pub struct PluginManifest {
+    pub name: String,
+    pub version: String,
+    pub tools: Vec<PluginToolDef>,    // default: empty vec
+}
+
+pub struct PluginToolDef {
+    pub name: String,                 // must be unique across all plugins
+    pub description: String,
+    pub input_schema: serde_json::Value,  // default: {"type": "object"}
+}
+```
+
+**Example manifest.json**:
+```json
+{
+  "name": "my-plugin",
+  "version": "0.1.0",
+  "tools": [
+    {
+      "name": "greet",
+      "description": "Greet someone by name",
+      "input_schema": {
+        "type": "object",
+        "properties": { "name": { "type": "string" } }
+      }
+    }
+  ]
+}
+```
+
+#### PluginLoader
+
+```rust
+pub struct PluginLoader;  // stateless, all methods are associated functions
+```
+
+**`load_into(registry, dirs)`**:
+1. Scan each directory for subdirectories
+2. For each subdirectory, look for `manifest.json`
+3. Parse manifest, find executable (try directory name first, then `main`)
+4. Validate executable permissions (Unix: `mode & 0o111 != 0`; non-Unix: existence check)
+5. Wrap each tool definition as a `PluginTool` implementing the `Tool` trait
+6. Register into `ToolRegistry`
+7. Log warning: `"loaded unverified plugin (no signature check)"`
+8. Return total tool count. Failed plugins are skipped with warning, not fatal.
+
+#### PluginTool — Execution Protocol
+
+```rust
+pub struct PluginTool {
+    plugin_name: String,
+    tool_def: PluginToolDef,
+    executable: PathBuf,
+}
+```
+
+**Invocation**: `executable <tool_name>` (tool name passed as first argument).
+
+**stdin/stdout protocol**:
+1. Spawn executable with tool name as arg, piped stdin/stdout/stderr
+2. Write JSON-serialized arguments to stdin, close (EOF signals end of input)
+3. Wait for exit with 30s timeout (`PLUGIN_TIMEOUT`)
+4. Parse stdout as JSON:
+   - **Structured**: `{"output": "...", "success": true/false}` → use parsed values
+   - **Fallback**: raw stdout + stderr concatenated, success from exit code
+5. Return `ToolResult` (no `file_modified` tracking for plugins)
+
+**Error handling**:
+- Spawn failure → eyre error with plugin name and executable path
+- Timeout → eyre error with plugin name, tool name, and duration
+- JSON parse failure → graceful fallback to raw output
 
 ### Progress Reporting
 
