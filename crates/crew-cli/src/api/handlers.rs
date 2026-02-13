@@ -40,10 +40,7 @@ pub async fn chat(
         ));
     }
 
-    let session_key = SessionKey::new(
-        "api",
-        req.session_id.as_deref().unwrap_or("default"),
-    );
+    let session_key = SessionKey::new("api", req.session_id.as_deref().unwrap_or("default"));
 
     let history: Vec<Message> = {
         let mut sessions = state.sessions.lock().await;
@@ -117,9 +114,7 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
-pub async fn list_sessions(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<SessionInfo>> {
+pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionInfo>> {
     let sessions = state.sessions.lock().await;
     let list = sessions
         .list_sessions()
@@ -188,9 +183,7 @@ pub struct StatusResponse {
     pub uptime_secs: i64,
 }
 
-pub async fn status(
-    State(state): State<Arc<AppState>>,
-) -> Json<StatusResponse> {
+pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = chrono::Utc::now() - state.started_at;
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),

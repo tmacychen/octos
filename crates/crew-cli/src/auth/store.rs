@@ -43,10 +43,8 @@ impl AuthStore {
     pub fn load() -> Result<Self> {
         let path = Self::store_path()?;
         let data = if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .wrap_err("failed to read auth store")?;
-            serde_json::from_str(&content)
-                .wrap_err("failed to parse auth store")?
+            let content = std::fs::read_to_string(&path).wrap_err("failed to read auth store")?;
+            serde_json::from_str(&content).wrap_err("failed to parse auth store")?
         } else {
             AuthData::default()
         };
@@ -99,8 +97,8 @@ impl AuthStore {
 
     /// Path: ~/.crew/auth.json
     fn store_path() -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| eyre::eyre!("cannot determine home directory"))?;
+        let home =
+            dirs::home_dir().ok_or_else(|| eyre::eyre!("cannot determine home directory"))?;
         Ok(home.join(".crew").join("auth.json"))
     }
 }

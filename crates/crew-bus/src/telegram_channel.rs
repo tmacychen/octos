@@ -108,11 +108,7 @@ impl Channel for TelegramChannel {
 
             if let UpdateKind::Message(msg) = update.kind {
                 // Extract text: plain text or caption (for photos/documents)
-                let text = msg
-                    .text()
-                    .or(msg.caption())
-                    .unwrap_or("")
-                    .to_string();
+                let text = msg.text().or(msg.caption()).unwrap_or("").to_string();
 
                 // Download media attachments
                 let mut media = Vec::new();

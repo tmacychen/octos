@@ -87,7 +87,17 @@ impl Executable for CronCommand {
                 deliver,
                 channel,
                 to,
-            } => cmd_add(&store_path, name, message, every, cron, at, deliver, channel, to),
+            } => cmd_add(
+                &store_path,
+                name,
+                message,
+                every,
+                cron,
+                at,
+                deliver,
+                channel,
+                to,
+            ),
             CronSubcommand::Remove { job_id } => cmd_remove(&store_path, &job_id),
             CronSubcommand::Enable { job_id, disable } => {
                 cmd_enable(&store_path, &job_id, !disable)
@@ -194,8 +204,10 @@ fn cmd_add(
         CronSchedule::Cron { expr }
     } else if let Some(at_str) = at {
         let dt = chrono::DateTime::parse_from_rfc3339(&at_str)
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(&at_str, "%Y-%m-%dT%H:%M:%S")
-                .map(|naive| naive.and_utc().fixed_offset()))
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(&at_str, "%Y-%m-%dT%H:%M:%S")
+                    .map(|naive| naive.and_utc().fixed_offset())
+            })
             .wrap_err("invalid timestamp format (use ISO 8601)")?;
         CronSchedule::At {
             at_ms: dt.timestamp_millis(),

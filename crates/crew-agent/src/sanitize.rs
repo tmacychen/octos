@@ -13,8 +13,7 @@ static DATA_URI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"data:[^;]{1,100};base64,[A-Za-z0-9+/=]{64,}").unwrap());
 
 /// Long hex strings (64+ contiguous hex chars, e.g. SHA-256, SHA-512, raw keys).
-static HEX_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[0-9a-fA-F]{64,}").unwrap());
+static HEX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[0-9a-fA-F]{64,}").unwrap());
 
 /// Sanitize tool output by stripping base64 data URIs and long hex strings.
 pub fn sanitize_tool_output(input: &str) -> String {
@@ -59,11 +58,7 @@ mod tests {
     #[test]
     fn test_multiple_replacements() {
         let hex = "f".repeat(64);
-        let input = format!(
-            "data:text/plain;base64,{} and {} end",
-            "A".repeat(100),
-            hex
-        );
+        let input = format!("data:text/plain;base64,{} and {} end", "A".repeat(100), hex);
         let result = sanitize_tool_output(&input);
         assert!(result.contains("[base64-data-redacted]"));
         assert!(result.contains("[hex-redacted]"));

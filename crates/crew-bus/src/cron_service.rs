@@ -1,8 +1,8 @@
 //! Cron service that fires scheduled jobs into the message bus.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
 use crew_core::InboundMessage;
@@ -279,7 +279,8 @@ impl CronService {
 
     fn save_store(&self) -> Result<()> {
         let store = self.store.lock().unwrap();
-        let json = serde_json::to_string_pretty(&*store).wrap_err("failed to serialize cron store")?;
+        let json =
+            serde_json::to_string_pretty(&*store).wrap_err("failed to serialize cron store")?;
         std::fs::write(&self.store_path, json).wrap_err("failed to write cron store")?;
         Ok(())
     }
@@ -300,7 +301,9 @@ fn short_id() -> String {
 mod tests {
     use super::*;
 
-    fn make_service(dir: &std::path::Path) -> (std::sync::Arc<CronService>, mpsc::Receiver<InboundMessage>) {
+    fn make_service(
+        dir: &std::path::Path,
+    ) -> (std::sync::Arc<CronService>, mpsc::Receiver<InboundMessage>) {
         let (tx, rx) = mpsc::channel(64);
         let service = std::sync::Arc::new(CronService::new(dir.join("cron.json"), tx));
         (service, rx)

@@ -152,7 +152,9 @@ fn parse_skill(path: &Path, content: &str, builtin: bool) -> Option<SkillInfo> {
     });
 
     let description = fm_value(&fm, "description").unwrap_or_default();
-    let always = fm_value(&fm, "always").map(|v| v == "true").unwrap_or(false);
+    let always = fm_value(&fm, "always")
+        .map(|v| v == "true")
+        .unwrap_or(false);
 
     let bins_ok = fm_value(&fm, "requires_bins")
         .map(|v| {

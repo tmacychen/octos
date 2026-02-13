@@ -60,7 +60,10 @@ impl GroqTranscriber {
         let resp = self
             .client
             .post("https://api.groq.com/openai/v1/audio/transcriptions")
-            .header("Authorization", format!("Bearer {}", self.api_key.expose_secret()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
             .multipart(form)
             .timeout(std::time::Duration::from_secs(60))
             .send()
@@ -73,7 +76,10 @@ impl GroqTranscriber {
             eyre::bail!("Groq transcription failed: {status} - {body}");
         }
 
-        let json: serde_json::Value = resp.json().await.wrap_err("invalid transcription response")?;
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .wrap_err("invalid transcription response")?;
 
         let text = json
             .get("text")

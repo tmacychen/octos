@@ -105,7 +105,10 @@ impl LlmProvider for OpenAIProvider {
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key.expose_secret()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
@@ -115,7 +118,10 @@ impl LlmProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            eyre::bail!("OpenAI API error: {status} - {}", crate::provider::truncate_error_body(&body));
+            eyre::bail!(
+                "OpenAI API error: {status} - {}",
+                crate::provider::truncate_error_body(&body)
+            );
         }
 
         let api_response: OpenAIResponse = response
@@ -209,8 +215,8 @@ impl LlmProvider for OpenAIProvider {
             tools: openai_tools,
         };
 
-        let mut body = serde_json::to_value(&request)
-            .wrap_err("failed to serialize OpenAI request")?;
+        let mut body =
+            serde_json::to_value(&request).wrap_err("failed to serialize OpenAI request")?;
         let obj = body
             .as_object_mut()
             .ok_or_else(|| eyre::eyre!("failed to build OpenAI request body"))?;
@@ -223,7 +229,10 @@ impl LlmProvider for OpenAIProvider {
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key.expose_secret()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -233,7 +242,10 @@ impl LlmProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eyre::bail!("OpenAI API error: {status} - {}", crate::provider::truncate_error_body(&text));
+            eyre::bail!(
+                "OpenAI API error: {status} - {}",
+                crate::provider::truncate_error_body(&text)
+            );
         }
 
         let sse_stream = crate::sse::parse_sse_response(response);
@@ -298,11 +310,7 @@ struct OpenAIImageUrl {
 }
 
 fn build_openai_content(msg: &Message) -> Option<OpenAIContent> {
-    let images: Vec<_> = msg
-        .media
-        .iter()
-        .filter(|p| vision::is_image(p))
-        .collect();
+    let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
 
     if images.is_empty() {
         if msg.content.is_empty() {

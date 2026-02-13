@@ -306,16 +306,16 @@ mod tests {
 
     #[test]
     fn test_private_host_ipv6() {
-        assert!(is_private_host("::1"));              // loopback
-        assert!(is_private_host("::"));               // unspecified
-        assert!(is_private_host("fc00::1"));           // ULA
-        assert!(is_private_host("fd12:3456::1"));      // ULA
-        assert!(is_private_host("fe80::1"));           // link-local
+        assert!(is_private_host("::1")); // loopback
+        assert!(is_private_host("::")); // unspecified
+        assert!(is_private_host("fc00::1")); // ULA
+        assert!(is_private_host("fd12:3456::1")); // ULA
+        assert!(is_private_host("fe80::1")); // link-local
         assert!(is_private_host("::ffff:127.0.0.1")); // IPv4-mapped loopback
-        assert!(is_private_host("::ffff:192.168.1.1"));// IPv4-mapped private
-        assert!(is_private_host("ff02::1"));            // multicast
-        assert!(is_private_host("fec0::1"));           // site-local (deprecated)
-        assert!(is_private_host("::192.168.1.1"));     // IPv4-compatible (deprecated)
+        assert!(is_private_host("::ffff:192.168.1.1")); // IPv4-mapped private
+        assert!(is_private_host("ff02::1")); // multicast
+        assert!(is_private_host("fec0::1")); // site-local (deprecated)
+        assert!(is_private_host("::192.168.1.1")); // IPv4-compatible (deprecated)
     }
 
     #[test]

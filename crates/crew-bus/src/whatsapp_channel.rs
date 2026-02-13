@@ -33,11 +33,7 @@ type WsSink = futures::stream::SplitSink<
 >;
 
 impl WhatsAppChannel {
-    pub fn new(
-        bridge_url: &str,
-        allowed_senders: Vec<String>,
-        shutdown: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(bridge_url: &str, allowed_senders: Vec<String>, shutdown: Arc<AtomicBool>) -> Self {
         let url = if bridge_url.is_empty() {
             DEFAULT_BRIDGE_URL.to_string()
         } else {
@@ -122,7 +118,10 @@ impl Channel for WhatsAppChannel {
                     "message" => {
                         let sender = msg.get("sender").and_then(|v| v.as_str()).unwrap_or("");
                         let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                        let is_group = msg.get("isGroup").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let is_group = msg
+                            .get("isGroup")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
 
                         if sender.is_empty() || content.is_empty() {
                             continue;
@@ -254,7 +253,10 @@ mod tests {
             WhatsAppChannel::clean_sender("1234567890@s.whatsapp.net"),
             "1234567890"
         );
-        assert_eq!(WhatsAppChannel::clean_sender("plain_number"), "plain_number");
+        assert_eq!(
+            WhatsAppChannel::clean_sender("plain_number"),
+            "plain_number"
+        );
     }
 
     #[test]

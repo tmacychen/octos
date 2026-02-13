@@ -65,7 +65,10 @@ impl SlackChannel {
             .wrap_err("failed to parse apps.connections.open response")?;
 
         if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             eyre::bail!("Slack apps.connections.open failed: {err}");
         }
 
@@ -94,12 +97,7 @@ impl SlackChannel {
     }
 
     /// Post a message via chat.postMessage.
-    async fn post_message(
-        &self,
-        channel: &str,
-        text: &str,
-        thread_ts: Option<&str>,
-    ) -> Result<()> {
+    async fn post_message(&self, channel: &str, text: &str, thread_ts: Option<&str>) -> Result<()> {
         let mut body = serde_json::json!({
             "channel": channel,
             "text": text,
@@ -121,7 +119,10 @@ impl SlackChannel {
             .await?;
 
         if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             warn!("chat.postMessage failed: {err}");
         }
 
@@ -285,17 +286,9 @@ impl Channel for SlackChannel {
                 if let Some(files) = event.get("files").and_then(|v| v.as_array()) {
                     let auth = format!("Bearer {}", self.bot_token);
                     for file in files {
-                        let url = file
-                            .get("url_private_download")
-                            .and_then(|v| v.as_str());
-                        let name = file
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("file");
-                        let file_id = file
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
+                        let url = file.get("url_private_download").and_then(|v| v.as_str());
+                        let name = file.get("name").and_then(|v| v.as_str()).unwrap_or("file");
+                        let file_id = file.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
                         if let Some(url) = url {
                             let ext = std::path::Path::new(name)
                                 .extension()

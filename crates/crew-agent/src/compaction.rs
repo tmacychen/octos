@@ -20,11 +20,7 @@ const BASE_CHUNK_RATIO: f64 = 0.4;
 ///
 /// Returns the index where the recent zone starts. Messages `[1..split]` are old,
 /// `[split..]` are recent. Never splits inside an assistant-tool pair.
-pub(crate) fn find_recent_boundary(
-    messages: &[Message],
-    budget: u32,
-    system_tokens: u32,
-) -> usize {
+pub(crate) fn find_recent_boundary(messages: &[Message], budget: u32, system_tokens: u32) -> usize {
     let mut recent_tokens = 0u32;
     let mut count = 0usize;
     let mut split = messages.len();
@@ -33,9 +29,7 @@ pub(crate) fn find_recent_boundary(
         let msg_tokens = estimate_message_tokens(&messages[i]);
         count += 1;
 
-        if count >= MIN_RECENT_MESSAGES
-            && system_tokens + recent_tokens + msg_tokens > budget / 2
-        {
+        if count >= MIN_RECENT_MESSAGES && system_tokens + recent_tokens + msg_tokens > budget / 2 {
             break;
         }
 
@@ -103,11 +97,7 @@ fn summarize_message(msg: &Message, context: &[Message]) -> String {
             } else {
                 " [media omitted]"
             };
-            format!(
-                "> User: {}{}",
-                first_line(&msg.content, 200),
-                media_note
-            )
+            format!("> User: {}{}", first_line(&msg.content, 200), media_note)
         }
         MessageRole::Assistant => {
             let mut parts = Vec::new();

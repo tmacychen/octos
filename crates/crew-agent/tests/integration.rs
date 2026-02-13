@@ -87,11 +87,10 @@ async fn setup(responses: Vec<ChatResponse>, dir: &TempDir) -> Agent {
     let llm: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::new(responses));
     let tools = ToolRegistry::with_builtins(dir.path());
     let memory = Arc::new(EpisodeStore::open(dir.path().join(".crew")).await.unwrap());
-    Agent::new(AgentId::new("test"), llm, tools, memory)
-        .with_config(AgentConfig {
-            save_episodes: false,
-            ..Default::default()
-        })
+    Agent::new(AgentId::new("test"), llm, tools, memory).with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    })
 }
 
 #[tokio::test]
@@ -128,7 +127,10 @@ async fn test_agent_tool_call_loop() {
     ];
 
     let agent = setup(responses, &dir).await;
-    let resp = agent.process_message("What's in hello.txt?", &[], vec![]).await.unwrap();
+    let resp = agent
+        .process_message("What's in hello.txt?", &[], vec![])
+        .await
+        .unwrap();
 
     assert_eq!(resp.content, "The file contains: world");
     // Tokens accumulated from both iterations
@@ -155,15 +157,16 @@ async fn test_agent_max_iterations() {
         })
         .collect();
 
-    let agent = setup(responses, &dir)
-        .await
-        .with_config(AgentConfig {
-            max_iterations: 3,
-            save_episodes: false,
-            ..Default::default()
-        });
+    let agent = setup(responses, &dir).await.with_config(AgentConfig {
+        max_iterations: 3,
+        save_episodes: false,
+        ..Default::default()
+    });
 
-    let resp = agent.process_message("loop forever", &[], vec![]).await.unwrap();
+    let resp = agent
+        .process_message("loop forever", &[], vec![])
+        .await
+        .unwrap();
     assert_eq!(resp.content, "Reached max iterations.");
 }
 
@@ -186,15 +189,16 @@ async fn test_agent_token_budget() {
         end_turn("done", 100, 100),
     ];
 
-    let agent = setup(responses, &dir)
-        .await
-        .with_config(AgentConfig {
-            max_tokens: Some(800),
-            save_episodes: false,
-            ..Default::default()
-        });
+    let agent = setup(responses, &dir).await.with_config(AgentConfig {
+        max_tokens: Some(800),
+        save_episodes: false,
+        ..Default::default()
+    });
 
-    let resp = agent.process_message("do stuff", &[], vec![]).await.unwrap();
+    let resp = agent
+        .process_message("do stuff", &[], vec![])
+        .await
+        .unwrap();
     // 500+500 = 1000 tokens after first iteration, exceeds 800 budget
     assert_eq!(resp.content, "Token budget exceeded.");
 }
@@ -204,9 +208,8 @@ async fn test_context_trimming() {
     let dir = TempDir::new().unwrap();
 
     // Use tiny context window to force trimming
-    let llm: Arc<dyn LlmProvider> = Arc::new(
-        MockLlmProvider::new(vec![end_turn("OK", 50, 20)]).with_context_window(500),
-    );
+    let llm: Arc<dyn LlmProvider> =
+        Arc::new(MockLlmProvider::new(vec![end_turn("OK", 50, 20)]).with_context_window(500));
     let tools = ToolRegistry::with_builtins(dir.path());
     let memory = Arc::new(EpisodeStore::open(dir.path().join(".crew")).await.unwrap());
 

@@ -108,7 +108,9 @@ impl Tool for CronTool {
             "enable" => Ok(self.handle_enable(input, true)),
             "disable" => Ok(self.handle_enable(input, false)),
             other => Ok(ToolResult {
-                output: format!("Unknown action: {other}. Use 'add', 'list', 'remove', 'enable', or 'disable'."),
+                output: format!(
+                    "Unknown action: {other}. Use 'add', 'list', 'remove', 'enable', or 'disable'."
+                ),
                 success: false,
                 ..Default::default()
             }),
@@ -137,14 +139,21 @@ impl CronTool {
                     ..Default::default()
                 });
             }
-            (CronSchedule::Every { every_ms: s * 1000 }, format!("every {s}s"))
+            (
+                CronSchedule::Every { every_ms: s * 1000 },
+                format!("every {s}s"),
+            )
         } else if let Some(expr) = input.cron_expr {
-            (CronSchedule::Cron { expr: expr.clone() }, format!("cron: {expr}"))
+            (
+                CronSchedule::Cron { expr: expr.clone() },
+                format!("cron: {expr}"),
+            )
         } else if let Some(at) = input.at_ms {
             (CronSchedule::At { at_ms: at }, format!("once at {at}"))
         } else {
             return Ok(ToolResult {
-                output: "One of 'every_seconds', 'cron_expr', or 'at_ms' is required for 'add'.".into(),
+                output: "One of 'every_seconds', 'cron_expr', or 'at_ms' is required for 'add'."
+                    .into(),
                 success: false,
                 ..Default::default()
             });

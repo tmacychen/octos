@@ -94,13 +94,8 @@ pub async fn device_code_flow() -> Result<AuthCredential> {
     let client = Client::new();
 
     let resp = client
-        .post(format!(
-            "{OPENAI_ISSUER}/api/accounts/deviceauth/usercode"
-        ))
-        .form(&[
-            ("client_id", OPENAI_CLIENT_ID),
-            ("scope", OPENAI_SCOPES),
-        ])
+        .post(format!("{OPENAI_ISSUER}/api/accounts/deviceauth/usercode"))
+        .form(&[("client_id", OPENAI_CLIENT_ID), ("scope", OPENAI_SCOPES)])
         .send()
         .await
         .wrap_err("failed to request device code")?;
@@ -129,16 +124,11 @@ pub async fn device_code_flow() -> Result<AuthCredential> {
         }
 
         let resp = client
-            .post(format!(
-                "{OPENAI_ISSUER}/api/accounts/deviceauth/token"
-            ))
+            .post(format!("{OPENAI_ISSUER}/api/accounts/deviceauth/token"))
             .form(&[
                 ("client_id", OPENAI_CLIENT_ID),
                 ("device_code", &device.device_code),
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:device_code",
-                ),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ])
             .send()
             .await?;
@@ -234,9 +224,7 @@ async fn exchange_code(code: &str, verifier: &str) -> Result<TokenResponse> {
         eyre::bail!("token exchange failed: {body}");
     }
 
-    resp.json()
-        .await
-        .wrap_err("failed to parse token response")
+    resp.json().await.wrap_err("failed to parse token response")
 }
 
 fn token_to_credential(token: TokenResponse, auth_method: &str) -> AuthCredential {

@@ -69,18 +69,68 @@ fn generate_docs() -> String {
     out
 }
 
-fn providers_list() -> Vec<(&'static str, &'static str, &'static str, Option<&'static str>)> {
+fn providers_list() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+)> {
     vec![
-        ("Anthropic", "ANTHROPIC_API_KEY", "claude-sonnet-4-20250514", None),
+        (
+            "Anthropic",
+            "ANTHROPIC_API_KEY",
+            "claude-sonnet-4-20250514",
+            None,
+        ),
         ("OpenAI", "OPENAI_API_KEY", "gpt-4o", None),
         ("Gemini", "GEMINI_API_KEY", "gemini-2.0-flash", None),
-        ("OpenRouter", "OPENROUTER_API_KEY", "anthropic/claude-sonnet-4-20250514", None),
-        ("DeepSeek", "DEEPSEEK_API_KEY", "deepseek-chat", Some("https://api.deepseek.com/v1")),
-        ("Groq", "GROQ_API_KEY", "llama-3.3-70b-versatile", Some("https://api.groq.com/openai/v1")),
-        ("Moonshot", "MOONSHOT_API_KEY", "kimi-k2.5", Some("https://api.moonshot.ai/v1")),
-        ("DashScope", "DASHSCOPE_API_KEY", "qwen-max", Some("https://dashscope.aliyuncs.com/compatible-mode/v1")),
-        ("MiniMax", "MINIMAX_API_KEY", "MiniMax-Text-01", Some("https://api.minimax.io/v1")),
-        ("Zhipu", "ZHIPU_API_KEY", "glm-4-plus", Some("https://open.bigmodel.cn/api/paas/v4")),
-        ("Ollama", "(none)", "llama3.2", Some("http://localhost:11434/v1")),
+        (
+            "OpenRouter",
+            "OPENROUTER_API_KEY",
+            "anthropic/claude-sonnet-4-20250514",
+            None,
+        ),
+        (
+            "DeepSeek",
+            "DEEPSEEK_API_KEY",
+            "deepseek-chat",
+            Some("https://api.deepseek.com/v1"),
+        ),
+        (
+            "Groq",
+            "GROQ_API_KEY",
+            "llama-3.3-70b-versatile",
+            Some("https://api.groq.com/openai/v1"),
+        ),
+        (
+            "Moonshot",
+            "MOONSHOT_API_KEY",
+            "kimi-k2.5",
+            Some("https://api.moonshot.ai/v1"),
+        ),
+        (
+            "DashScope",
+            "DASHSCOPE_API_KEY",
+            "qwen-max",
+            Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        ),
+        (
+            "MiniMax",
+            "MINIMAX_API_KEY",
+            "MiniMax-Text-01",
+            Some("https://api.minimax.io/v1"),
+        ),
+        (
+            "Zhipu",
+            "ZHIPU_API_KEY",
+            "glm-4-plus",
+            Some("https://open.bigmodel.cn/api/paas/v4"),
+        ),
+        (
+            "Ollama",
+            "(none)",
+            "llama3.2",
+            Some("http://localhost:11434/v1"),
+        ),
     ]
 }

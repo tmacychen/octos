@@ -30,7 +30,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/chat", post(handlers::chat))
         .route("/api/chat/stream", get(handlers::chat_stream))
         .route("/api/sessions", get(handlers::list_sessions))
-        .route("/api/sessions/{id}/messages", get(handlers::session_messages))
+        .route(
+            "/api/sessions/{id}/messages",
+            get(handlers::session_messages),
+        )
         .route("/api/status", get(handlers::status));
 
     // Wrap with auth middleware if token is configured

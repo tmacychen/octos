@@ -5,8 +5,8 @@
 //! Each provider has a circuit breaker that degrades after repeated failures
 //! and resets on success.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use crew_core::Message;
@@ -40,7 +40,10 @@ impl ProviderChain {
     ///
     /// Panics if `providers` is empty.
     pub fn new(providers: Vec<Arc<dyn LlmProvider>>) -> Self {
-        assert!(!providers.is_empty(), "ProviderChain requires at least one provider");
+        assert!(
+            !providers.is_empty(),
+            "ProviderChain requires at least one provider"
+        );
         let slots = providers
             .into_iter()
             .map(|p| ProviderSlot {
@@ -118,9 +121,7 @@ impl LlmProvider for ProviderChain {
             let slot = &self.slots[idx];
 
             // Skip degraded providers (unless it's our last resort)
-            if offset > 0
-                && slot.failures.load(Ordering::Relaxed) >= self.failure_threshold
-            {
+            if offset > 0 && slot.failures.load(Ordering::Relaxed) >= self.failure_threshold {
                 continue;
             }
 
@@ -163,9 +164,7 @@ impl LlmProvider for ProviderChain {
             let idx = (start + offset) % self.slots.len();
             let slot = &self.slots[idx];
 
-            if offset > 0
-                && slot.failures.load(Ordering::Relaxed) >= self.failure_threshold
-            {
+            if offset > 0 && slot.failures.load(Ordering::Relaxed) >= self.failure_threshold {
                 continue;
             }
 
@@ -275,10 +274,7 @@ mod tests {
             Arc::new(SuccessProvider { name: "fallback" }),
         ]);
 
-        let result = chain
-            .chat(&[], &[], &ChatConfig::default())
-            .await
-            .unwrap();
+        let result = chain.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(result.content.unwrap(), "ok");
     }
 
@@ -292,10 +288,7 @@ mod tests {
             }),
         ]);
 
-        let result = chain
-            .chat(&[], &[], &ChatConfig::default())
-            .await
-            .unwrap();
+        let result = chain.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(result.content.unwrap(), "ok");
     }
 

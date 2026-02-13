@@ -33,7 +33,11 @@ const MAX_CHUNKS: usize = 50;
 /// Produces at most [`MAX_CHUNKS`] chunks; remaining text is truncated with a marker.
 pub fn split_message(text: &str, config: &ChunkConfig) -> Vec<String> {
     if text.len() <= config.max_chars {
-        return if text.is_empty() { vec![] } else { vec![text.to_string()] };
+        return if text.is_empty() {
+            vec![]
+        } else {
+            vec![text.to_string()]
+        };
     }
 
     let mut chunks = Vec::new();
@@ -46,7 +50,10 @@ pub fn split_message(text: &str, config: &ChunkConfig) -> Vec<String> {
                 remaining_chars = remaining.len(),
                 "message exceeded {MAX_CHUNKS} chunks, truncating",
             );
-            chunks.push(format!("[message truncated - {} chars omitted]", remaining.len()));
+            chunks.push(format!(
+                "[message truncated - {} chars omitted]",
+                remaining.len()
+            ));
             break;
         }
 
@@ -80,19 +87,27 @@ pub fn split_message(text: &str, config: &ChunkConfig) -> Vec<String> {
 fn find_break_point(text: &str) -> usize {
     // Try paragraph break
     if let Some(pos) = text.rfind("\n\n") {
-        if pos > 0 { return pos; }
+        if pos > 0 {
+            return pos;
+        }
     }
     // Try newline
     if let Some(pos) = text.rfind('\n') {
-        if pos > 0 { return pos; }
+        if pos > 0 {
+            return pos;
+        }
     }
     // Try sentence end
     if let Some(pos) = text.rfind(". ") {
-        if pos > 0 { return pos + 1; } // include the period
+        if pos > 0 {
+            return pos + 1;
+        } // include the period
     }
     // Try space
     if let Some(pos) = text.rfind(' ') {
-        if pos > 0 { return pos; }
+        if pos > 0 {
+            return pos;
+        }
     }
     // Hard cut at char boundary
     let mut end = text.len();

@@ -61,6 +61,9 @@ mod tests {
             "tools": [{"name": "t", "description": "d"}]
         }"#;
         let manifest: PluginManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(manifest.tools[0].input_schema, serde_json::json!({"type": "object"}));
+        assert_eq!(
+            manifest.tools[0].input_schema,
+            serde_json::json!({"type": "object"})
+        );
     }
 }

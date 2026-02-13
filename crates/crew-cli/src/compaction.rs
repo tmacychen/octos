@@ -89,8 +89,7 @@ pub async fn maybe_compact_with_config(
         },
         Message {
             role: MessageRole::User,
-            content: serde_json::to_string(&transcript)
-                .unwrap_or_else(|_| "[]".to_string()),
+            content: serde_json::to_string(&transcript).unwrap_or_else(|_| "[]".to_string()),
             media: vec![],
             tool_calls: None,
             tool_call_id: None,

@@ -94,7 +94,10 @@ impl LlmProvider for AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            eyre::bail!("Anthropic API error: {status} - {}", crate::provider::truncate_error_body(&body));
+            eyre::bail!(
+                "Anthropic API error: {status} - {}",
+                crate::provider::truncate_error_body(&body)
+            );
         }
 
         let api_response: AnthropicResponse = response
@@ -171,8 +174,8 @@ impl LlmProvider for AnthropicProvider {
             tools: if tools.is_empty() { None } else { Some(tools) },
         };
 
-        let mut body = serde_json::to_value(&request)
-            .wrap_err("failed to serialize Anthropic request")?;
+        let mut body =
+            serde_json::to_value(&request).wrap_err("failed to serialize Anthropic request")?;
         body.as_object_mut()
             .ok_or_else(|| eyre::eyre!("failed to build Anthropic request body"))?
             .insert("stream".into(), true.into());
@@ -191,7 +194,10 @@ impl LlmProvider for AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eyre::bail!("Anthropic API error: {status} - {}", crate::provider::truncate_error_body(&text));
+            eyre::bail!(
+                "Anthropic API error: {status} - {}",
+                crate::provider::truncate_error_body(&text)
+            );
         }
 
         let sse_stream = crate::sse::parse_sse_response(response);
@@ -257,11 +263,7 @@ struct AnthropicImageSource {
 }
 
 fn build_anthropic_content(msg: &Message) -> AnthropicContent {
-    let images: Vec<_> = msg
-        .media
-        .iter()
-        .filter(|p| vision::is_image(p))
-        .collect();
+    let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
 
     if images.is_empty() {
         return AnthropicContent::Text(msg.content.clone());

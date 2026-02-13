@@ -37,9 +37,7 @@ fn event_to_json(event: &ProgressEvent) -> serde_json::Value {
         ProgressEvent::ToolStarted { name, .. } => {
             serde_json::json!({"type": "tool_start", "tool": name})
         }
-        ProgressEvent::ToolCompleted {
-            name, success, ..
-        } => {
+        ProgressEvent::ToolCompleted { name, success, .. } => {
             serde_json::json!({"type": "tool_end", "tool": name, "success": success})
         }
         ProgressEvent::StreamChunk { text, .. } => {

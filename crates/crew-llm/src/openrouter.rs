@@ -105,12 +105,12 @@ impl LlmProvider for OpenRouterProvider {
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key.expose_secret()))
-            .header("Content-Type", "application/json")
             .header(
-                "HTTP-Referer",
-                "https://github.com/heyong4725/crew-rs",
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
             )
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://github.com/heyong4725/crew-rs")
             .header("X-Title", "crew-rs")
             .json(&request)
             .send()
@@ -120,7 +120,10 @@ impl LlmProvider for OpenRouterProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            eyre::bail!("OpenRouter API error: {status} - {}", crate::provider::truncate_error_body(&body));
+            eyre::bail!(
+                "OpenRouter API error: {status} - {}",
+                crate::provider::truncate_error_body(&body)
+            );
         }
 
         let api_response: ApiResponse = response
@@ -214,8 +217,8 @@ impl LlmProvider for OpenRouterProvider {
             tools: api_tools,
         };
 
-        let mut body = serde_json::to_value(&request)
-            .wrap_err("failed to serialize OpenRouter request")?;
+        let mut body =
+            serde_json::to_value(&request).wrap_err("failed to serialize OpenRouter request")?;
         let obj = body
             .as_object_mut()
             .ok_or_else(|| eyre::eyre!("failed to build OpenRouter request body"))?;
@@ -228,12 +231,12 @@ impl LlmProvider for OpenRouterProvider {
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key.expose_secret()))
-            .header("Content-Type", "application/json")
             .header(
-                "HTTP-Referer",
-                "https://github.com/heyong4725/crew-rs",
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
             )
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://github.com/heyong4725/crew-rs")
             .header("X-Title", "crew-rs")
             .json(&body)
             .send()
@@ -243,12 +246,15 @@ impl LlmProvider for OpenRouterProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eyre::bail!("OpenRouter API error: {status} - {}", crate::provider::truncate_error_body(&text));
+            eyre::bail!(
+                "OpenRouter API error: {status} - {}",
+                crate::provider::truncate_error_body(&text)
+            );
         }
 
         let sse_stream = crate::sse::parse_sse_response(response);
-        let event_stream = sse_stream
-            .flat_map(|event| futures::stream::iter(parse_openai_sse_events(&event)));
+        let event_stream =
+            sse_stream.flat_map(|event| futures::stream::iter(parse_openai_sse_events(&event)));
 
         Ok(Box::pin(event_stream))
     }
@@ -307,11 +313,7 @@ struct ApiImageUrl {
 }
 
 fn build_api_content(msg: &Message) -> Option<ApiContent> {
-    let images: Vec<_> = msg
-        .media
-        .iter()
-        .filter(|p| vision::is_image(p))
-        .collect();
+    let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
 
     if images.is_empty() {
         if msg.content.is_empty() {

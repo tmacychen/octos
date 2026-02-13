@@ -76,13 +76,7 @@ impl Channel for EmailChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("Re: Message");
 
-        smtp_send(
-            &self.config,
-            &msg.chat_id,
-            subject,
-            &msg.content,
-        )
-        .await
+        smtp_send(&self.config, &msg.chat_id, subject, &msg.content).await
     }
 
     fn is_allowed(&self, sender_id: &str) -> bool {
@@ -92,10 +86,7 @@ impl Channel for EmailChannel {
 }
 
 /// Poll IMAP for unseen messages, send them as InboundMessages. Returns count.
-async fn imap_poll(
-    config: &EmailConfig,
-    tx: &mpsc::Sender<InboundMessage>,
-) -> Result<usize> {
+async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> Result<usize> {
     // Build TLS connector
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -227,12 +218,7 @@ async fn imap_poll(
 }
 
 /// Send an email via SMTP with lettre.
-async fn smtp_send(
-    config: &EmailConfig,
-    to: &str,
-    subject: &str,
-    body: &str,
-) -> Result<()> {
+async fn smtp_send(config: &EmailConfig, to: &str, subject: &str, body: &str) -> Result<()> {
     use lettre::message::header::ContentType;
     use lettre::transport::smtp::authentication::Credentials;
     use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -268,10 +254,7 @@ async fn smtp_send(
             .build()
     };
 
-    mailer
-        .send(email)
-        .await
-        .wrap_err("failed to send email")?;
+    mailer.send(email).await.wrap_err("failed to send email")?;
 
     Ok(())
 }

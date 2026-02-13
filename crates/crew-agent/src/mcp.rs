@@ -349,10 +349,7 @@ impl McpClient {
             .spawn()
             .wrap_err_with(|| format!("failed to spawn MCP server: {command}"))?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| eyre::eyre!("no stdin"))?;
+        let stdin = child.stdin.take().ok_or_else(|| eyre::eyre!("no stdin"))?;
         let stdout = child
             .stdout
             .take()
@@ -421,8 +418,8 @@ async fn initialize_and_list_tools(
         .await
         .wrap_err("MCP tools/list failed")?;
 
-    let tool_list: McpToolListResponse = serde_json::from_value(tools_result)
-        .wrap_err("failed to parse MCP tools/list response")?;
+    let tool_list: McpToolListResponse =
+        serde_json::from_value(tools_result).wrap_err("failed to parse MCP tools/list response")?;
 
     Ok((conn, tool_list.tools))
 }
@@ -532,7 +529,8 @@ mod tests {
 
     #[test]
     fn test_parse_sse_json_rpc() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
         let result = parse_sse_json_rpc(body).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["id"], 1);
@@ -562,7 +560,8 @@ mod tests {
 
     #[test]
     fn test_config_deser_http() {
-        let json = r#"{"url": "https://mcp.example.com/sse", "headers": {"Authorization": "Bearer tok"}}"#;
+        let json =
+            r#"{"url": "https://mcp.example.com/sse", "headers": {"Authorization": "Bearer tok"}}"#;
         let config: McpServerConfig = serde_json::from_str(json).unwrap();
         assert!(config.command.is_none());
         assert_eq!(config.url.as_deref(), Some("https://mcp.example.com/sse"));

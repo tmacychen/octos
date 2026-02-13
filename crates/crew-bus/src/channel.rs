@@ -87,7 +87,9 @@ impl ChannelManager {
         tokio::spawn(async move {
             while let Some(msg) = publisher.recv_outbound().await {
                 if let Some(channel) = channels.get(&msg.channel) {
-                    let config = ChunkConfig { max_chars: channel.max_message_length() };
+                    let config = ChunkConfig {
+                        max_chars: channel.max_message_length(),
+                    };
                     let chunks = split_message(&msg.content, &config);
                     let total = chunks.len();
                     for (i, chunk) in chunks.into_iter().enumerate() {

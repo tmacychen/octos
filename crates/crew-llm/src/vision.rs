@@ -7,8 +7,7 @@ use eyre::{Result, WrapErr};
 
 /// Encode an image file as base64 and return (mime_type, base64_data).
 pub fn encode_image(path: &str) -> Result<(String, String)> {
-    let bytes = std::fs::read(path)
-        .wrap_err_with(|| format!("failed to read image: {path}"))?;
+    let bytes = std::fs::read(path).wrap_err_with(|| format!("failed to read image: {path}"))?;
 
     let ext = Path::new(path)
         .extension()

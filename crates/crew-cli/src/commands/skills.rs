@@ -54,7 +54,14 @@ fn cmd_list(skills_dir: &std::path::Path) -> Result<()> {
     println!();
 
     // Built-in skills
-    let builtins = ["cron", "github", "skill-creator", "summarize", "tmux", "weather"];
+    let builtins = [
+        "cron",
+        "github",
+        "skill-creator",
+        "summarize",
+        "tmux",
+        "weather",
+    ];
     for name in &builtins {
         let overridden = skills_dir.join(name).join("SKILL.md").exists();
         if overridden {

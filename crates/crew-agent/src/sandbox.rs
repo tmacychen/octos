@@ -13,16 +13,27 @@ use tokio::process::Command;
 /// Shared between sandbox backends and MCP server spawning.
 pub const BLOCKED_ENV_VARS: &[&str] = &[
     // Linux: shared library injection
-    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
     // macOS: dylib injection
-    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
-    "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_VERSIONED_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_VERSIONED_LIBRARY_PATH",
     // Runtime-specific code injection
-    "NODE_OPTIONS", "PYTHONSTARTUP", "PYTHONPATH",
-    "PERL5OPT", "RUBYOPT", "RUBYLIB",
+    "NODE_OPTIONS",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "PERL5OPT",
+    "RUBYOPT",
+    "RUBYLIB",
     "JAVA_TOOL_OPTIONS",
     // Shell startup injection
-    "BASH_ENV", "ENV", "ZDOTDIR",
+    "BASH_ENV",
+    "ENV",
+    "ZDOTDIR",
 ];
 
 /// Sandbox configuration.
@@ -201,12 +212,14 @@ impl Sandbox for MacosSandbox {
 
         // Reject paths with control characters or SBPL metacharacters to prevent
         // sandbox profile injection. Fail closed: error instead of running unsandboxed.
-        if cwd_str.bytes().any(|b| {
-            b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"'
-        }) {
+        if cwd_str
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
+        {
             tracing::error!("cwd contains SBPL metacharacters, refusing to execute");
             let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg("echo 'sandbox error: cwd contains invalid characters' >&2; exit 1");
+            cmd.arg("-c")
+                .arg("echo 'sandbox error: cwd contains invalid characters' >&2; exit 1");
             return cmd;
         }
 
@@ -288,12 +301,17 @@ impl Sandbox for DockerSandbox {
 
         // Workspace mount — validate path to prevent volume mount injection via ':'
         let cwd_str = cwd.to_string_lossy();
-        if cwd_str.contains(':') || cwd_str.contains('\0')
-            || cwd_str.contains('\n') || cwd_str.contains('\r')
+        if cwd_str.contains(':')
+            || cwd_str.contains('\0')
+            || cwd_str.contains('\n')
+            || cwd_str.contains('\r')
         {
-            tracing::error!("cwd contains invalid characters for Docker mount, refusing to execute");
+            tracing::error!(
+                "cwd contains invalid characters for Docker mount, refusing to execute"
+            );
             let mut fail = Command::new("sh");
-            fail.arg("-c").arg("echo 'sandbox error: cwd contains invalid characters' >&2; exit 1");
+            fail.arg("-c")
+                .arg("echo 'sandbox error: cwd contains invalid characters' >&2; exit 1");
             return fail;
         }
         match self.config.mount_mode {
@@ -575,7 +593,11 @@ mod tests {
             allow_network: false,
         };
         // Parentheses, backslash, and quote should all be rejected
-        for path in &["/tmp/(allow network*)", "/tmp/test\\evil", "/tmp/test\"evil"] {
+        for path in &[
+            "/tmp/(allow network*)",
+            "/tmp/test\\evil",
+            "/tmp/test\"evil",
+        ] {
             let cmd = sb.wrap_command("ls", Path::new(path));
             let prog = cmd.as_std().get_program().to_string_lossy().to_string();
             assert_eq!(prog, "sh", "should reject path: {path}");
@@ -584,7 +606,10 @@ mod tests {
                 .get_args()
                 .map(|a| a.to_string_lossy().to_string())
                 .collect();
-            assert!(args.iter().any(|a| a.contains("exit 1")), "should exit 1 for path: {path}");
+            assert!(
+                args.iter().any(|a| a.contains("exit 1")),
+                "should exit 1 for path: {path}"
+            );
         }
     }
 
@@ -601,7 +626,10 @@ mod tests {
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         for var in BLOCKED_ENV_VARS {
-            assert!(args.contains(&format!("{var}=")), "missing env clear for {var}");
+            assert!(
+                args.contains(&format!("{var}=")),
+                "missing env clear for {var}"
+            );
         }
     }
 }

@@ -10,8 +10,10 @@ use chrono::Utc;
 use crew_core::{InboundMessage, OutboundMessage};
 use eyre::{Result, WrapErr};
 use reqwest::Client as HttpClient;
-use serenity::all::{Context, EventHandler, GatewayIntents, Http, Message as DiscordMessage, Ready};
 use serenity::Client;
+use serenity::all::{
+    Context, EventHandler, GatewayIntents, Http, Message as DiscordMessage, Ready,
+};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 

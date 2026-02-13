@@ -73,7 +73,7 @@ impl Tool for EditFileTool {
                     output: format!("Path outside working directory: {}", input.path),
                     success: false,
                     ..Default::default()
-                })
+                });
             }
         };
 

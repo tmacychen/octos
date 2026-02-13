@@ -85,11 +85,7 @@ async fn login(provider: &str, device_code: bool) -> Result<()> {
 fn logout(provider: &str) -> Result<()> {
     let mut store = AuthStore::load()?;
     if store.remove(provider)? {
-        println!(
-            "{} Logged out from {}",
-            "OK".green().bold(),
-            provider
-        );
+        println!("{} Logged out from {}", "OK".green().bold(), provider);
     } else {
         println!("No credentials found for {provider}");
     }
@@ -101,7 +97,10 @@ fn status() -> Result<()> {
     let creds: Vec<_> = store.list().collect();
 
     if creds.is_empty() {
-        println!("No saved credentials. Use {} to log in.", "crew auth login".cyan());
+        println!(
+            "No saved credentials. Use {} to log in.",
+            "crew auth login".cyan()
+        );
         return Ok(());
     }
 

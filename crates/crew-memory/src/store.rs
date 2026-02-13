@@ -69,11 +69,7 @@ impl EpisodeStore {
                         .ok()
                         .flatten()
                         .and_then(|v| bincode::deserialize(v.value()).ok());
-                    index.insert(
-                        &ep_id,
-                        &episode.summary,
-                        embedding.as_deref(),
-                    );
+                    index.insert(&ep_id, &episode.summary, embedding.as_deref());
                 }
             }
         }
@@ -242,8 +238,7 @@ impl EpisodeStore {
     pub async fn store_embedding(&self, episode_id: &str, embedding: Vec<f32>) -> Result<()> {
         let db = self.db.clone();
         let ep_id = episode_id.to_string();
-        let emb_bytes =
-            bincode::serialize(&embedding).wrap_err("failed to serialize embedding")?;
+        let emb_bytes = bincode::serialize(&embedding).wrap_err("failed to serialize embedding")?;
 
         tokio::task::spawn_blocking(move || {
             let write_txn = db.begin_write()?;

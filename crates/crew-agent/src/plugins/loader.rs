@@ -126,10 +126,7 @@ mod tests {
     #[test]
     fn test_load_nonexistent_dir() {
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(
-            &mut registry,
-            &[PathBuf::from("/nonexistent/path")],
-        );
+        let result = PluginLoader::load_into(&mut registry, &[PathBuf::from("/nonexistent/path")]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
@@ -159,7 +156,11 @@ mod tests {
 
         // Write executable
         let exec_path = plugin_dir.join("my-plugin");
-        std::fs::write(&exec_path, "#!/bin/sh\necho '{\"output\": \"hi\", \"success\": true}'").unwrap();
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"hi\", \"success\": true}'",
+        )
+        .unwrap();
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();

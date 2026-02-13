@@ -48,7 +48,10 @@ impl HeartbeatService {
         let this = Arc::clone(self);
 
         let handle = tokio::spawn(async move {
-            info!(interval_secs = this.interval_secs, "heartbeat service started");
+            info!(
+                interval_secs = this.interval_secs,
+                "heartbeat service started"
+            );
             while this.running.load(Ordering::Relaxed) {
                 tokio::time::sleep(std::time::Duration::from_secs(this.interval_secs)).await;
                 if !this.running.load(Ordering::Relaxed) {
@@ -125,15 +128,11 @@ pub fn is_heartbeat_empty(content: &str) -> bool {
             continue;
         }
         // Empty checkboxes: - [ ] or * [ ] (with optional whitespace after)
-        if (trimmed.starts_with("- [ ]") || trimmed.starts_with("* [ ]"))
-            && trimmed.len() <= 6
-        {
+        if (trimmed.starts_with("- [ ]") || trimmed.starts_with("* [ ]")) && trimmed.len() <= 6 {
             continue;
         }
         // Checked checkboxes: - [x] or * [x]
-        if (trimmed.starts_with("- [x]") || trimmed.starts_with("* [x]"))
-            && trimmed.len() <= 6
-        {
+        if (trimmed.starts_with("- [x]") || trimmed.starts_with("* [x]")) && trimmed.len() <= 6 {
             continue;
         }
         return false;

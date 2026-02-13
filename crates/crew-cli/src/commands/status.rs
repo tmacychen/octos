@@ -87,18 +87,17 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
             "(found)".green()
         );
     } else {
-        println!(
-            "{}: {}",
-            "Workspace".yellow(),
-            "not initialized".dimmed()
-        );
+        println!("{}: {}", "Workspace".yellow(), "not initialized".dimmed());
     }
 
     // Load config for provider/model info
     let config = Config::load(cwd).unwrap_or_default();
 
     let provider = config.provider.as_deref().unwrap_or("anthropic");
-    let model = config.model.as_deref().unwrap_or("claude-sonnet-4-20250514");
+    let model = config
+        .model
+        .as_deref()
+        .unwrap_or("claude-sonnet-4-20250514");
     println!("{}: {}", "Provider".green(), provider);
     println!("{}: {}", "Model".green(), model);
 
@@ -125,13 +124,7 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     println!("{}", "Bootstrap Files".cyan().bold());
     println!("{}", "─".repeat(50).dimmed());
 
-    for name in &[
-        "AGENTS.md",
-        "SOUL.md",
-        "USER.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-    ] {
+    for name in &["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"] {
         let path = data_dir.join(name);
         let status = if path.exists() {
             "found".green().to_string()

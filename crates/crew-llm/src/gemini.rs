@@ -111,10 +111,7 @@ impl LlmProvider for GeminiProvider {
             }),
         };
 
-        let url = format!(
-            "{}/models/{}:generateContent",
-            self.base_url, self.model
-        );
+        let url = format!("{}/models/{}:generateContent", self.base_url, self.model);
 
         let response = self
             .client
@@ -129,7 +126,10 @@ impl LlmProvider for GeminiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            eyre::bail!("Gemini API error: {status} - {}", crate::provider::truncate_error_body(&body));
+            eyre::bail!(
+                "Gemini API error: {status} - {}",
+                crate::provider::truncate_error_body(&body)
+            );
         }
 
         let api_response: GeminiResponse = response
@@ -265,7 +265,10 @@ impl LlmProvider for GeminiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eyre::bail!("Gemini API error: {status} - {}", crate::provider::truncate_error_body(&text));
+            eyre::bail!(
+                "Gemini API error: {status} - {}",
+                crate::provider::truncate_error_body(&text)
+            );
         }
 
         let sse_stream = crate::sse::parse_sse_response(response);
@@ -335,11 +338,7 @@ struct GeminiInlineData {
 }
 
 fn build_gemini_parts(msg: &Message) -> Vec<GeminiPart> {
-    let images: Vec<_> = msg
-        .media
-        .iter()
-        .filter(|p| vision::is_image(p))
-        .collect();
+    let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
 
     if images.is_empty() {
         return vec![GeminiPart::Text {
@@ -422,10 +421,7 @@ struct GeminiStreamState {
     has_tool_calls: bool,
 }
 
-fn map_gemini_sse(
-    state: &mut GeminiStreamState,
-    event: &crate::sse::SseEvent,
-) -> Vec<StreamEvent> {
+fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -> Vec<StreamEvent> {
     let data: serde_json::Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
         Err(_) => return vec![],

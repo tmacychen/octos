@@ -14,9 +14,7 @@ pub struct SseEvent {
 }
 
 /// Parse SSE events from a reqwest response using its bytes_stream().
-pub fn parse_sse_response(
-    response: reqwest::Response,
-) -> impl Stream<Item = SseEvent> + Send {
+pub fn parse_sse_response(response: reqwest::Response) -> impl Stream<Item = SseEvent> + Send {
     let byte_stream = response.bytes_stream();
     stream::unfold(
         (Box::pin(byte_stream), String::new()),
@@ -153,10 +151,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_event() {
-        let events: Vec<SseEvent> =
-            parse_sse_strings(make_stream(vec!["data: hello world\n\n"]))
-                .collect()
-                .await;
+        let events: Vec<SseEvent> = parse_sse_strings(make_stream(vec!["data: hello world\n\n"]))
+            .collect()
+            .await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hello world");
         assert!(events[0].event.is_none());
@@ -198,10 +195,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_done_sentinel() {
-        let events: Vec<SseEvent> =
-            parse_sse_strings(make_stream(vec!["data: [DONE]\n\n"]))
-                .collect()
-                .await;
+        let events: Vec<SseEvent> = parse_sse_strings(make_stream(vec!["data: [DONE]\n\n"]))
+            .collect()
+            .await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "[DONE]");
     }

@@ -75,7 +75,7 @@ impl Tool for ReadFileTool {
                     output: format!("Path outside working directory: {}", input.path),
                     success: false,
                     ..Default::default()
-                })
+                });
             }
         };
 

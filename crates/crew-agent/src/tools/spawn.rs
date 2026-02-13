@@ -125,7 +125,9 @@ impl Tool for SpawnTool {
 
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
         let worker_id = AgentId::new(format!("subagent-{worker_num}"));
-        let label = input.label.unwrap_or_else(|| input.task.chars().take(60).collect());
+        let label = input
+            .label
+            .unwrap_or_else(|| input.task.chars().take(60).collect());
 
         // Build the task prompt (optionally prepend context)
         let task_desc = match &input.context {

@@ -75,9 +75,9 @@ impl HybridIndex {
         self.has_embedding.push(valid_emb.is_some());
         if let Some(emb) = valid_emb {
             let normalized = l2_normalize(emb);
-            let hnsw = self.hnsw.get_or_insert_with(|| {
-                Hnsw::new(16, 10000, 16, 200, DistCosine)
-            });
+            let hnsw = self
+                .hnsw
+                .get_or_insert_with(|| Hnsw::new(16, 10000, 16, 200, DistCosine));
             hnsw.insert((&normalized, doc_idx));
         }
     }
@@ -99,9 +99,9 @@ impl HybridIndex {
 
         self.has_embedding[doc_idx] = true;
         let normalized = l2_normalize(embedding);
-        let hnsw = self.hnsw.get_or_insert_with(|| {
-            Hnsw::new(16, 10000, 16, 200, DistCosine)
-        });
+        let hnsw = self
+            .hnsw
+            .get_or_insert_with(|| Hnsw::new(16, 10000, 16, 200, DistCosine));
         hnsw.insert((&normalized, doc_idx));
         true
     }
@@ -183,8 +183,7 @@ impl HybridIndex {
                     let dl = self.doc_lengths[doc_idx] as f64;
                     let tf_d = tf as f64;
                     let numerator = tf_d * (BM25_K1 + 1.0);
-                    let denominator =
-                        tf_d + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / self.avg_dl);
+                    let denominator = tf_d + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / self.avg_dl);
                     *scores.entry(doc_idx).or_default() += idf * numerator / denominator;
                 }
             }
@@ -287,11 +286,7 @@ mod tests {
             Some(&[0.0, 1.0, 0.0, 0.0]),
         );
         // ep3: moderately relevant both ways
-        index.insert(
-            "ep3",
-            "rust async programming",
-            Some(&[0.1, 0.9, 0.0, 0.0]),
-        );
+        index.insert("ep3", "rust async programming", Some(&[0.1, 0.9, 0.0, 0.0]));
 
         // Query embedding is close to ep2/ep3
         let results = index.search("rust programming", Some(&[0.0, 1.0, 0.0, 0.0]), 3);

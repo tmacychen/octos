@@ -67,7 +67,9 @@ impl FeishuChannel {
 
         let resp: serde_json::Value = self
             .http
-            .post(format!("{FEISHU_BASE}/auth/v3/tenant_access_token/internal"))
+            .post(format!(
+                "{FEISHU_BASE}/auth/v3/tenant_access_token/internal"
+            ))
             .json(&serde_json::json!({
                 "app_id": self.app_id,
                 "app_secret": self.app_secret,
@@ -82,7 +84,10 @@ impl FeishuChannel {
             .get("tenant_access_token")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                let msg = resp.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let msg = resp
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 eyre::eyre!("Feishu token error: {msg}")
             })?
             .to_string();
@@ -106,7 +111,10 @@ impl FeishuChannel {
             .await?;
 
         let data = resp.get("data").ok_or_else(|| {
-            let msg = resp.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let msg = resp
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             eyre::eyre!("Feishu WS endpoint error: {msg}")
         })?;
 
@@ -320,7 +328,9 @@ impl Channel for FeishuChannel {
 
         let resp: serde_json::Value = self
             .http
-            .post(format!("{FEISHU_BASE}/im/v1/messages?receive_id_type={id_type}"))
+            .post(format!(
+                "{FEISHU_BASE}/im/v1/messages?receive_id_type={id_type}"
+            ))
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -332,7 +342,10 @@ impl Channel for FeishuChannel {
 
         let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
-            let err_msg = resp.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let err_msg = resp
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             warn!("Feishu send error: {err_msg}");
         }
 

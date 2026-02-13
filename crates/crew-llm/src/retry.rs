@@ -67,10 +67,7 @@ impl RetryProvider {
         for cause in error.chain() {
             if let Some(reqwest_err) = cause.downcast_ref::<reqwest::Error>() {
                 if let Some(status) = reqwest_err.status() {
-                    return matches!(
-                        status.as_u16(),
-                        429 | 500 | 502 | 503 | 504 | 529
-                    );
+                    return matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529);
                 }
                 // Connection/timeout errors from reqwest are retryable
                 if reqwest_err.is_connect() || reqwest_err.is_timeout() {

@@ -97,7 +97,9 @@ impl SessionManager {
                 .unwrap_or_else(|| Session::new(key.clone()));
             self.cache.insert(key_str.clone(), session);
         }
-        self.cache.get_mut(&key_str).expect("session must exist: inserted above")
+        self.cache
+            .get_mut(&key_str)
+            .expect("session must exist: inserted above")
     }
 
     /// Add a message to a session and persist it.
@@ -168,7 +170,10 @@ impl SessionManager {
         // Check file size after open to avoid TOCTOU race with exists() check
         let is_new = file.metadata()?.len() == 0;
         if is_new {
-            let parent_key = self.cache.get(&key.0).and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
+            let parent_key = self
+                .cache
+                .get(&key.0)
+                .and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
             let meta = SessionMeta {
                 session_key: key.0.clone(),
                 parent_key,
@@ -230,11 +235,7 @@ impl SessionManager {
         let parent = self.get_or_create(parent_key);
         let messages: Vec<Message> = parent.get_history(copy_messages).to_vec();
         // Derive channel from parent key (format: "channel:chat_id")
-        let channel = parent_key
-            .0
-            .split(':')
-            .next()
-            .unwrap_or("cli");
+        let channel = parent_key.0.split(':').next().unwrap_or("cli");
         let new_key = SessionKey::new(channel, new_chat_id);
 
         let now = Utc::now();

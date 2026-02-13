@@ -59,7 +59,7 @@ impl Tool for ListDirTool {
                     output: format!("Path outside working directory: {}", input.path),
                     success: false,
                     ..Default::default()
-                })
+                });
             }
         };
 
