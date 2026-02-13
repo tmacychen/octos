@@ -94,6 +94,14 @@ impl ToolRegistry {
         self.tools.retain(|name, _| f(name));
     }
 
+    /// Remove tools not permitted by the given policy.
+    pub fn apply_policy(&mut self, policy: &ToolPolicy) {
+        if policy.is_empty() {
+            return;
+        }
+        self.retain(|name| policy.is_allowed(name));
+    }
+
     /// Execute a tool by name.
     pub async fn execute(&self, name: &str, args: &serde_json::Value) -> Result<ToolResult> {
         let tool = self
@@ -103,6 +111,10 @@ impl ToolRegistry {
         tool.execute(args).await
     }
 }
+
+// Tool policy
+pub mod policy;
+pub use policy::ToolPolicy;
 
 // Built-in tools
 pub mod diff_edit;

@@ -134,6 +134,11 @@ impl ChatCommand {
             }
         }
 
+        // Apply tool policy from config
+        if let Some(ref policy) = config.tool_policy {
+            tools.apply_policy(policy);
+        }
+
         // Set up Ctrl+C handler
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();

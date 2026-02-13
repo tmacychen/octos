@@ -9,6 +9,7 @@
 
 mod agent;
 pub mod builtin_skills;
+mod compaction;
 pub mod policy;
 pub mod progress;
 pub mod skills;
@@ -25,7 +26,7 @@ pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentRepor
 pub use skills::{SkillInfo, SkillsLoader};
 pub use tools::{
     DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, MessageTool, ReadFileTool,
-    ShellTool, SpawnTool, Tool, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
+    ShellTool, SpawnTool, Tool, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
     WriteFileTool,
 };
 

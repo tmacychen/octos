@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 const CURRENT_CONFIG_VERSION: u32 = 1;
 
 /// LLM provider configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Config version for migration.
     #[serde(default)]
@@ -42,6 +42,10 @@ pub struct Config {
     /// Sandbox configuration.
     #[serde(default)]
     pub sandbox: crew_agent::SandboxConfig,
+
+    /// Tool access policy (allow/deny lists with group and wildcard support).
+    #[serde(default)]
+    pub tool_policy: Option<crew_agent::ToolPolicy>,
 }
 
 impl Config {
@@ -63,7 +67,7 @@ impl Config {
 }
 
 /// Gateway mode configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GatewayConfig {
     /// Channels to enable.
     #[serde(default)]
@@ -79,7 +83,7 @@ pub struct GatewayConfig {
 }
 
 /// A channel entry in gateway config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelEntry {
     /// Channel type: "cli", "telegram", "discord".
     #[serde(rename = "type")]

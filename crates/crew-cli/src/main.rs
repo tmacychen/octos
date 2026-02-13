@@ -9,6 +9,7 @@ pub mod auth;
 mod commands;
 pub mod compaction;
 pub mod config;
+pub mod config_watcher;
 pub mod cron_tool;
 
 use commands::{Args, Executable};

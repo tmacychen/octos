@@ -1,7 +1,7 @@
 //! Agent implementation.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -55,8 +55,8 @@ pub struct Agent {
     tools: ToolRegistry,
     /// Episode store for memory.
     memory: Arc<EpisodeStore>,
-    /// System prompt for this agent.
-    system_prompt: String,
+    /// System prompt for this agent (RwLock for hot-reload support).
+    system_prompt: RwLock<String>,
     /// Agent configuration.
     config: AgentConfig,
     /// Progress reporter.
@@ -80,7 +80,7 @@ impl Agent {
             llm,
             tools,
             memory,
-            system_prompt,
+            system_prompt: RwLock::new(system_prompt),
             config: AgentConfig::default(),
             reporter: Arc::new(SilentReporter),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -106,9 +106,14 @@ impl Agent {
     }
 
     /// Override the system prompt (e.g. for gateway mode).
-    pub fn with_system_prompt(mut self, prompt: String) -> Self {
-        self.system_prompt = prompt;
+    pub fn with_system_prompt(self, prompt: String) -> Self {
+        *self.system_prompt.write().unwrap() = prompt;
         self
+    }
+
+    /// Update the system prompt at runtime (hot-reload).
+    pub fn set_system_prompt(&self, prompt: String) {
+        *self.system_prompt.write().unwrap() = prompt;
     }
 
     /// The LLM model ID in use.
@@ -131,7 +136,7 @@ impl Agent {
     ) -> Result<ConversationResponse> {
         let mut messages = vec![Message {
             role: MessageRole::System,
-            content: self.system_prompt.clone(),
+            content: self.system_prompt.read().unwrap().clone(),
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
@@ -383,7 +388,7 @@ impl Agent {
     async fn build_initial_messages(&self, task: &Task) -> Vec<Message> {
         let mut messages = vec![Message {
             role: MessageRole::System,
-            content: self.system_prompt.clone(),
+            content: self.system_prompt.read().unwrap().clone(),
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
@@ -581,38 +586,79 @@ impl Agent {
         Ok((messages, files_modified, tokens_used))
     }
 
-    /// Minimum number of non-system messages to keep after trimming.
-    const MIN_KEPT_MESSAGES: usize = 2;
-
     fn trim_to_context_window(&self, messages: &mut Vec<Message>) {
-        if messages.len() <= 1 + Self::MIN_KEPT_MESSAGES {
-            return; // Not enough messages to trim
-        }
+        use crate::compaction::{MIN_RECENT_MESSAGES, compact_messages, find_recent_boundary};
+        use crew_llm::context::{estimate_message_tokens, estimate_tokens};
 
-        let window = self.llm.context_window();
-        let limit = (window as f64 * 0.8) as u32; // Reserve 20% for output
-
-        let total: u32 = messages
-            .iter()
-            .map(crew_llm::context::estimate_message_tokens)
-            .sum();
-
-        if total <= limit {
+        if messages.len() <= 1 + MIN_RECENT_MESSAGES {
             return;
         }
 
-        // If system prompt alone exceeds limit, warn but don't corrupt messages
-        let system_tokens = crew_llm::context::estimate_message_tokens(&messages[0]);
-        if system_tokens >= limit {
+        let window = self.llm.context_window();
+        let budget = (window as f64 * 0.8 / crate::compaction::SAFETY_MARGIN) as u32;
+
+        let total: u32 = messages.iter().map(estimate_message_tokens).sum();
+        if total <= budget {
+            return;
+        }
+
+        let system_tokens = estimate_message_tokens(&messages[0]);
+        if system_tokens >= budget {
             warn!(
                 system_tokens,
-                limit,
+                budget,
                 "system prompt exceeds context window budget, cannot trim"
             );
             return;
         }
 
-        // Keep system prompt (index 0) + walk backwards from end
+        let split = find_recent_boundary(messages, budget, system_tokens);
+        let recent_tokens: u32 = messages[split..].iter().map(estimate_message_tokens).sum();
+
+        // If recent messages alone exceed budget, fall back to simple truncation
+        if system_tokens + recent_tokens >= budget {
+            self.fallback_truncate(messages, budget);
+            return;
+        }
+
+        let old_messages = &messages[1..split];
+        if old_messages.is_empty() {
+            return;
+        }
+
+        let summary_budget = budget - system_tokens - recent_tokens;
+        let summary_text = compact_messages(old_messages, summary_budget);
+        let summary_tokens = estimate_tokens(&summary_text) + 4;
+
+        let original_count = messages.len();
+        let dropped = split - 1;
+        messages.drain(1..split);
+        messages.insert(
+            1,
+            Message {
+                role: MessageRole::System,
+                content: summary_text,
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        );
+
+        info!(
+            original_tokens = total,
+            summary_tokens,
+            messages_compacted = dropped,
+            messages_remaining = messages.len(),
+            original_messages = original_count,
+            "compacted conversation history ({} token budget)",
+            budget
+        );
+    }
+
+    /// Simple truncation fallback when even recent messages exceed budget.
+    fn fallback_truncate(&self, messages: &mut Vec<Message>, limit: u32) {
+        let system_tokens = crew_llm::context::estimate_message_tokens(&messages[0]);
         let mut kept_tokens = system_tokens;
         let mut keep_from = messages.len();
 
@@ -625,23 +671,19 @@ impl Agent {
             keep_from = i;
         }
 
-        // Ensure we keep at least MIN_KEPT_MESSAGES non-system messages
-        let max_keep_from = messages.len().saturating_sub(Self::MIN_KEPT_MESSAGES);
+        // Keep at least 2 non-system messages
+        let max_keep_from = messages.len().saturating_sub(2);
         if keep_from > max_keep_from {
             keep_from = max_keep_from;
         }
 
         if keep_from > 1 {
-            let original_count = messages.len();
             let dropped = keep_from - 1;
             messages.drain(1..keep_from);
             warn!(
-                original_tokens = total,
-                trimmed_tokens = kept_tokens,
                 messages_dropped = dropped,
                 messages_kept = messages.len(),
-                original_messages = original_count,
-                "trimmed messages to fit context window ({} token limit)",
+                "fallback truncation ({} token limit)",
                 limit
             );
         }

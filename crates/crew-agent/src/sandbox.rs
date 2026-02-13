@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 /// Sandbox configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// Whether sandboxing is enabled.
     #[serde(default)]
@@ -35,7 +35,7 @@ impl Default for SandboxConfig {
 }
 
 /// Which sandbox backend to use.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
     /// Auto-detect: bwrap on Linux, sandbox-exec on macOS, none elsewhere.

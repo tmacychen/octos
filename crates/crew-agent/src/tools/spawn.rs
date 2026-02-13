@@ -12,7 +12,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{Tool, ToolRegistry, ToolResult};
+use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::Agent;
 
 /// Tool that spawns background worker agents for long-running tasks.
@@ -137,11 +137,11 @@ impl Tool for SpawnTool {
         if is_sync {
             // Sync mode: run subagent inline and return the result directly
             let mut tools = ToolRegistry::with_builtins(&self.working_dir);
-            // Prevent recursive spawning; filter to allowed_tools if specified
-            tools.retain(|name| name != "spawn");
-            if !allowed_tools.is_empty() {
-                tools.retain(|name| allowed_tools.iter().any(|a| a == name));
-            }
+            let policy = ToolPolicy {
+                allow: allowed_tools,
+                deny: vec!["spawn".into()],
+            };
+            tools.apply_policy(&policy);
             let worker = Agent::new(worker_id, self.llm.clone(), tools, self.memory.clone());
 
             let subtask = Task::new(
@@ -180,11 +180,11 @@ impl Tool for SpawnTool {
 
             tokio::spawn(async move {
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
-                // Prevent recursive spawning; filter to allowed_tools if specified
-                tools.retain(|name| name != "spawn");
-                if !allowed_tools.is_empty() {
-                    tools.retain(|name| allowed_tools.iter().any(|a| a == name));
-                }
+                let policy = ToolPolicy {
+                    allow: allowed_tools,
+                    deny: vec!["spawn".into()],
+                };
+                tools.apply_policy(&policy);
                 let worker = Agent::new(wid.clone(), llm, tools, memory);
 
                 let subtask = Task::new(

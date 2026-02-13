@@ -22,6 +22,7 @@ use std::path::Path;
 
 use super::Executable;
 use crate::config::{Config, detect_provider};
+use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::cron_tool::CronTool;
 
 /// Run as a persistent gateway daemon.
@@ -313,6 +314,11 @@ impl GatewayCommand {
             }
         }
 
+        // Apply tool policy from config
+        if let Some(ref policy) = config.tool_policy {
+            tools.apply_policy(policy);
+        }
+
         tools.register(CronTool::new(cron_service.clone()));
 
         // Message tool (cross-channel messaging)
@@ -358,6 +364,28 @@ impl GatewayCommand {
         .with_reporter(Arc::new(SilentReporter))
         .with_shutdown(shutdown.clone())
         .with_system_prompt(system_prompt);
+
+        // Start config watcher for hot-reload
+        let watch_paths = {
+            let mut paths = Vec::new();
+            if let Some(ref p) = self.config {
+                paths.push(p.clone());
+            } else {
+                let local = cwd.join(".crew").join("config.json");
+                if local.exists() {
+                    paths.push(local);
+                }
+                if let Some(global) = Config::global_config_path() {
+                    if global.exists() {
+                        paths.push(global);
+                    }
+                }
+            }
+            paths
+        };
+        let (config_tx, mut config_rx) = tokio::sync::watch::channel(None);
+        let _watcher_handle = ConfigWatcher::new(watch_paths, config.clone(), config_tx).spawn();
+        let mut max_history = gw_config.max_history;
 
         // Create session manager
         let mut session_mgr =
@@ -529,6 +557,30 @@ impl GatewayCommand {
                 break;
             }
 
+            // Apply hot-reload config changes
+            if config_rx.has_changed().unwrap_or(false) {
+                if let Some(change) = config_rx.borrow_and_update().clone() {
+                    match change {
+                        ConfigChange::HotReload {
+                            system_prompt,
+                            max_history: new_max,
+                        } => {
+                            if let Some(prompt) = system_prompt {
+                                agent.set_system_prompt(prompt);
+                                info!("System prompt updated via hot-reload");
+                            }
+                            if let Some(new_max) = new_max {
+                                max_history = new_max;
+                                info!("Max history updated to {new_max} via hot-reload");
+                            }
+                        }
+                        ConfigChange::RestartRequired(_) => {
+                            // Already logged by ConfigWatcher
+                        }
+                    }
+                }
+            }
+
             // Transcribe audio media and separate images
             let mut image_media = Vec::new();
             if let Some(ref transcriber) = transcriber {
@@ -588,7 +640,7 @@ impl GatewayCommand {
 
             // Get conversation history
             let session = session_mgr.get_or_create(&session_key);
-            let history: Vec<Message> = session.get_history(gw_config.max_history).to_vec();
+            let history: Vec<Message> = session.get_history(max_history).to_vec();
 
             // Process message through agent (with images for vision)
             let response = agent
