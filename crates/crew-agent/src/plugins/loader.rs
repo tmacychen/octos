@@ -89,16 +89,18 @@ impl PluginLoader {
                 )
             })?;
 
-        // SHA-256 hash verification
+        // SHA-256 hash verification.
+        // Read executable content once to avoid TOCTOU (file swap between
+        // hash check and later use).
+        let exe_bytes = std::fs::read(&executable)
+            .map_err(|e| eyre::eyre!("cannot read plugin executable: {e}"))?;
         match &manifest.sha256 {
             Some(expected_hash) => {
-                let actual_hash = compute_sha256(&executable)?;
+                let actual_hash = format!("{:x}", Sha256::digest(&exe_bytes));
                 if actual_hash != expected_hash.to_lowercase() {
                     eyre::bail!(
-                        "plugin '{}' hash mismatch: expected {}, got {}",
+                        "plugin '{}' failed integrity check (hash mismatch)",
                         manifest.name,
-                        expected_hash,
-                        actual_hash
                     );
                 }
                 info!(
@@ -139,6 +141,7 @@ impl PluginLoader {
 }
 
 /// Compute SHA-256 hex digest of a file.
+#[cfg(test)]
 fn compute_sha256(path: &Path) -> Result<String> {
     let data = std::fs::read(path)?;
     let hash = Sha256::digest(&data);

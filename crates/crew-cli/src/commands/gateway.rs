@@ -717,7 +717,8 @@ impl GatewayCommand {
             let queue_mode = gw_config.queue_mode.clone();
             let collect_inbound_tx = collect_inbound_tx.clone();
 
-            tokio::spawn(async move {
+            let session_key_str = session_key.to_string();
+            let handle = tokio::spawn(async move {
                 // Acquire concurrency permit (blocks if at max)
                 let _permit = match semaphore.acquire().await {
                     Ok(permit) => permit,
@@ -757,6 +758,18 @@ impl GatewayCommand {
                     &collect_inbound_tx,
                 )
                 .await;
+            });
+
+            // Monitor spawned task for panics
+            let session_key_for_log = session_key_str;
+            tokio::spawn(async move {
+                if let Err(e) = handle.await {
+                    tracing::error!(
+                        session = %session_key_for_log,
+                        error = %e,
+                        "session task panicked"
+                    );
+                }
             });
         }
 

@@ -251,9 +251,11 @@ fn collect_symbols(
         },
         "javascript" => match kind {
             "function_declaration" | "method_definition" | "arrow_function" => {
+                // Arrow function name extraction: handles `const f = () => {}`
+                // via variable_declarator parent. Does not cover property
+                // assignments like `obj.method = () => {}`.
                 let name = child_text(&node, "name", source)
                     .or_else(|| {
-                        // For arrow functions assigned to variables
                         node.parent()
                             .filter(|p| p.kind() == "variable_declarator")
                             .and_then(|p| child_text(&p, "name", source))

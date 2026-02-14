@@ -83,9 +83,29 @@ impl Tool for GitTool {
         let args: GitArgs = serde_json::from_value(args.clone())
             .map_err(|e| eyre::eyre!("invalid arguments: {e}"))?;
 
+        // Validate user-provided path against traversal attacks
+        if let Some(ref path) = args.path {
+            if let Err(e) = super::resolve_path(&self.working_dir, path) {
+                return Ok(ToolResult {
+                    output: format!("git error: {e}"),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
+
         let output = match args.command.as_str() {
             "status" => git_status(&self.working_dir),
-            "diff" => git_diff(&self.working_dir, args.path.as_deref(), args.revision.as_deref()),
+            "diff" => {
+                if args.revision.is_some() {
+                    return Ok(ToolResult {
+                        output: "revision-based diff is not yet supported; omit 'revision' to diff working tree against index".to_string(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                git_diff(&self.working_dir, args.path.as_deref())
+            }
             "log" => git_log(&self.working_dir, args.count),
             "show" => git_show(&self.working_dir, args.revision.as_deref().unwrap_or("HEAD")),
             "blame" => {
@@ -158,11 +178,12 @@ fn git_status(cwd: &std::path::Path) -> Result<String> {
                     let entry = index.entries().iter().find(|e| {
                         e.path(&index).to_str().ok().is_some_and(|p| p == rel_str.as_ref())
                     });
-                    if let Some(_entry) = entry {
-                        // Simple heuristic: if file size differs from index, mark modified
-                        // Full content comparison would require reading blobs
+                    if let Some(idx_entry) = entry {
+                        // Heuristic: compare file size to detect modifications.
+                        // This may miss same-size edits (e.g. changing one char).
+                        // Full accuracy would require blob content comparison.
                         let file_size = meta.len() as u32;
-                        if file_size != _entry.stat.size {
+                        if file_size != idx_entry.stat.size {
                             modified.push(rel_str.to_string());
                         }
                     }
@@ -210,11 +231,7 @@ fn git_status(cwd: &std::path::Path) -> Result<String> {
     Ok(serde_json::to_string_pretty(&result)?)
 }
 
-fn git_diff(
-    cwd: &std::path::Path,
-    path: Option<&str>,
-    revision: Option<&str>,
-) -> Result<String> {
+fn git_diff(cwd: &std::path::Path, path: Option<&str>) -> Result<String> {
     let repo = gix::discover(cwd)?;
     let worktree = repo
         .workdir()
@@ -271,8 +288,6 @@ fn git_diff(
             }
         }
     }
-
-    let _ = revision; // TODO: revision-based diff (compare two commits)
 
     if diffs.is_empty() {
         Ok("No changes.".to_string())
@@ -376,7 +391,9 @@ fn git_blame(cwd: &std::path::Path, path: &str) -> Result<String> {
         .workdir()
         .ok_or_else(|| eyre::eyre!("bare repository"))?;
 
-    let file_path = worktree.join(path);
+    // Path already validated via resolve_path in execute(), but resolve again
+    // against worktree for the actual read path.
+    let file_path = super::resolve_path(worktree, path)?;
     if !file_path.exists() {
         eyre::bail!("file not found: {path}");
     }
@@ -505,6 +522,41 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.output, "No changes.");
+    }
+
+    #[tokio::test]
+    async fn test_git_path_traversal_rejected() {
+        let dir = setup_git_repo();
+        let tool = GitTool::new(dir.path());
+
+        // blame with traversal
+        let result = tool
+            .execute(&serde_json::json!({"command": "blame", "path": "../../../etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("outside working directory"));
+
+        // diff with traversal
+        let result = tool
+            .execute(&serde_json::json!({"command": "diff", "path": "../../../etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("outside working directory"));
+    }
+
+    #[tokio::test]
+    async fn test_git_diff_revision_rejected() {
+        let dir = setup_git_repo();
+        let tool = GitTool::new(dir.path());
+
+        let result = tool
+            .execute(&serde_json::json!({"command": "diff", "revision": "HEAD~1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("not yet supported"));
     }
 
     #[tokio::test]
