@@ -12,6 +12,15 @@ pub struct PluginManifest {
     /// Tools provided by this plugin.
     #[serde(default)]
     pub tools: Vec<PluginToolDef>,
+    /// SHA-256 hash of the plugin executable for integrity verification.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Whether the plugin needs network access (informational).
+    #[serde(default)]
+    pub requires_network: bool,
+    /// Override default execution timeout in seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// A tool definition within a plugin manifest.

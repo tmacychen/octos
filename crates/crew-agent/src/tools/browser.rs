@@ -434,6 +434,10 @@ impl Tool for BrowserTool {
          text/HTML extraction, clicking, typing, screenshots, and JS evaluation."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["web", "interactive"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",

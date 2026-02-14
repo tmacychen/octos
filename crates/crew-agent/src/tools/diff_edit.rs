@@ -38,6 +38,10 @@ impl Tool for DiffEditTool {
          Use standard unified diff format with @@ -start,count +start,count @@ headers."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["fs", "code"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

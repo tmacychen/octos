@@ -34,6 +34,12 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for input parameters.
     fn input_schema(&self) -> serde_json::Value;
 
+    /// Semantic tags for capability-based filtering (e.g. "code", "web", "gateway").
+    /// Default: empty (tool passes all tag filters).
+    fn tags(&self) -> &[&str] {
+        &[]
+    }
+
     /// Execute the tool with the given arguments.
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult>;
 }
@@ -43,6 +49,9 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// Provider-specific policy that filters specs() output without removing tools.
     provider_policy: Option<ToolPolicy>,
+    /// Context-based tag filter: only tools with matching tags appear in specs().
+    /// Tools with empty tags always pass.
+    context_filter: Option<Vec<String>>,
 }
 
 impl Default for ToolRegistry {
@@ -57,6 +66,7 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             provider_policy: None,
+            context_filter: None,
         }
     }
 
@@ -77,7 +87,17 @@ impl ToolRegistry {
             .filter(|t| {
                 self.provider_policy
                     .as_ref()
-                    .is_none_or(|p| p.is_allowed(t.name()))
+                    .is_none_or(|p| p.is_allowed_with_tags(t.name(), t.tags()))
+            })
+            .filter(|t| {
+                self.context_filter
+                    .as_ref()
+                    .is_none_or(|tags| {
+                        // Tools with no tags pass through; tools with tags must match
+                        let tool_tags = t.tags();
+                        tool_tags.is_empty()
+                            || tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
+                    })
             })
             .map(|t| ToolSpec {
                 name: t.name().to_string(),
@@ -125,6 +145,15 @@ impl ToolRegistry {
     /// can propagate it to subagent registries.
     pub fn provider_policy(&self) -> Option<&ToolPolicy> {
         self.provider_policy.as_ref()
+    }
+
+    /// Set a context-based tag filter. Only tools whose tags overlap with these
+    /// values will appear in `specs()`. Tools with no tags always pass through.
+    pub fn set_context_filter(&mut self, tags: Vec<String>) {
+        if tags.is_empty() {
+            return;
+        }
+        self.context_filter = Some(tags);
     }
 
     /// Execute a tool by name.
@@ -180,6 +209,12 @@ pub mod write_file;
 #[cfg(feature = "browser")]
 pub mod browser;
 
+#[cfg(feature = "git")]
+pub mod git;
+
+#[cfg(feature = "ast")]
+pub mod code_structure;
+
 pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;
@@ -195,6 +230,12 @@ pub use write_file::WriteFileTool;
 
 #[cfg(feature = "browser")]
 pub use browser::BrowserTool;
+
+#[cfg(feature = "git")]
+pub use git::GitTool;
+
+#[cfg(feature = "ast")]
+pub use code_structure::CodeStructureTool;
 
 use std::path::{Component, Path};
 
@@ -278,6 +319,10 @@ impl ToolRegistry {
         registry.register(WebFetchTool::new());
         #[cfg(feature = "browser")]
         registry.register(BrowserTool::new());
+        #[cfg(feature = "git")]
+        registry.register(GitTool::new(cwd));
+        #[cfg(feature = "ast")]
+        registry.register(CodeStructureTool::new(cwd));
         registry
     }
 }

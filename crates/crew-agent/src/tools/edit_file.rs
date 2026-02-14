@@ -40,6 +40,10 @@ impl Tool for EditFileTool {
         "Edit a file by replacing an exact string with a new string. The old_string must match exactly (including whitespace and indentation)."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["fs", "code"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

@@ -39,6 +39,10 @@ impl Tool for WriteFileTool {
         "Write content to a file. Creates the file if it doesn't exist, or overwrites if it does."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["fs", "code"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

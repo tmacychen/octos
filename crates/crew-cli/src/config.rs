@@ -64,6 +64,11 @@ pub struct Config {
     /// Lifecycle hooks for agent events.
     #[serde(default)]
     pub hooks: Vec<crew_agent::HookConfig>,
+
+    /// Context-based tool tag filter. When set, only tools matching at least one
+    /// tag are visible to the LLM. Example: `["code", "search"]`.
+    #[serde(default)]
+    pub context_filter: Vec<String>,
 }
 
 /// A fallback model for the provider failover chain.
@@ -146,6 +151,22 @@ pub struct GatewayConfig {
     /// Message queue mode: "followup" (default) or "collect".
     #[serde(default)]
     pub queue_mode: QueueMode,
+
+    /// Maximum sessions to keep in memory (LRU eviction). Default: 1000.
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
+
+    /// Maximum concurrent session processing. Default: 10.
+    #[serde(default = "default_max_concurrent_sessions")]
+    pub max_concurrent_sessions: usize,
+}
+
+fn default_max_sessions() -> usize {
+    1000
+}
+
+fn default_max_concurrent_sessions() -> usize {
+    10
 }
 
 /// A channel entry in gateway config.
@@ -574,6 +595,8 @@ mod tests {
                 max_history: 50,
                 system_prompt: None,
                 queue_mode: QueueMode::default(),
+                max_sessions: default_max_sessions(),
+                max_concurrent_sessions: default_max_concurrent_sessions(),
             }),
             ..Default::default()
         };
@@ -638,6 +661,8 @@ mod tests {
                 max_history: 0,
                 system_prompt: None,
                 queue_mode: QueueMode::default(),
+                max_sessions: default_max_sessions(),
+                max_concurrent_sessions: default_max_concurrent_sessions(),
             }),
             ..Default::default()
         };

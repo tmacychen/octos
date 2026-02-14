@@ -1,5 +1,6 @@
 //! Gateway command: run as a persistent messaging daemon.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,13 +15,14 @@ use crew_agent::{
 use crew_bus::{
     ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager, create_bus,
 };
-use crew_core::{AgentId, Message, MessageRole, OutboundMessage};
+use crew_core::{AgentId, Message, MessageRole, OutboundMessage, SessionKey};
 use crew_llm::{
     GroqTranscriber, LlmProvider, ProviderChain, RetryProvider, anthropic::AnthropicProvider,
     gemini::GeminiProvider, openai::OpenAIProvider, openrouter::OpenRouterProvider,
 };
 use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 
 use std::path::Path;
@@ -106,6 +108,8 @@ impl GatewayCommand {
                 max_history: 50,
                 system_prompt: None,
                 queue_mode: QueueMode::default(),
+                max_sessions: 1000,
+                max_concurrent_sessions: 10,
             });
 
         println!("{}: {}", "Provider".green(), provider_name);
@@ -334,6 +338,11 @@ impl GatewayCommand {
             tools.apply_policy(policy);
         }
 
+        // Apply context-based tag filter
+        if !config.context_filter.is_empty() {
+            tools.set_context_filter(config.context_filter.clone());
+        }
+
         // Apply provider-specific tool policy
         if let Some(policy) = resolve_provider_policy(&config, &provider_name, &model_id) {
             tools.set_provider_policy(policy);
@@ -406,11 +415,14 @@ impl GatewayCommand {
         };
         let (config_tx, mut config_rx) = tokio::sync::watch::channel(None);
         let _watcher_handle = ConfigWatcher::new(watch_paths, config.clone(), config_tx).spawn();
-        let mut max_history = gw_config.max_history;
+        let max_history = gw_config.max_history;
 
-        // Create session manager
-        let mut session_mgr =
-            SessionManager::open(&data_dir).wrap_err("failed to open session manager")?;
+        // Create session manager with LRU eviction (shared for concurrent access)
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&data_dir)
+                .wrap_err("failed to open session manager")?
+                .with_max_sessions(gw_config.max_sessions),
+        ));
 
         // Create channel manager and register channels
         let mut channel_mgr = ChannelManager::new();
@@ -556,6 +568,11 @@ impl GatewayCommand {
         });
 
         println!("{}: {}", "Max history".green(), gw_config.max_history);
+        println!(
+            "{}: {}",
+            "Max concurrent".green(),
+            gw_config.max_concurrent_sessions
+        );
         println!();
         println!(
             "{}",
@@ -563,13 +580,26 @@ impl GatewayCommand {
         );
         println!();
 
-        // Main loop: process inbound messages
+        // Wrap agent in Arc for sharing across spawned tasks
+        let agent = Arc::new(agent);
+
+        // Per-session locks to serialize messages within the same session
+        let session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Semaphore to bound concurrent session processing
+        let concurrency_semaphore = Arc::new(Semaphore::new(gw_config.max_concurrent_sessions));
+
+        // Shared max_history behind Arc<Mutex<>> for hot-reload
+        let max_history = Arc::new(std::sync::atomic::AtomicUsize::new(max_history));
+
+        // Main loop: dispatch inbound messages to concurrent tasks
         while let Some(mut inbound) = agent_handle.recv_inbound().await {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Apply hot-reload config changes
+            // Apply hot-reload config changes (stays on main task)
             if config_rx.has_changed().unwrap_or(false) {
                 if let Some(change) = config_rx.borrow_and_update().clone() {
                     match change {
@@ -582,7 +612,7 @@ impl GatewayCommand {
                                 info!("System prompt updated via hot-reload");
                             }
                             if let Some(new_max) = new_max {
-                                max_history = new_max;
+                                max_history.store(new_max, Ordering::Relaxed);
                                 info!("Max history updated to {new_max} via hot-reload");
                             }
                         }
@@ -593,7 +623,7 @@ impl GatewayCommand {
                 }
             }
 
-            // Transcribe audio media and separate images
+            // Transcribe audio media and separate images (stays on main task)
             let mut image_media = Vec::new();
             if let Some(ref transcriber) = transcriber {
                 for path in &inbound.media {
@@ -610,7 +640,6 @@ impl GatewayCommand {
                     }
                 }
             } else {
-                // No transcriber: just keep image media
                 image_media = inbound
                     .media
                     .iter()
@@ -638,14 +667,9 @@ impl GatewayCommand {
                 (inbound.channel.clone(), inbound.chat_id.clone())
             };
 
-            // Update per-message context for tools
-            message_tool.set_context(&reply_channel, &reply_chat_id);
-            spawn_tool.set_context(&reply_channel, &reply_chat_id);
-
             let session_key = inbound.session_key();
 
-            // Handle /new command: fork the current session.
-            // Namespace by sender_id so each user gets their own fork.
+            // Handle /new command inline (quick operation, no concurrency needed)
             if inbound.content.trim() == "/new" {
                 let new_id = format!(
                     "{}_{}_{}",
@@ -653,7 +677,7 @@ impl GatewayCommand {
                     inbound.chat_id,
                     chrono::Utc::now().timestamp_millis(),
                 );
-                match session_mgr.fork(&session_key, &new_id, 10) {
+                match session_mgr.lock().await.fork(&session_key, &new_id, 10) {
                     Ok(new_key) => {
                         let msg = OutboundMessage {
                             channel: reply_channel.clone(),
@@ -676,91 +700,64 @@ impl GatewayCommand {
                 channel = %inbound.channel,
                 sender = %inbound.sender_id,
                 session = %session_key,
-                "processing message"
+                "dispatching message to concurrent handler"
             );
 
-            // Get conversation history
-            let session = session_mgr.get_or_create(&session_key);
-            let history: Vec<Message> = session.get_history(max_history).to_vec();
+            // Clone shared state for the spawned task
+            let agent = agent.clone();
+            let session_mgr = session_mgr.clone();
+            let session_locks = session_locks.clone();
+            let semaphore = concurrency_semaphore.clone();
+            let message_tool = message_tool.clone();
+            let spawn_tool = spawn_tool.clone();
+            let llm_for_compaction = llm_for_compaction.clone();
+            let out_tx = agent_handle.outbound_sender();
+            let max_history = max_history.clone();
+            let shutdown = shutdown.clone();
+            let queue_mode = gw_config.queue_mode.clone();
+            let collect_inbound_tx = collect_inbound_tx.clone();
 
-            // Process message through agent (with images for vision)
-            let response = agent
-                .process_message(&inbound.content, &history, image_media)
+            tokio::spawn(async move {
+                // Acquire concurrency permit (blocks if at max)
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => return, // semaphore closed
+                };
+
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                // Get or create per-session lock
+                let session_lock = {
+                    let mut locks = session_locks.lock().await;
+                    locks
+                        .entry(session_key.to_string())
+                        .or_insert_with(|| Arc::new(Mutex::new(())))
+                        .clone()
+                };
+
+                // Serialize processing within the same session
+                let _session_guard = session_lock.lock().await;
+
+                process_session_message(
+                    &agent,
+                    &session_mgr,
+                    &message_tool,
+                    &spawn_tool,
+                    &llm_for_compaction,
+                    &out_tx,
+                    &inbound,
+                    &session_key,
+                    &reply_channel,
+                    &reply_chat_id,
+                    image_media,
+                    max_history.load(Ordering::Relaxed),
+                    &queue_mode,
+                    &collect_inbound_tx,
+                )
                 .await;
-
-            match response {
-                Ok(conv_response) => {
-                    // Save user message to session
-                    let user_msg = Message {
-                        role: MessageRole::User,
-                        content: inbound.content.clone(),
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: None,
-                        timestamp: Utc::now(),
-                    };
-                    let _ = session_mgr.add_message(&session_key, user_msg);
-
-                    // Save assistant response to session
-                    let assistant_msg = Message {
-                        role: MessageRole::Assistant,
-                        content: conv_response.content.clone(),
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: None,
-                        timestamp: Utc::now(),
-                    };
-                    let _ = session_mgr.add_message(&session_key, assistant_msg);
-
-                    // Compact session if it's grown too large
-                    if let Err(e) = crate::compaction::maybe_compact(
-                        &mut session_mgr,
-                        &session_key,
-                        &*llm_for_compaction,
-                    )
-                    .await
-                    {
-                        warn!("session compaction failed: {e}");
-                    }
-
-                    // Send response back through channel
-                    let outbound = OutboundMessage {
-                        channel: reply_channel.clone(),
-                        chat_id: reply_chat_id.clone(),
-                        content: conv_response.content,
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    };
-
-                    if agent_handle.send_outbound(outbound).await.is_err() {
-                        break;
-                    }
-
-                    // Collect mode: drain queued messages, merge by session, re-process
-                    if gw_config.queue_mode == QueueMode::Collect {
-                        let queued = agent_handle.try_recv_all();
-                        if !queued.is_empty() {
-                            for merged_msg in merge_queued_by_session(queued) {
-                                let _ = collect_inbound_tx.send(merged_msg).await;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let error_msg = OutboundMessage {
-                        channel: reply_channel.clone(),
-                        chat_id: reply_chat_id.clone(),
-                        content: format!("Error: {e}"),
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    };
-                    if agent_handle.send_outbound(error_msg).await.is_err() {
-                        break;
-                    }
-                }
-            }
+            });
         }
 
         heartbeat_service.stop().await;
@@ -768,6 +765,102 @@ impl GatewayCommand {
         channel_mgr.stop_all().await?;
         println!("{}", "Gateway stopped.".dimmed());
         Ok(())
+    }
+}
+
+/// Process a single inbound message for a session (runs inside a spawned task).
+#[allow(clippy::too_many_arguments)]
+async fn process_session_message(
+    agent: &Agent,
+    session_mgr: &Mutex<SessionManager>,
+    message_tool: &MessageTool,
+    spawn_tool: &SpawnTool,
+    llm: &Arc<dyn LlmProvider>,
+    out_tx: &tokio::sync::mpsc::Sender<OutboundMessage>,
+    inbound: &crew_core::InboundMessage,
+    session_key: &SessionKey,
+    reply_channel: &str,
+    reply_chat_id: &str,
+    image_media: Vec<String>,
+    max_history: usize,
+    queue_mode: &QueueMode,
+    collect_tx: &tokio::sync::mpsc::Sender<crew_core::InboundMessage>,
+) {
+    // Set tool context for this session's reply routing
+    message_tool.set_context(reply_channel, reply_chat_id);
+    spawn_tool.set_context(reply_channel, reply_chat_id);
+
+    // Get conversation history (hold session_mgr lock briefly)
+    let history: Vec<Message> = {
+        let mut mgr = session_mgr.lock().await;
+        let session = mgr.get_or_create(session_key);
+        session.get_history(max_history).to_vec()
+    };
+
+    // Process message through agent (potentially long LLM call, no lock held)
+    let response = agent
+        .process_message(&inbound.content, &history, image_media)
+        .await;
+
+    match response {
+        Ok(conv_response) => {
+            // Save user + assistant messages (hold lock briefly)
+            {
+                let mut mgr = session_mgr.lock().await;
+                let user_msg = Message {
+                    role: MessageRole::User,
+                    content: inbound.content.clone(),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Utc::now(),
+                };
+                let _ = mgr.add_message(session_key, user_msg);
+
+                let assistant_msg = Message {
+                    role: MessageRole::Assistant,
+                    content: conv_response.content.clone(),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Utc::now(),
+                };
+                let _ = mgr.add_message(session_key, assistant_msg);
+
+                // Compact session if it's grown too large
+                if let Err(e) =
+                    crate::compaction::maybe_compact(&mut mgr, session_key, &**llm).await
+                {
+                    warn!("session compaction failed: {e}");
+                }
+            }
+
+            // Send response back through channel
+            let outbound = OutboundMessage {
+                channel: reply_channel.to_string(),
+                chat_id: reply_chat_id.to_string(),
+                content: conv_response.content,
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            };
+            let _ = out_tx.send(outbound).await;
+
+            // Collect mode: not applicable in concurrent processing
+            // (would require access to agent_handle which stays on main task)
+            let _ = (queue_mode, collect_tx);
+        }
+        Err(e) => {
+            let error_msg = OutboundMessage {
+                channel: reply_channel.to_string(),
+                chat_id: reply_chat_id.to_string(),
+                content: format!("Error: {e}"),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            };
+            let _ = out_tx.send(error_msg).await;
+        }
     }
 }
 
@@ -838,6 +931,8 @@ fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> Strin
 
 /// Merge queued inbound messages by session key.
 /// Messages from the same session are concatenated with `\n\n`.
+/// Used by Collect queue mode (reserved for future concurrent collect support).
+#[allow(dead_code)]
 fn merge_queued_by_session(messages: Vec<crew_core::InboundMessage>) -> Vec<crew_core::InboundMessage> {
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<String, Vec<crew_core::InboundMessage>> = BTreeMap::new();

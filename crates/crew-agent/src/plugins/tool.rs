@@ -13,8 +13,6 @@ use crate::tools::{Tool, ToolResult};
 
 use super::manifest::PluginToolDef;
 
-const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// A tool backed by a plugin executable.
 ///
 /// Protocol: write JSON args to stdin, read JSON result from stdout.
@@ -23,15 +21,36 @@ pub struct PluginTool {
     plugin_name: String,
     tool_def: PluginToolDef,
     executable: PathBuf,
+    /// Environment variables to strip from the plugin's environment.
+    blocked_env: Vec<String>,
+    /// Execution timeout.
+    timeout: Duration,
 }
 
 impl PluginTool {
+    /// Default timeout for plugin execution.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
     pub fn new(plugin_name: String, tool_def: PluginToolDef, executable: PathBuf) -> Self {
         Self {
             plugin_name,
             tool_def,
             executable,
+            blocked_env: vec![],
+            timeout: Self::DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Set environment variables to block from plugin execution.
+    pub fn with_blocked_env(mut self, blocked: Vec<String>) -> Self {
+        self.blocked_env = blocked;
+        self
+    }
+
+    /// Set custom execution timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -50,19 +69,24 @@ impl Tool for PluginTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let mut child = Command::new(&self.executable)
-            .arg(&self.tool_def.name)
+        let mut cmd = Command::new(&self.executable);
+        cmd.arg(&self.tool_def.name)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to spawn plugin '{}' executable: {}",
-                    self.plugin_name,
-                    self.executable.display()
-                )
-            })?;
+            .stderr(Stdio::piped());
+
+        // Remove blocked environment variables
+        for var in &self.blocked_env {
+            cmd.env_remove(var);
+        }
+
+        let mut child = cmd.spawn().wrap_err_with(|| {
+            format!(
+                "failed to spawn plugin '{}' executable: {}",
+                self.plugin_name,
+                self.executable.display()
+            )
+        })?;
 
         // Write args to stdin
         if let Some(mut stdin) = child.stdin.take() {
@@ -71,14 +95,14 @@ impl Tool for PluginTool {
             // Drop stdin to signal EOF
         }
 
-        let result = tokio::time::timeout(PLUGIN_TIMEOUT, child.wait_with_output())
+        let result = tokio::time::timeout(self.timeout, child.wait_with_output())
             .await
             .wrap_err_with(|| {
                 format!(
                     "plugin '{}' tool '{}' timed out after {}s",
                     self.plugin_name,
                     self.tool_def.name,
-                    PLUGIN_TIMEOUT.as_secs()
+                    self.timeout.as_secs()
                 )
             })?
             .wrap_err_with(|| {

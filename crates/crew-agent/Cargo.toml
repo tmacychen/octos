@@ -27,12 +27,20 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 htmd = { workspace = true }
 dirs = { workspace = true }
+sha2 = { workspace = true }
+gix = { workspace = true, optional = true }
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true, features = ["connect"] }
 which = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 
 [features]
+git = ["dep:gix"]
+ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript"]
 browser = ["dep:tokio-tungstenite", "dep:which", "dep:tempfile", "dep:base64"]
 
 [lints]

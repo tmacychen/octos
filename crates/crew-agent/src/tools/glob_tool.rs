@@ -46,6 +46,10 @@ impl Tool for GlobTool {
         "Find files matching a glob pattern. Use ** for recursive matching. Examples: '**/*.rs' finds all Rust files, 'src/**/*.py' finds Python files in src."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["search", "code"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

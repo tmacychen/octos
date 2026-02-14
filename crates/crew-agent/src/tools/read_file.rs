@@ -42,6 +42,10 @@ impl Tool for ReadFileTool {
         "Read the contents of a file. Returns the file content with line numbers."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["fs", "code"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

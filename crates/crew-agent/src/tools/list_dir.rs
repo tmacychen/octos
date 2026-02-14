@@ -36,6 +36,10 @@ impl Tool for ListDirTool {
         "List the contents of a directory."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["search", "code"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

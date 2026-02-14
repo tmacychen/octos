@@ -57,6 +57,10 @@ impl Tool for GrepTool {
         "Search file contents using regex. Respects .gitignore. Use file_pattern to filter which files to search (e.g., '*.rs')."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["search", "code"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

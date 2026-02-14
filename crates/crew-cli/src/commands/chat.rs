@@ -154,6 +154,11 @@ impl ChatCommand {
             tools.apply_policy(policy);
         }
 
+        // Apply context-based tag filter
+        if !config.context_filter.is_empty() {
+            tools.set_context_filter(config.context_filter.clone());
+        }
+
         // Apply provider-specific tool policy
         if let Some(policy) = resolve_provider_policy(&config, &provider_name, &model_id) {
             tools.set_provider_policy(policy);

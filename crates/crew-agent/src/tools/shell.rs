@@ -72,6 +72,10 @@ impl Tool for ShellTool {
         "Execute a shell command and return the output. Use this to run tests, build code, or interact with the filesystem."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["runtime", "code"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

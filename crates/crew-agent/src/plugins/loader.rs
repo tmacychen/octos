@@ -1,10 +1,13 @@
 //! Plugin loader: scans directories for plugins and registers their tools.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use eyre::Result;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::ToolRegistry;
 
 use super::manifest::PluginManifest;
@@ -86,22 +89,60 @@ impl PluginLoader {
                 )
             })?;
 
-        warn!(
-            plugin = %manifest.name,
-            version = %manifest.version,
-            tools = manifest.tools.len(),
-            executable = %executable.display(),
-            "loaded unverified plugin (no signature check)"
-        );
+        // SHA-256 hash verification
+        match &manifest.sha256 {
+            Some(expected_hash) => {
+                let actual_hash = compute_sha256(&executable)?;
+                if actual_hash != expected_hash.to_lowercase() {
+                    eyre::bail!(
+                        "plugin '{}' hash mismatch: expected {}, got {}",
+                        manifest.name,
+                        expected_hash,
+                        actual_hash
+                    );
+                }
+                info!(
+                    plugin = %manifest.name,
+                    "plugin hash verified"
+                );
+            }
+            None => {
+                warn!(
+                    plugin = %manifest.name,
+                    version = %manifest.version,
+                    executable = %executable.display(),
+                    "loaded unverified plugin (no sha256 in manifest)"
+                );
+            }
+        }
+
+        // Collect env vars to filter out
+        let blocked_env: Vec<String> = BLOCKED_ENV_VARS.iter().map(|s| s.to_string()).collect();
+
+        let timeout = manifest
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(PluginTool::DEFAULT_TIMEOUT);
 
         let tools = manifest
             .tools
             .into_iter()
-            .map(|def| PluginTool::new(manifest.name.clone(), def, executable.clone()))
+            .map(|def| {
+                PluginTool::new(manifest.name.clone(), def, executable.clone())
+                    .with_blocked_env(blocked_env.clone())
+                    .with_timeout(timeout)
+            })
             .collect();
 
         Ok(tools)
     }
+}
+
+/// Compute SHA-256 hex digest of a file.
+fn compute_sha256(path: &Path) -> Result<String> {
+    let data = std::fs::read(path)?;
+    let hash = Sha256::digest(&data);
+    Ok(format!("{hash:x}"))
 }
 
 /// Check if a path is executable (Unix).
@@ -167,5 +208,66 @@ mod tests {
         let count = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()]).unwrap();
         assert_eq!(count, 1);
         assert_eq!(registry.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hash_verification_pass() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("hash-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let exec_content = b"#!/bin/sh\necho ok";
+        let hash = format!("{:x}", Sha256::digest(exec_content));
+
+        let manifest = format!(
+            r#"{{"name": "hash-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d"}}]}}"#
+        );
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+
+        let exec_path = plugin_dir.join("hash-plugin");
+        std::fs::write(&exec_path, exec_content).unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let count = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hash_verification_fail() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("bad-hash");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let manifest = r#"{"name": "bad-hash", "version": "1.0", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "tools": [{"name": "t", "description": "d"}]}"#;
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+
+        let exec_path = plugin_dir.join("bad-hash");
+        std::fs::write(&exec_path, b"#!/bin/sh\necho tampered").unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        // Should succeed overall (skips failed plugin) but register 0 tools
+        let count = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_compute_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_file");
+        std::fs::write(&path, b"hello world").unwrap();
+        let hash = compute_sha256(&path).unwrap();
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 }

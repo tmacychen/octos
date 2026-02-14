@@ -58,6 +58,10 @@ impl Tool for WebFetchTool {
         "Fetch a URL and extract its content as markdown or plain text."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["web"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

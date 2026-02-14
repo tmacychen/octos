@@ -50,6 +50,10 @@ impl Tool for MessageTool {
         "Send a message to a channel. If channel/chat_id are omitted, sends to the current conversation."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["gateway"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

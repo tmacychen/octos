@@ -1,7 +1,8 @@
-//! Session management with JSONL persistence.
+//! Session management with JSONL persistence and LRU eviction.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use crew_core::{Message, SessionKey};
@@ -53,10 +54,20 @@ impl Session {
     }
 }
 
-/// Manages sessions with in-memory cache and JSONL disk persistence.
+/// Default maximum number of sessions kept in memory.
+const DEFAULT_MAX_SESSIONS: usize = 1000;
+
+/// A cache entry wrapping a session with LRU tracking.
+struct CachedSession {
+    session: Session,
+    last_accessed: Instant,
+}
+
+/// Manages sessions with in-memory cache, LRU eviction, and JSONL disk persistence.
 pub struct SessionManager {
     sessions_dir: PathBuf,
-    cache: HashMap<String, Session>,
+    cache: HashMap<String, CachedSession>,
+    max_sessions: usize,
 }
 
 impl SessionManager {
@@ -66,7 +77,15 @@ impl SessionManager {
         Ok(Self {
             sessions_dir,
             cache: HashMap::new(),
+            max_sessions: DEFAULT_MAX_SESSIONS,
         })
+    }
+
+    /// Set the maximum number of sessions to keep in memory.
+    /// Sessions evicted from memory are NOT deleted from disk.
+    pub fn with_max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = max;
+        self
     }
 
     /// List all sessions (ID + message count) from disk.
@@ -95,11 +114,20 @@ impl SessionManager {
             let session = self
                 .load_from_disk(key)
                 .unwrap_or_else(|| Session::new(key.clone()));
-            self.cache.insert(key_str.clone(), session);
+            self.cache.insert(
+                key_str.clone(),
+                CachedSession {
+                    session,
+                    last_accessed: Instant::now(),
+                },
+            );
         }
-        self.cache
+        let entry = self
+            .cache
             .get_mut(&key_str)
-            .expect("session must exist: inserted above")
+            .expect("session must exist: inserted above");
+        entry.last_accessed = Instant::now();
+        &mut entry.session
     }
 
     /// Add a message to a session and persist it.
@@ -107,7 +135,9 @@ impl SessionManager {
         let session = self.get_or_create(key);
         session.messages.push(message.clone());
         session.updated_at = Utc::now();
-        self.append_to_disk(key, &message)
+        self.append_to_disk(key, &message)?;
+        self.evict_lru();
+        Ok(())
     }
 
     /// Get the JSONL file path for a session key.
@@ -173,7 +203,7 @@ impl SessionManager {
             let parent_key = self
                 .cache
                 .get(&key.0)
-                .and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
+                .and_then(|e| e.session.parent_key.as_ref().map(|k| k.0.clone()));
             let meta = SessionMeta {
                 session_key: key.0.clone(),
                 parent_key,
@@ -192,10 +222,11 @@ impl SessionManager {
     pub fn rewrite(&self, key: &SessionKey) -> Result<()> {
         use std::io::Write;
 
-        let session = self
+        let entry = self
             .cache
             .get(&key.0)
             .ok_or_else(|| eyre::eyre!("session not in cache: {}", key))?;
+        let session = &entry.session;
 
         let path = self.session_path(key);
         let tmp_path = path.with_extension("jsonl.tmp");
@@ -246,7 +277,13 @@ impl SessionManager {
             created_at: now,
             updated_at: now,
         };
-        self.cache.insert(new_key.0.clone(), session);
+        self.cache.insert(
+            new_key.0.clone(),
+            CachedSession {
+                session,
+                last_accessed: Instant::now(),
+            },
+        );
         self.rewrite(&new_key)?;
 
         debug!(
@@ -266,6 +303,39 @@ impl SessionManager {
             std::fs::remove_file(&path)?;
         }
         Ok(())
+    }
+
+    /// Number of sessions currently in memory.
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Evict least-recently-used sessions from memory when over capacity.
+    /// Evicted sessions remain on disk and will be lazy-loaded on next access.
+    fn evict_lru(&mut self) {
+        if self.cache.len() <= self.max_sessions {
+            return;
+        }
+
+        let mut entries: Vec<(String, Instant)> = self
+            .cache
+            .iter()
+            .map(|(k, e)| (k.clone(), e.last_accessed))
+            .collect();
+
+        // Sort oldest first
+        entries.sort_by_key(|(_, t)| *t);
+
+        let to_remove = self.cache.len() - self.max_sessions;
+        for (key, _) in entries.into_iter().take(to_remove) {
+            self.cache.remove(&key);
+        }
+
+        debug!(
+            remaining = self.cache.len(),
+            max = self.max_sessions,
+            "evicted LRU sessions from memory"
+        );
     }
 }
 
@@ -434,6 +504,52 @@ mod tests {
         assert_eq!(child.messages.len(), 3);
         assert_eq!(child.messages[0].content, "msg2");
         assert_eq!(child.messages[2].content, "msg4");
+    }
+
+    #[test]
+    fn test_eviction_keeps_max_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap().with_max_sessions(3);
+
+        // Create 5 sessions
+        for i in 0..5 {
+            let key = SessionKey::new("cli", &format!("s{i}"));
+            mgr.add_message(&key, make_message(MessageRole::User, &format!("msg{i}")))
+                .unwrap();
+            // Small delay so last_accessed ordering is deterministic
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Should have at most 3 in memory
+        assert_eq!(mgr.cache_len(), 3);
+    }
+
+    #[test]
+    fn test_evicted_session_reloads_from_disk() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap().with_max_sessions(2);
+
+        let k0 = SessionKey::new("cli", "oldest");
+        mgr.add_message(&k0, make_message(MessageRole::User, "hello from oldest"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let k1 = SessionKey::new("cli", "middle");
+        mgr.add_message(&k1, make_message(MessageRole::User, "hello from middle"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let k2 = SessionKey::new("cli", "newest");
+        mgr.add_message(&k2, make_message(MessageRole::User, "hello from newest"))
+            .unwrap();
+
+        // k0 should have been evicted from memory
+        assert_eq!(mgr.cache_len(), 2);
+
+        // But accessing k0 should reload it from disk
+        let session = mgr.get_or_create(&k0);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "hello from oldest");
     }
 
     #[test]

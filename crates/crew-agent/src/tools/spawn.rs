@@ -87,6 +87,10 @@ impl Tool for SpawnTool {
         "Spawn a subagent to work on a task. Use mode='sync' to wait for the result, or 'background' (default) for fire-and-forget."
     }
 
+    fn tags(&self) -> &[&str] {
+        &["gateway"]
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -151,6 +155,7 @@ impl Tool for SpawnTool {
             let policy = ToolPolicy {
                 allow: allowed_tools,
                 deny: vec!["spawn".into()],
+                ..Default::default()
             };
             tools.apply_policy(&policy);
             if let Some(ref pp) = self.provider_policy {
@@ -198,6 +203,7 @@ impl Tool for SpawnTool {
                 let policy = ToolPolicy {
                     allow: allowed_tools,
                     deny: vec!["spawn".into()],
+                    ..Default::default()
                 };
                 tools.apply_policy(&policy);
                 if let Some(pp) = provider_policy {
