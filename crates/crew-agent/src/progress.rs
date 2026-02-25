@@ -350,17 +350,19 @@ impl ProgressReporter for ConsoleReporter {
                 session_cost,
                 ..
             } => {
-                let cost_str = match session_cost {
-                    Some(c) => format!("${:.4}", c),
-                    None => "N/A".to_string(),
-                };
-                println!(
-                    "  {} {} in / {} out | Cost: {}",
-                    self.dim("Tokens:"),
-                    session_input_tokens,
-                    session_output_tokens,
-                    cost_str,
-                );
+                if self.verbose {
+                    let cost_str = match session_cost {
+                        Some(c) => format!("${:.4}", c),
+                        None => "N/A".to_string(),
+                    };
+                    println!(
+                        "  {} {} in / {} out | Cost: {}",
+                        self.dim("Tokens:"),
+                        session_input_tokens,
+                        session_output_tokens,
+                        cost_str,
+                    );
+                }
             }
         }
     }

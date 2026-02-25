@@ -126,6 +126,7 @@ impl LlmProvider for FailCountProvider {
 fn end_turn(text: &str, input: u32, output: u32) -> ChatResponse {
     ChatResponse {
         content: Some(text.to_string()),
+        reasoning_content: None,
         tool_calls: vec![],
         stop_reason: StopReason::EndTurn,
         usage: TokenUsage {
@@ -138,6 +139,7 @@ fn end_turn(text: &str, input: u32, output: u32) -> ChatResponse {
 fn tool_use(calls: Vec<ToolCall>, input: u32, output: u32) -> ChatResponse {
     ChatResponse {
         content: None,
+        reasoning_content: None,
         tool_calls: calls,
         stop_reason: StopReason::ToolUse,
         usage: TokenUsage {
@@ -581,6 +583,7 @@ async fn test_context_window_override_subagent() {
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         })
         .collect();

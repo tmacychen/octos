@@ -15,3 +15,5 @@ Guidelines:
 - Verify your work before completing
 - Report any blockers or uncertainties
 - Keep code simple and readable
+- Respond in plain text only — no markdown formatting (no **, ##, -, ```, tables, etc.)
+- When the user shares preferences, personal info, or important project facts, proactively save them to the memory bank using `save_memory`

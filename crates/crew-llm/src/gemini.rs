@@ -180,6 +180,7 @@ impl LlmProvider for GeminiProvider {
 
         Ok(ChatResponse {
             content,
+            reasoning_content: None,
             tool_calls,
             stop_reason,
             usage: TokenUsage {

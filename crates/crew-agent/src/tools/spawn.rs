@@ -435,6 +435,7 @@ mod tests {
         ) -> Result<crew_llm::ChatResponse> {
             Ok(crew_llm::ChatResponse {
                 content: Some("done".into()),
+                reasoning_content: None,
                 tool_calls: vec![],
                 stop_reason: crew_llm::StopReason::EndTurn,
                 usage: crew_llm::TokenUsage {

@@ -36,14 +36,13 @@ tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-python = { workspace = true, optional = true }
 tree-sitter-javascript = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
-chromiumoxide = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
+base64 = { workspace = true }
+chromiumoxide = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 git = ["dep:gix", "dep:similar"]
 ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript", "dep:tree-sitter-typescript"]
-browser = ["dep:chromiumoxide", "dep:tempfile", "dep:base64"]
 
 [lints]
 workspace = true

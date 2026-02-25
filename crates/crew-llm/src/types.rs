@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 pub struct ChatResponse {
     /// Text content of the response (if any).
     pub content: Option<String>,
+    /// Reasoning/thinking content from thinking models (kimi-k2.5, o1, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Tool calls requested by the model.
     pub tool_calls: Vec<ToolCall>,
     /// Why the model stopped generating.
@@ -53,6 +56,8 @@ pub struct ToolSpec {
 pub enum StreamEvent {
     /// Incremental text chunk.
     TextDelta(String),
+    /// Incremental reasoning/thinking content from thinking models.
+    ReasoningDelta(String),
     /// Incremental tool call data.
     ToolCallDelta {
         index: usize,

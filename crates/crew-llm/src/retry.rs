@@ -57,7 +57,34 @@ impl RetryProvider {
         self
     }
 
-    /// Check if an error is retryable.
+    /// Check if an error should trigger failover to the next provider.
+    ///
+    /// This is broader than `is_retryable_error`: auth failures (401/403)
+    /// should not be retried on the *same* provider but should failover to
+    /// a different provider which may have valid credentials.
+    pub(crate) fn should_failover(error: &eyre::Report) -> bool {
+        // Auth errors: don't retry same provider, but do failover
+        for cause in error.chain() {
+            if let Some(reqwest_err) = cause.downcast_ref::<reqwest::Error>() {
+                if let Some(status) = reqwest_err.status() {
+                    if matches!(status.as_u16(), 401 | 403) {
+                        return true;
+                    }
+                }
+            }
+        }
+        let error_str = error.to_string();
+        for code in ["401", "403"] {
+            if error_str.contains(&format!("API error: {code}")) {
+                return true;
+            }
+        }
+
+        // Everything retryable is also failover-worthy
+        Self::is_retryable_error(error)
+    }
+
+    /// Check if an error is retryable on the same provider.
     ///
     /// First tries to extract an HTTP status code from the error chain
     /// (reqwest errors carry status). Falls back to keyword matching for
@@ -104,6 +131,28 @@ impl RetryProvider {
         let delay = Duration::from_secs_f64(delay);
         std::cmp::min(delay, self.config.max_delay)
     }
+
+    /// Extract a longer delay for rate-limit (429 TPM) errors.
+    /// OpenAI errors include "Please try again in 29.159s" — parse that.
+    /// Falls back to 30s if unparseable.
+    fn rate_limit_delay(error: &eyre::Report) -> Option<Duration> {
+        let msg = error.to_string();
+        // Only apply to rate-limit / TPM errors
+        if !msg.contains("429") && !msg.contains("rate limit") && !msg.contains("tokens per min") {
+            return None;
+        }
+        // Try to parse "try again in Xs" or "try again in X.XXXs"
+        if let Some(idx) = msg.find("try again in ") {
+            let after = &msg[idx + "try again in ".len()..];
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            if let Ok(secs) = num_str.parse::<f64>() {
+                // Add 1s buffer
+                return Some(Duration::from_secs_f64(secs + 1.0));
+            }
+        }
+        // Fallback: wait 30s for TPM to reset
+        Some(Duration::from_secs(30))
+    }
 }
 
 #[async_trait]
@@ -124,7 +173,8 @@ impl LlmProvider for RetryProvider {
                 }
                 Err(e) => {
                     if attempt < self.config.max_retries && Self::is_retryable_error(&e) {
-                        let delay = self.calculate_delay(attempt);
+                        let delay = Self::rate_limit_delay(&e)
+                            .unwrap_or_else(|| self.calculate_delay(attempt));
                         warn!(
                             attempt = attempt + 1,
                             max_retries = self.config.max_retries,
@@ -161,7 +211,8 @@ impl LlmProvider for RetryProvider {
                 }
                 Err(e) => {
                     if attempt < self.config.max_retries && Self::is_retryable_error(&e) {
-                        let delay = self.calculate_delay(attempt);
+                        let delay = Self::rate_limit_delay(&e)
+                            .unwrap_or_else(|| self.calculate_delay(attempt));
                         warn!(
                             attempt = attempt + 1,
                             max_retries = self.config.max_retries,
@@ -240,6 +291,57 @@ mod tests {
     fn test_not_retryable_generic() {
         let err = eyre::eyre!("invalid JSON in response");
         assert!(!RetryProvider::is_retryable_error(&err));
+    }
+
+    #[test]
+    fn test_should_failover_401() {
+        let err = eyre::eyre!("OpenAI API error: 401 - unauthorized");
+        assert!(!RetryProvider::is_retryable_error(&err));
+        assert!(RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_should_failover_403() {
+        let err = eyre::eyre!("API error: 403 - forbidden");
+        assert!(!RetryProvider::is_retryable_error(&err));
+        assert!(RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_should_failover_429() {
+        let err = eyre::eyre!("API error: 429 - rate limited");
+        assert!(RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_should_not_failover_400() {
+        let err = eyre::eyre!("API error: 400 - bad request");
+        assert!(!RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_rate_limit_delay_parses_seconds() {
+        let err = eyre::eyre!(
+            "OpenAI API error: 429 Too Many Requests - Rate limit reached. Please try again in 29.159s"
+        );
+        let delay = RetryProvider::rate_limit_delay(&err).unwrap();
+        // 29.159 + 1.0 buffer = ~30.159s
+        assert!(delay.as_secs_f64() > 29.0 && delay.as_secs_f64() < 32.0);
+    }
+
+    #[test]
+    fn test_rate_limit_delay_fallback() {
+        let err = eyre::eyre!(
+            "OpenAI API error: 429 Too Many Requests - tokens per min limit exceeded"
+        );
+        let delay = RetryProvider::rate_limit_delay(&err).unwrap();
+        assert_eq!(delay, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_rate_limit_delay_not_429() {
+        let err = eyre::eyre!("OpenAI API error: 500 Internal Server Error");
+        assert!(RetryProvider::rate_limit_delay(&err).is_none());
     }
 
     #[test]

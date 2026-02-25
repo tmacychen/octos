@@ -232,11 +232,16 @@ pub mod message;
 pub mod read_file;
 pub mod shell;
 pub mod spawn;
+pub mod deep_research;
+pub mod deep_search;
+pub mod recall_memory;
+pub mod save_memory;
+pub mod send_file;
+pub mod take_photo;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
 
-#[cfg(feature = "browser")]
 pub mod browser;
 
 #[cfg(feature = "git")]
@@ -254,11 +259,16 @@ pub use message::MessageTool;
 pub use read_file::ReadFileTool;
 pub use shell::ShellTool;
 pub use spawn::SpawnTool;
+pub use deep_research::{DeepResearchTool, ResearchNotification};
+pub use deep_search::DeepSearchTool;
+pub use recall_memory::RecallMemoryTool;
+pub use save_memory::SaveMemoryTool;
+pub use send_file::SendFileTool;
+pub use take_photo::TakePhotoTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
-#[cfg(feature = "browser")]
 pub use browser::BrowserTool;
 
 #[cfg(feature = "git")]
@@ -484,7 +494,7 @@ impl ToolRegistry {
         registry.register(ListDirTool::new(cwd));
         registry.register(WebSearchTool::new());
         registry.register(WebFetchTool::new());
-        #[cfg(feature = "browser")]
+        // DeepSearchTool registered separately by caller with correct data_dir
         registry.register(BrowserTool::new());
         #[cfg(feature = "git")]
         registry.register(GitTool::new(cwd));

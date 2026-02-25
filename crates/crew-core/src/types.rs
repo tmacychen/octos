@@ -63,6 +63,9 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Reasoning/thinking content from thinking models (kimi-k2.5, o1, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -165,6 +168,7 @@ mod tests {
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: Utc::now(),
         };
         let json = serde_json::to_string(&msg).unwrap();

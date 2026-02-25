@@ -1,4 +1,10 @@
-//! Web search tool using Brave Search API.
+//! Web search tool with multiple provider support.
+//!
+//! Provider priority (first available key wins):
+//! 1. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized answers with citations
+//! 2. You.com (`YDC_API_KEY`) — rich JSON results with snippets
+//! 3. Brave Search (`BRAVE_API_KEY`) — traditional search results
+//! 4. DuckDuckGo (no key) — free HTML fallback
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -14,7 +20,10 @@ pub struct WebSearchTool {
 impl WebSearchTool {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 }
@@ -36,6 +45,8 @@ fn default_count() -> u8 {
     5
 }
 
+// --- Brave types ---
+
 #[derive(Deserialize)]
 struct BraveResponse {
     web: Option<BraveWebResults>,
@@ -53,6 +64,46 @@ struct BraveWebResult {
     description: String,
 }
 
+// --- You.com types ---
+
+#[derive(Deserialize)]
+struct YouResponse {
+    results: Option<YouResults>,
+}
+
+#[derive(Deserialize)]
+struct YouResults {
+    web: Option<Vec<YouWebResult>>,
+}
+
+#[derive(Deserialize)]
+struct YouWebResult {
+    title: String,
+    url: String,
+    description: String,
+    #[serde(default)]
+    snippets: Vec<String>,
+}
+
+// --- Perplexity types ---
+
+#[derive(Deserialize)]
+struct PerplexityResponse {
+    choices: Option<Vec<PerplexityChoice>>,
+    #[serde(default)]
+    citations: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PerplexityChoice {
+    message: Option<PerplexityMessage>,
+}
+
+#[derive(Deserialize)]
+struct PerplexityMessage {
+    content: Option<String>,
+}
+
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
@@ -60,7 +111,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web using Brave Search API. Requires BRAVE_API_KEY environment variable."
+        "Search the web for information. Supports Perplexity, You.com, Brave, and DuckDuckGo (auto-detected from environment)."
     }
 
     fn tags(&self) -> &[&str] {
@@ -88,25 +139,166 @@ impl Tool for WebSearchTool {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid web_search input")?;
 
-        let api_key = match std::env::var("BRAVE_API_KEY") {
-            Ok(key) => key,
-            Err(_) => {
-                return Ok(ToolResult {
-                    output: "BRAVE_API_KEY environment variable not set.".to_string(),
-                    success: false,
-                    ..Default::default()
-                });
-            }
-        };
-
         let count = input.count.clamp(1, 10);
+
+        // Provider priority: Perplexity > You.com > Brave > DuckDuckGo
+        if let Ok(api_key) = std::env::var("PERPLEXITY_API_KEY") {
+            return self.perplexity_search(&input.query, &api_key).await;
+        }
+
+        if let Ok(api_key) = std::env::var("YDC_API_KEY") {
+            return self.you_search(&input.query, count, &api_key).await;
+        }
+
+        if let Ok(api_key) = std::env::var("BRAVE_API_KEY") {
+            return self.brave_search(&input.query, count, &api_key).await;
+        }
+
+        // Free fallback: DuckDuckGo HTML
+        self.ddg_search(&input.query, count).await
+    }
+}
+
+impl WebSearchTool {
+    // --- Perplexity Sonar ---
+
+    async fn perplexity_search(&self, query: &str, api_key: &str) -> Result<ToolResult> {
+        let body = serde_json::json!({
+            "model": "sonar",
+            "messages": [{"role": "user", "content": query}],
+            "max_tokens": 1024
+        });
 
         let response = self
             .client
+            .post("https://api.perplexity.ai/chat/completions")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to call Perplexity API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Ok(ToolResult {
+                output: format!("Perplexity API error ({status}): {body}"),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let pplx: PerplexityResponse = response
+            .json()
+            .await
+            .wrap_err("failed to parse Perplexity response")?;
+
+        let answer = pplx
+            .choices
+            .and_then(|c| c.into_iter().next())
+            .and_then(|c| c.message)
+            .and_then(|m| m.content)
+            .unwrap_or_default();
+
+        if answer.is_empty() {
+            return Ok(ToolResult {
+                output: format!("No results found for: {query}"),
+                success: true,
+                ..Default::default()
+            });
+        }
+
+        let mut output = format!("Search: {query}\n\n{answer}");
+
+        if !pplx.citations.is_empty() {
+            output.push_str("\n\nSources:\n");
+            for (i, url) in pplx.citations.iter().enumerate() {
+                output.push_str(&format!("  [{}] {}\n", i + 1, url));
+            }
+        }
+
+        Ok(ToolResult {
+            output,
+            success: true,
+            ..Default::default()
+        })
+    }
+
+    // --- You.com ---
+
+    async fn you_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        let response = self
+            .client
+            .get("https://ydc-index.io/v1/search")
+            .header("X-API-Key", api_key)
+            .query(&[("query", query), ("count", &count.to_string())])
+            .send()
+            .await
+            .wrap_err("failed to call You.com Search API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Ok(ToolResult {
+                output: format!("You.com API error ({status}): {body}"),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let you: YouResponse = response
+            .json()
+            .await
+            .wrap_err("failed to parse You.com response")?;
+
+        let results = you
+            .results
+            .and_then(|r| r.web)
+            .unwrap_or_default();
+
+        if results.is_empty() {
+            return Ok(ToolResult {
+                output: format!("No results found for: {query}"),
+                success: true,
+                ..Default::default()
+            });
+        }
+
+        let mut output = format!("Results for: {query}\n\n");
+        for (i, r) in results.iter().enumerate() {
+            output.push_str(&format!("{}. {}\n   {}\n", i + 1, r.title, r.url));
+            if !r.description.is_empty() {
+                output.push_str(&format!("   {}\n", r.description));
+            }
+            // Include first snippet if available (richer than description)
+            if let Some(snippet) = r.snippets.first() {
+                let truncated = if snippet.len() > 300 {
+                    format!("{}...", &snippet[..300])
+                } else {
+                    snippet.clone()
+                };
+                output.push_str(&format!("   {}\n", truncated));
+            }
+            output.push('\n');
+        }
+
+        Ok(ToolResult {
+            output,
+            success: true,
+            ..Default::default()
+        })
+    }
+
+    // --- Brave Search ---
+
+    async fn brave_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        let response = self
+            .client
             .get("https://api.search.brave.com/res/v1/web/search")
-            .header("X-Subscription-Token", &api_key)
+            .header("X-Subscription-Token", api_key)
             .header("Accept", "application/json")
-            .query(&[("q", &input.query), ("count", &count.to_string())])
+            .query(&[("q", query), ("count", &count.to_string())])
             .send()
             .await
             .wrap_err("failed to call Brave Search API")?;
@@ -130,13 +322,13 @@ impl Tool for WebSearchTool {
 
         if results.is_empty() {
             return Ok(ToolResult {
-                output: format!("No results found for: {}", input.query),
+                output: format!("No results found for: {query}"),
                 success: true,
                 ..Default::default()
             });
         }
 
-        let mut output = format!("Results for: {}\n\n", input.query);
+        let mut output = format!("Results for: {query}\n\n");
         for (i, r) in results.iter().enumerate() {
             output.push_str(&format!(
                 "{}. {}\n   {}\n   {}\n\n",
@@ -153,36 +345,276 @@ impl Tool for WebSearchTool {
             ..Default::default()
         })
     }
+
+    // --- DuckDuckGo HTML fallback ---
+
+    async fn ddg_search(&self, query: &str, count: u8) -> Result<ToolResult> {
+        let url = format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            urlencoded(query)
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .wrap_err("failed to fetch DuckDuckGo search results")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Ok(ToolResult {
+                output: format!("DuckDuckGo search error: HTTP {status}"),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let html = response.text().await.unwrap_or_default();
+        let results = parse_ddg_results(&html, count as usize);
+
+        if results.is_empty() {
+            return Ok(ToolResult {
+                output: format!("No results found for: {query}"),
+                success: true,
+                ..Default::default()
+            });
+        }
+
+        let mut output = format!("Results for: {query}\n\n");
+        for (i, (title, url, snippet)) in results.iter().enumerate() {
+            output.push_str(&format!("{}. {title}\n   {url}\n   {snippet}\n\n", i + 1));
+        }
+
+        Ok(ToolResult {
+            output,
+            success: true,
+            ..Default::default()
+        })
+    }
+}
+
+/// Simple URL encoding for query parameters.
+fn urlencoded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX[(b >> 4) as usize]));
+                out.push(char::from(HEX[(b & 0xf) as usize]));
+            }
+        }
+    }
+    out
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// Parse DuckDuckGo HTML search results.
+/// DDG format: `class="result__a" href="//duckduckgo.com/l/?uddg=ENCODED_URL&rut=...">Title</a>`
+/// Snippet: `class="result__snippet">snippet text</a>`
+fn parse_ddg_results(html: &str, max: usize) -> Vec<(String, String, String)> {
+    let mut results = Vec::new();
+    let marker = "class=\"result__a\"";
+
+    let mut search_from = 0;
+    while results.len() < max {
+        let pos = match html[search_from..].find(marker) {
+            Some(p) => search_from + p + marker.len(),
+            None => break,
+        };
+        search_from = pos;
+
+        let chunk = &html[pos..];
+
+        // Extract href: href="//duckduckgo.com/l/?uddg=REAL_URL&rut=..."
+        let raw_href = match extract_attr(chunk, "href=\"") {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // Decode the real URL from DDG redirect
+        let url = decode_ddg_url(&raw_href);
+        if !url.starts_with("http") {
+            continue;
+        }
+        // Skip DDG ad/tracking redirects
+        if url.contains("duckduckgo.com/y.js") {
+            continue;
+        }
+
+        // Title is between > and </a>
+        let title = match chunk.find('>') {
+            Some(gt) => {
+                let after = &chunk[gt + 1..];
+                match after.find("</a>") {
+                    Some(end) => strip_tags(&after[..end]),
+                    None => continue,
+                }
+            }
+            None => continue,
+        };
+
+        if title.is_empty() {
+            continue;
+        }
+
+        // Snippet from class="result__snippet"
+        let snippet_marker = "class=\"result__snippet\"";
+        let snippet = if let Some(sp) = chunk.find(snippet_marker) {
+            let after_marker = &chunk[sp + snippet_marker.len()..];
+            match after_marker.find('>') {
+                Some(gt) => {
+                    let content = &after_marker[gt + 1..];
+                    match content.find("</a>") {
+                        Some(end) => strip_tags(&content[..end]),
+                        None => String::new(),
+                    }
+                }
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        results.push((title, url, snippet));
+    }
+
+    results
+}
+
+/// Decode a DuckDuckGo redirect URL to extract the real destination.
+/// Input: `//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=...`
+/// Output: `https://example.com`
+fn decode_ddg_url(raw: &str) -> String {
+    // Look for uddg= parameter
+    if let Some(start) = raw.find("uddg=") {
+        let encoded = &raw[start + 5..];
+        let end = encoded.find('&').unwrap_or(encoded.len());
+        urldecoded(&encoded[..end])
+    } else if raw.starts_with("http") {
+        raw.to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Simple percent-decode.
+fn urldecoded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hi = bytes.next().and_then(hex_val);
+            let lo = bytes.next().and_then(hex_val);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h << 4 | l) as char);
+            }
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Extract an attribute value after the given prefix (up to the next `"`).
+fn extract_attr(html: &str, prefix: &str) -> Option<String> {
+    let start = html.find(prefix)? + prefix.len();
+    let end = html[start..].find('"')? + start;
+    Some(decode_html_entities(&html[start..end]))
+}
+
+/// Strip HTML tags from a string.
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    decode_html_entities(out.trim())
+}
+
+/// Decode common HTML entities.
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    #[allow(unsafe_code)]
-    async fn test_missing_api_key() {
-        // Ensure BRAVE_API_KEY is not set for this test
-        let was_set = std::env::var("BRAVE_API_KEY").ok();
-        if was_set.is_some() {
-            // SAFETY: test-only, single-threaded
-            unsafe { std::env::remove_var("BRAVE_API_KEY") };
-        }
+    #[test]
+    fn test_urlencoded() {
+        assert_eq!(urlencoded("hello world"), "hello+world");
+        assert_eq!(urlencoded("a&b=c"), "a%26b%3Dc");
+    }
 
-        let tool = WebSearchTool::new();
-        let result = tool
-            .execute(&serde_json::json!({"query": "test"}))
-            .await
-            .unwrap();
+    #[test]
+    fn test_strip_tags() {
+        assert_eq!(strip_tags("<b>hello</b> world"), "hello world");
+        assert_eq!(strip_tags("no tags"), "no tags");
+    }
 
-        assert!(!result.success);
-        assert!(result.output.contains("BRAVE_API_KEY"));
+    #[test]
+    fn test_parse_ddg_results_empty() {
+        assert!(parse_ddg_results("", 5).is_empty());
+        assert!(parse_ddg_results("<html>no results</html>", 5).is_empty());
+    }
 
-        // Restore if it was set
-        if let Some(key) = was_set {
-            // SAFETY: test-only, single-threaded
-            unsafe { std::env::set_var("BRAVE_API_KEY", key) };
-        }
+    #[test]
+    fn test_parse_ddg_results_basic() {
+        // Matches real DDG HTML format with redirect URLs
+        let html = r#"<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&amp;rut=abc123">Example Title</a><a class="result__snippet">This is a snippet.</a>"#;
+        let results = parse_ddg_results(html, 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "Example Title");
+        assert_eq!(results[0].1, "https://example.com/page");
+        assert_eq!(results[0].2, "This is a snippet.");
+    }
+
+    #[test]
+    fn test_parse_ddg_results_direct_url() {
+        let html = r#"<a class="result__a" href="https://example.com">Direct Link</a>"#;
+        let results = parse_ddg_results(html, 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "Direct Link");
+        assert_eq!(results[0].1, "https://example.com");
+    }
+
+    #[test]
+    fn test_urldecoded() {
+        assert_eq!(urldecoded("https%3A%2F%2Fexample.com"), "https://example.com");
+        assert_eq!(urldecoded("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn test_decode_html_entities() {
+        assert_eq!(decode_html_entities("a &amp; b"), "a & b");
+        assert_eq!(decode_html_entities("1 &lt; 2"), "1 < 2");
     }
 
     #[tokio::test]

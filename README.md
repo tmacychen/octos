@@ -261,6 +261,46 @@ crew-rs/
 | Feishu/Lark | `feishu` | WebSocket + REST |
 | Email | `email` | IMAP polling + SMTP |
 
+## Multi-User Setup
+
+By default, all data (episodes, memory, sessions, research) is stored in `~/.crew`. To run multiple users on a shared machine, override the data directory with `--data-dir` or the `CREW_HOME` environment variable:
+
+```bash
+# Using environment variable (recommended for services)
+CREW_HOME=/data/crew/alice crew gateway --config /shared/config.json
+CREW_HOME=/data/crew/bob   crew gateway --config /shared/config.json
+
+# Using CLI flag
+crew chat --data-dir /data/crew/alice
+crew chat --data-dir /data/crew/bob
+```
+
+Resolution order: `--data-dir` flag > `CREW_HOME` env var > `~/.crew`.
+
+Each user gets isolated storage:
+
+```
+/data/crew/alice/
+├── episodes.redb     # Episodic memory DB
+├── memory/           # Long-term memory + daily notes
+├── sessions/         # Conversation history
+├── research/         # Deep search results
+├── skills/           # Installed skills
+├── history/          # Readline history
+└── cron.json         # Scheduled jobs
+```
+
+Pair with sandbox isolation so users' shell commands stay confined:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "allow_network": true
+  }
+}
+```
+
 ## Development
 
 ```bash

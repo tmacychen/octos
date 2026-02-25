@@ -80,6 +80,7 @@ pub async fn maybe_compact_with_config(
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: Utc::now(),
         },
         Message {
@@ -88,6 +89,7 @@ pub async fn maybe_compact_with_config(
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: Utc::now(),
         },
     ];
@@ -114,6 +116,7 @@ pub async fn maybe_compact_with_config(
         media: vec![],
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
         timestamp: Utc::now(),
     });
     session.messages.extend(recent);

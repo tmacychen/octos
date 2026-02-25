@@ -28,9 +28,10 @@ pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentRepor
 pub use sandbox::{Sandbox, SandboxConfig, create_sandbox};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use tools::{
-    DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, MessageTool, ReadFileTool,
-    ShellTool, SpawnTool, Tool, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    DeepResearchTool, DeepSearchTool, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool,
+    MessageTool, ReadFileTool, RecallMemoryTool, ResearchNotification, SaveMemoryTool, SendFileTool,
+    ShellTool, SpawnTool, TakePhotoTool, Tool, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool,
+    WebSearchTool, WriteFileTool,
 };
 
 #[cfg(test)]

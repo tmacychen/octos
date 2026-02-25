@@ -179,6 +179,7 @@ mod tests {
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -190,6 +191,7 @@ mod tests {
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -205,6 +207,7 @@ mod tests {
                 arguments: serde_json::json!({"path": "/secret/file", "content": "x".repeat(1000)}),
             }]),
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -216,6 +219,7 @@ mod tests {
             media: vec![],
             tool_calls: None,
             tool_call_id: Some(tool_id.to_string()),
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -227,6 +231,7 @@ mod tests {
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -287,6 +292,7 @@ mod tests {
             media: vec!["photo.jpg".to_string()],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }];
 

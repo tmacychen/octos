@@ -14,16 +14,25 @@ use super::AppState;
 struct Assets;
 
 /// Fallback handler: serves embedded static files, falls back to index.html for SPA routing.
+/// Routes under `/admin/` fall back to `admin/index.html` for the admin dashboard SPA.
 pub async fn static_handler(State(_state): State<Arc<AppState>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
+    // Check if this is an admin route
+    let is_admin = path.starts_with("admin");
+
     match Assets::get(path) {
         Some(file) => serve_file(path, &file.data),
         None => {
-            // SPA fallback: serve index.html for unmatched routes
-            match Assets::get("index.html") {
-                Some(file) => serve_file("index.html", &file.data),
+            // SPA fallback: serve the appropriate index.html
+            let fallback = if is_admin {
+                "admin/index.html"
+            } else {
+                "index.html"
+            };
+            match Assets::get(fallback) {
+                Some(file) => serve_file(fallback, &file.data),
                 None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
             }
         }

@@ -9,8 +9,8 @@ use chrono::Utc;
 use clap::Args;
 use colored::Colorize;
 use crew_agent::{
-    Agent, AgentConfig, HookExecutor, MessageTool, SilentReporter, SkillsLoader, SpawnTool,
-    ToolRegistry,
+    Agent, AgentConfig, HookExecutor, MessageTool, SendFileTool, SilentReporter, SkillsLoader,
+    SpawnTool, TakePhotoTool, ToolRegistry,
 };
 use crew_bus::{
     ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager, create_bus,
@@ -36,6 +36,10 @@ pub struct GatewayCommand {
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
+
+    /// Data directory for episodes, memory, sessions (defaults to $CREW_HOME or ~/.crew).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 
     /// Path to config file.
     #[arg(long)]
@@ -66,6 +70,7 @@ impl Executable for GatewayCommand {
     fn execute(self) -> Result<()> {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .thread_stack_size(8 * 1024 * 1024) // 8MB stack for deep agent futures
             .build()
             .wrap_err("failed to create tokio runtime")?
             .block_on(self.run_async())
@@ -127,7 +132,14 @@ impl GatewayCommand {
             let mut providers: Vec<Arc<dyn LlmProvider>> =
                 vec![Arc::new(RetryProvider::new(base_provider))];
             for fb in &config.fallback_models {
-                match create_provider(&fb.provider, &config, fb.model.clone(), fb.base_url.clone())
+                let fb_config = if fb.api_key_env.is_some() {
+                    let mut c = config.clone();
+                    c.api_key_env = fb.api_key_env.clone();
+                    c
+                } else {
+                    config.clone()
+                };
+                match create_provider(&fb.provider, &fb_config, fb.model.clone(), fb.base_url.clone())
                 {
                     Ok(p) => providers.push(Arc::new(RetryProvider::new(p))),
                     Err(e) => {
@@ -138,7 +150,8 @@ impl GatewayCommand {
             Arc::new(ProviderChain::new(providers))
         };
 
-        let data_dir = cwd.join(".crew");
+        // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
+        let data_dir = super::resolve_data_dir(self.data_dir)?;
         let media_dir = data_dir.join("media");
         let _ = &media_dir; // used by channel feature gates below
 
@@ -155,12 +168,15 @@ impl GatewayCommand {
         );
 
         // Initialize memory store
-        let memory_store = MemoryStore::open(&data_dir)
-            .await
-            .wrap_err("failed to open memory store")?;
+        let memory_store = Arc::new(
+            MemoryStore::open(&data_dir)
+                .await
+                .wrap_err("failed to open memory store")?,
+        );
 
-        // Initialize skills loader
-        let skills_loader = SkillsLoader::new(&data_dir);
+        // Initialize skills loader (project-level, from cwd/.crew/)
+        let project_dir = cwd.join(".crew");
+        let skills_loader = SkillsLoader::new(&project_dir);
 
         // Create message bus (before publisher is consumed by channel manager)
         let (mut agent_handle, publisher) = create_bus();
@@ -190,6 +206,7 @@ impl GatewayCommand {
         // Build tool registry (with sandbox if configured)
         let sandbox = crew_agent::create_sandbox(&config.sandbox);
         let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+        tools.register(crew_agent::DeepSearchTool::new(data_dir.join("research")));
 
         // Register MCP tools
         if !config.mcp_servers.is_empty() {
@@ -225,8 +242,16 @@ impl GatewayCommand {
         tools.register(CronTool::new(cron_service.clone()));
 
         // Message tool (cross-channel messaging)
-        let message_tool = Arc::new(MessageTool::new(out_tx));
+        let message_tool = Arc::new(MessageTool::new(out_tx.clone()));
         tools.register_arc(message_tool.clone() as Arc<dyn crew_agent::Tool>);
+
+        // Send file tool (document attachments)
+        let send_file_tool = Arc::new(SendFileTool::new(out_tx.clone()));
+        tools.register_arc(send_file_tool.clone() as Arc<dyn crew_agent::Tool>);
+
+        // Take photo tool (camera capture + send)
+        let take_photo_tool = Arc::new(TakePhotoTool::new(out_tx));
+        tools.register_arc(take_photo_tool.clone() as Arc<dyn crew_agent::Tool>);
 
         // Build sub-provider router from config
         let provider_router = if !config.sub_providers.is_empty() {
@@ -279,10 +304,24 @@ impl GatewayCommand {
         let spawn_tool = Arc::new(spawn);
         tools.register_arc(spawn_tool.clone() as Arc<dyn crew_agent::Tool>);
 
+        // Deep research tool with background notification channel
+        let (research_tx, _research_rx) =
+            tokio::sync::mpsc::channel::<crew_agent::ResearchNotification>(8);
+        tools.register(crew_agent::DeepResearchTool::new(
+            llm.clone(),
+            memory.clone(),
+            data_dir.clone(),
+            research_tx,
+        ));
+
+        // Memory bank tools (recall/save entity pages)
+        tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
+        tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
+
         // Build enhanced system prompt
         let system_prompt = build_system_prompt(
             gw_config.system_prompt.as_deref(),
-            &data_dir,
+            &project_dir,
             &memory_store,
             &skills_loader,
         )
@@ -473,6 +512,24 @@ impl GatewayCommand {
             }
         }
 
+        // Determine default channel and chat_id for cron delivery fallback
+        let default_cron_channel: String = gw_config
+            .channels
+            .iter()
+            .map(|e| e.channel_type.as_str())
+            .find(|t| *t != "cli")
+            .unwrap_or("cli")
+            .to_string();
+
+        // Default chat_id: first allowed_sender from the first non-CLI channel
+        let default_cron_chat_id: String = gw_config
+            .channels
+            .iter()
+            .find(|e| e.channel_type != "cli")
+            .and_then(|e| e.allowed_senders.first())
+            .cloned()
+            .unwrap_or_default();
+
         // Start channels and dispatcher
         channel_mgr.start_all(publisher).await?;
 
@@ -576,13 +633,21 @@ impl GatewayCommand {
                     .metadata
                     .get("deliver_to_channel")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("cli")
+                    .and_then(|s| if s.is_empty() { None } else { Some(s) })
+                    .unwrap_or(&default_cron_channel)
                     .to_string();
                 let cid = inbound
                     .metadata
                     .get("deliver_to_chat_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(&inbound.chat_id)
+                    .and_then(|s| if s.is_empty() { None } else { Some(s) })
+                    .unwrap_or_else(|| {
+                        if !default_cron_chat_id.is_empty() {
+                            &default_cron_chat_id
+                        } else {
+                            &inbound.chat_id
+                        }
+                    })
                     .to_string();
                 (ch, cid)
             } else {
@@ -636,6 +701,8 @@ impl GatewayCommand {
             let session_locks = session_locks.clone();
             let semaphore = concurrency_semaphore.clone();
             let message_tool = message_tool.clone();
+            let send_file_tool = send_file_tool.clone();
+            let take_photo_tool = take_photo_tool.clone();
             let spawn_tool = spawn_tool.clone();
             let llm_for_compaction = llm_for_compaction.clone();
             let out_tx = agent_handle.outbound_sender();
@@ -673,6 +740,8 @@ impl GatewayCommand {
                     &agent,
                     &session_mgr,
                     &message_tool,
+                    &send_file_tool,
+                    &take_photo_tool,
                     &spawn_tool,
                     &llm_for_compaction,
                     &out_tx,
@@ -734,6 +803,8 @@ async fn process_session_message(
     agent: &Agent,
     session_mgr: &Mutex<SessionManager>,
     message_tool: &MessageTool,
+    send_file_tool: &SendFileTool,
+    take_photo_tool: &TakePhotoTool,
     spawn_tool: &SpawnTool,
     llm: &Arc<dyn LlmProvider>,
     out_tx: &tokio::sync::mpsc::Sender<OutboundMessage>,
@@ -748,6 +819,8 @@ async fn process_session_message(
 ) {
     // Set tool context for this session's reply routing
     message_tool.set_context(reply_channel, reply_chat_id);
+    send_file_tool.set_context(reply_channel, reply_chat_id);
+    take_photo_tool.set_context(reply_channel, reply_chat_id);
     spawn_tool.set_context(reply_channel, reply_chat_id);
 
     // Get conversation history (hold session_mgr lock briefly)
@@ -773,6 +846,7 @@ async fn process_session_message(
                     media: vec![],
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                     timestamp: Utc::now(),
                 };
                 let _ = mgr.add_message(session_key, user_msg).await;
@@ -783,6 +857,7 @@ async fn process_session_message(
                     media: vec![],
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                     timestamp: Utc::now(),
                 };
                 let _ = mgr.add_message(session_key, assistant_msg).await;
@@ -796,10 +871,12 @@ async fn process_session_message(
             }
 
             // Send response back through channel
+            // Strip <think>...</think> blocks from models that embed reasoning inline
+            let content = strip_think_tags(&conv_response.content);
             let outbound = OutboundMessage {
                 channel: reply_channel.to_string(),
                 chat_id: reply_chat_id.to_string(),
-                content: conv_response.content,
+                content,
                 reply_to: None,
                 media: vec![],
                 metadata: serde_json::json!({}),
@@ -824,19 +901,52 @@ async fn process_session_message(
     }
 }
 
+/// Strip `<think>...</think>` blocks that some models (e.g. MiniMax) embed inline.
+fn strip_think_tags(s: &str) -> String {
+    let mut result = s.to_string();
+    while let Some(start) = result.find("<think>") {
+        if let Some(end) = result[start..].find("</think>") {
+            result.replace_range(start..start + end + "</think>".len(), "");
+        } else {
+            // Unclosed <think> — strip from tag to end
+            result.truncate(start);
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
 /// Build the system prompt with bootstrap files, memory context, and skills.
 async fn build_system_prompt(
     base: Option<&str>,
-    data_dir: &Path,
+    project_dir: &Path,
     memory_store: &MemoryStore,
     skills_loader: &SkillsLoader,
 ) -> String {
-    let mut prompt = base
-        .unwrap_or("You are a helpful AI assistant.")
-        .to_string();
+    let default_prompt = "You are a helpful AI assistant. Your role is to:\n\
+        \n\
+        1. EXECUTE: Complete the assigned task using available tools\n\
+        2. REPORT: Provide clear status updates\n\
+        3. ESCALATE: Request help when blocked\n\
+        \n\
+        Guidelines:\n\
+        - Make minimal, focused changes\n\
+        - Verify your work before completing\n\
+        - Report any blockers or uncertainties\n\
+        - Keep code simple and readable\n\
+        - You may use standard markdown formatting: **bold**, *italic*, `code`, \
+        ```code blocks```, ~~strikethrough~~, [text](url), > blockquotes, \
+        # headings, and - bullet lists. These will be rendered for the user.\n\
+        - When the user shares preferences, personal info, or important project facts, \
+        proactively save them to the memory bank using `save_memory`\n\
+        - IMPORTANT: For ANY task that takes time (web_search, deep_search, deep_research, \
+        spawn, take_photo, or multi-step tool work), you MUST first use the `message` tool \
+        to immediately acknowledge the user and briefly describe what you are about to do. \
+        Then perform the actual work. The user should never wait in silence.";
+    let mut prompt = base.unwrap_or(default_prompt).to_string();
 
     // Append bootstrap files (AGENTS.md, SOUL.md, USER.md, etc.)
-    let bootstrap = load_bootstrap_files(data_dir);
+    let bootstrap = super::load_bootstrap_files(project_dir);
     if !bootstrap.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&bootstrap);
@@ -847,6 +957,13 @@ async fn build_system_prompt(
     if !memory_ctx.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&memory_ctx);
+    }
+
+    // Append memory bank summary (entity abstracts)
+    let bank_summary = memory_store.get_bank_summary().await;
+    if !bank_summary.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&bank_summary);
     }
 
     // Append always-on skills
@@ -923,18 +1040,3 @@ fn merge_queued_by_session(
         .collect()
 }
 
-/// Load optional bootstrap/personality files from the .crew/ directory.
-fn load_bootstrap_files(data_dir: &Path) -> String {
-    const FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"];
-    let mut parts = Vec::new();
-    for filename in FILES {
-        let path = data_dir.join(filename);
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                parts.push(format!("## {filename}\n\n{trimmed}"));
-            }
-        }
-    }
-    parts.join("\n\n")
-}

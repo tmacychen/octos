@@ -111,7 +111,7 @@ which = "7"
 # Channel integrations (optional, pulled in via feature flags)
 teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 serenity = { version = "0.12", default-features = false, features = ["rustls_backend", "gateway", "client", "http", "model"] }
-tokio-tungstenite = { version = "0.26", default-features = false, features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 
 # Email channel (optional)
 async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }

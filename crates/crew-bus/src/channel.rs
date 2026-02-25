@@ -87,22 +87,33 @@ impl ChannelManager {
         tokio::spawn(async move {
             while let Some(msg) = publisher.recv_outbound().await {
                 if let Some(channel) = channels.get(&msg.channel) {
-                    let config = ChunkConfig {
-                        max_chars: channel.max_message_length(),
-                    };
-                    let chunks = split_message(&msg.content, &config);
-                    let total = chunks.len();
-                    for (i, chunk) in chunks.into_iter().enumerate() {
-                        let mut chunk_msg = msg.clone();
-                        chunk_msg.content = chunk;
-                        if let Err(e) = channel.send(&chunk_msg).await {
+                    if !msg.media.is_empty() {
+                        // File attachments: send directly without chunking
+                        if let Err(e) = channel.send(&msg).await {
                             error!(
                                 channel = msg.channel,
-                                chunk = i + 1,
-                                total = total,
-                                "Failed to send outbound chunk: {e}",
+                                "Failed to send outbound file message: {e}",
                             );
-                            break;
+                        }
+                    } else {
+                        // Text message: chunk and send
+                        let config = ChunkConfig {
+                            max_chars: channel.max_message_length(),
+                        };
+                        let chunks = split_message(&msg.content, &config);
+                        let total = chunks.len();
+                        for (i, chunk) in chunks.into_iter().enumerate() {
+                            let mut chunk_msg = msg.clone();
+                            chunk_msg.content = chunk;
+                            if let Err(e) = channel.send(&chunk_msg).await {
+                                error!(
+                                    channel = msg.channel,
+                                    chunk = i + 1,
+                                    total = total,
+                                    "Failed to send outbound chunk: {e}",
+                                );
+                                break;
+                            }
                         }
                     }
                 } else {

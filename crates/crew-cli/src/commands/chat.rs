@@ -13,7 +13,7 @@ use crew_llm::{
     anthropic::AnthropicProvider, gemini::GeminiProvider, openai::OpenAIProvider,
     openrouter::OpenRouterProvider,
 };
-use crew_memory::EpisodeStore;
+use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
 use rustyline::DefaultEditor;
 
@@ -26,6 +26,10 @@ pub struct ChatCommand {
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
+
+    /// Data directory for episodes, memory, sessions (defaults to $CREW_HOME or ~/.crew).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 
     /// Path to config file.
     #[arg(long)]
@@ -67,6 +71,7 @@ impl Executable for ChatCommand {
     fn execute(self) -> Result<()> {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .thread_stack_size(8 * 1024 * 1024) // 8MB stack for deep agent futures
             .build()
             .wrap_err("failed to create tokio runtime")?
             .block_on(self.run_async())
@@ -124,8 +129,8 @@ impl ChatCommand {
             Arc::new(ProviderChain::new(providers))
         };
 
-        // Create stores
-        let data_dir = cwd.join(".crew");
+        // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
+        let data_dir = super::resolve_data_dir(self.data_dir)?;
         let memory = Arc::new(
             EpisodeStore::open(&data_dir)
                 .await
@@ -135,6 +140,36 @@ impl ChatCommand {
         // Create tool registry (with sandbox if configured)
         let sandbox = crew_agent::create_sandbox(&config.sandbox);
         let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+        tools.register(crew_agent::DeepSearchTool::new(data_dir.join("research")));
+
+        // Register spawn tool for sync sub-agent support in chat mode.
+        // Background mode won't deliver results (dummy channel), but sync mode works fine.
+        let (spawn_tx, _spawn_rx) = tokio::sync::mpsc::channel(1);
+        tools.register(crew_agent::SpawnTool::new(
+            llm.clone(),
+            memory.clone(),
+            cwd.clone(),
+            spawn_tx,
+        ));
+
+        // Register deep research tool with background notification channel
+        let (research_tx, mut research_rx) =
+            tokio::sync::mpsc::channel::<crew_agent::ResearchNotification>(8);
+        tools.register(crew_agent::DeepResearchTool::new(
+            llm.clone(),
+            memory.clone(),
+            data_dir.clone(),
+            research_tx,
+        ));
+
+        // Create memory store and register memory bank tools
+        let memory_store = Arc::new(
+            MemoryStore::open(&data_dir)
+                .await
+                .wrap_err("failed to open memory store")?,
+        );
+        tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
+        tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
 
         // Register MCP tools
         if !config.mcp_servers.is_empty() {
@@ -180,13 +215,32 @@ impl ChatCommand {
         let reporter = Arc::new(ConsoleReporter::new().with_verbose(self.verbose));
         let agent_config = AgentConfig {
             max_iterations: self.max_iterations,
-            save_episodes: false,
+            save_episodes: true,
             ..Default::default()
         };
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
             .with_config(agent_config)
             .with_reporter(reporter)
             .with_shutdown(shutdown.clone());
+
+        // Load bootstrap files (AGENTS.md, SOUL.md, etc.) from project .crew/ directory
+        let project_dir = cwd.join(".crew");
+        let bootstrap = super::load_bootstrap_files(&project_dir);
+        if !bootstrap.is_empty() {
+            agent.append_system_prompt(&bootstrap);
+        }
+
+        // Inject memory context (long-term + daily notes)
+        let memory_ctx = memory_store.get_memory_context().await;
+        if !memory_ctx.is_empty() {
+            agent.append_system_prompt(&memory_ctx);
+        }
+
+        // Inject memory bank summary (entity abstracts)
+        let bank_summary = memory_store.get_bank_summary().await;
+        if !bank_summary.is_empty() {
+            agent.append_system_prompt(&bank_summary);
+        }
 
         if !config.hooks.is_empty() {
             agent = agent.with_hooks(Arc::new(HookExecutor::new(config.hooks.clone())));
@@ -221,13 +275,66 @@ impl ChatCommand {
         // Conversation history
         let mut history: Vec<Message> = Vec::new();
 
-        // Interactive loop
+        // Interactive loop using tokio::select! to handle both user input
+        // and background research notifications concurrently.
+        //
+        // readline is blocking, so we run it on a blocking thread and receive
+        // the result via a oneshot channel. This lets us print notifications
+        // even while waiting for user input.
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
 
-            let line = match rl.readline("you> ") {
+            // Spawn blocking readline on a separate thread
+            let (line_tx, line_rx) = tokio::sync::oneshot::channel();
+            let mut rl_moved = rl;
+            let readline_handle = tokio::task::spawn_blocking(move || {
+                let result = rl_moved.readline("you> ");
+                let _ = line_tx.send(result);
+                rl_moved
+            });
+
+            // Wait for either user input or background notification
+            let readline_result;
+            let mut line_rx = line_rx;
+            loop {
+                tokio::select! {
+                    result = &mut line_rx => {
+                        readline_result = result.unwrap_or(Err(
+                            rustyline::error::ReadlineError::Eof
+                        ));
+                        break;
+                    }
+                    Some(notif) = research_rx.recv() => {
+                        // Print notification while user is at the prompt
+                        println!();
+                        if notif.success {
+                            println!(
+                                "{} Research complete: {}",
+                                "✓".green().bold(),
+                                notif.question
+                            );
+                            println!("  Report saved to: {}", notif.report_path.display());
+                        } else {
+                            println!(
+                                "{} Research failed: {}",
+                                "✗".red().bold(),
+                                notif.summary
+                            );
+                        }
+                        println!();
+                        // Continue waiting for user input
+                    }
+                }
+            }
+
+            // Recover the Editor from the blocking thread
+            rl = readline_handle.await.unwrap_or_else(|_| {
+                rustyline::DefaultEditor::new().expect("failed to create editor")
+            });
+
+            let line = match readline_result {
                 Ok(line) => line,
                 Err(
                     rustyline::error::ReadlineError::Interrupted
@@ -252,8 +359,27 @@ impl ChatCommand {
                 break;
             }
 
-            // Process message
+            // Process message (may return quickly for background research)
             let response = agent.process_message(input, &history, vec![]).await?;
+
+            // Drain any notifications that arrived during processing
+            while let Ok(notif) = research_rx.try_recv() {
+                println!();
+                if notif.success {
+                    println!(
+                        "{} Research complete: {}",
+                        "✓".green().bold(),
+                        notif.question
+                    );
+                    println!("  Report saved to: {}", notif.report_path.display());
+                } else {
+                    println!(
+                        "{} Research failed: {}",
+                        "✗".red().bold(),
+                        notif.summary
+                    );
+                }
+            }
 
             // Append to history
             history.push(Message {
@@ -262,6 +388,7 @@ impl ChatCommand {
                 media: vec![],
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
                 timestamp: chrono::Utc::now(),
             });
             history.push(Message {
@@ -270,6 +397,7 @@ impl ChatCommand {
                 media: vec![],
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
                 timestamp: chrono::Utc::now(),
             });
 
@@ -468,6 +596,18 @@ pub(crate) fn create_provider(
             println!("{}: {}", "Model".green(), p.model_id());
             Arc::new(p)
         }
+        "zai" | "z.ai" => {
+            let api_key = config.get_api_key("zai")?;
+            let model_name = model.unwrap_or_else(|| "glm-5".to_string());
+            let mut p = AnthropicProvider::new(&api_key, &model_name);
+            p = p.with_base_url(
+                base_url
+                    .as_deref()
+                    .unwrap_or("https://api.z.ai/api/anthropic"),
+            );
+            println!("{}: {}", "Model".green(), p.model_id());
+            Arc::new(p)
+        }
         "nvidia" | "nim" => {
             let api_key = config.get_api_key("nvidia")?;
             let model_name = model.unwrap_or_else(|| "meta/llama-3.3-70b-instruct".to_string());
@@ -501,7 +641,7 @@ pub(crate) fn create_provider(
         other => {
             eyre::bail!(
                 "unknown provider: {other}. Valid: anthropic, openai, gemini, openrouter, \
-                 deepseek, groq, moonshot, dashscope, minimax, zhipu, nvidia, ollama, vllm"
+                 deepseek, groq, moonshot, dashscope, minimax, zhipu, zai, nvidia, ollama, vllm"
             );
         }
     };

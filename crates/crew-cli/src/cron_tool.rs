@@ -48,7 +48,10 @@ impl Tool for CronTool {
     }
 
     fn description(&self) -> &str {
-        "Schedule recurring or one-time tasks. Actions: add, list, remove, enable, disable."
+        "Schedule recurring or one-time tasks. Actions: add, list, remove, enable, disable. \
+         IMPORTANT: When adding a job, you MUST specify 'channel' and 'chat_id' so the \
+         reminder can be delivered. For Telegram users, use channel='telegram' and the \
+         user's numeric chat_id. Use 'every_seconds' for recurring reminders, not 'at_ms'."
     }
 
     fn input_schema(&self) -> serde_json::Value {

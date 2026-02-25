@@ -74,6 +74,7 @@ mod tests {
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
                 content: Some("ok".into()),
+                reasoning_content: None,
                 tool_calls: vec![],
                 stop_reason: crate::StopReason::EndTurn,
                 usage: TokenUsage::default(),

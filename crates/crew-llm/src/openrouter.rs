@@ -1,7 +1,7 @@
 //! OpenRouter provider implementation (OpenAI-compatible API).
 
 use async_trait::async_trait;
-use crew_core::Message;
+use crew_core::{Message, MessageRole};
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
 use reqwest::Client;
@@ -153,6 +153,7 @@ impl LlmProvider for OpenRouterProvider {
 
         Ok(ChatResponse {
             content: choice.message.content,
+            reasoning_content: None,
             tool_calls,
             stop_reason,
             usage: TokenUsage {
@@ -307,7 +308,10 @@ fn build_api_content(msg: &Message) -> Option<ApiContent> {
 
     if images.is_empty() {
         if msg.content.is_empty() {
-            return None;
+            return match msg.role {
+                MessageRole::User => Some(ApiContent::Text("[empty message]".to_string())),
+                _ => None,
+            };
         }
         return Some(ApiContent::Text(msg.content.clone()));
     }

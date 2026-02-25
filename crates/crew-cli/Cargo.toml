@@ -51,7 +51,6 @@ slack = ["crew-bus/slack"]
 whatsapp = ["crew-bus/whatsapp"]
 email = ["crew-bus/email"]
 feishu = ["crew-bus/feishu"]
-browser = ["crew-agent/browser"]
 git = ["crew-agent/git"]
 ast = ["crew-agent/ast"]
 

@@ -198,15 +198,30 @@ impl Channel for WhatsAppChannel {
             return Ok(());
         };
 
-        let payload = serde_json::json!({
-            "type": "send",
-            "to": msg.chat_id,
-            "text": msg.content,
-        });
-
-        tx.send(WsMessage::Text(payload.to_string().into()))
-            .await
-            .map_err(|e| eyre::eyre!("failed to send WhatsApp message: {e}"))?;
+        if !msg.media.is_empty() {
+            // Send each media file (bridge handles image/video/audio/document detection)
+            for (i, path) in msg.media.iter().enumerate() {
+                let caption = if i == 0 { &msg.content } else { "" };
+                let payload = serde_json::json!({
+                    "type": "send",
+                    "to": msg.chat_id,
+                    "text": caption,
+                    "media": path,
+                });
+                tx.send(WsMessage::Text(payload.to_string().into()))
+                    .await
+                    .map_err(|e| eyre::eyre!("failed to send WhatsApp media: {e}"))?;
+            }
+        } else {
+            let payload = serde_json::json!({
+                "type": "send",
+                "to": msg.chat_id,
+                "text": msg.content,
+            });
+            tx.send(WsMessage::Text(payload.to_string().into()))
+                .await
+                .map_err(|e| eyre::eyre!("failed to send WhatsApp message: {e}"))?;
+        }
 
         Ok(())
     }

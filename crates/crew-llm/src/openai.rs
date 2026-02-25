@@ -1,7 +1,7 @@
 //! OpenAI (GPT) provider implementation.
 
 use async_trait::async_trait;
-use crew_core::Message;
+use crew_core::{Message, MessageRole};
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
 use reqwest::Client;
@@ -59,11 +59,25 @@ impl OpenAIProvider {
             .iter()
             .map(|m| {
                 let role = m.role.as_str();
+                // Convert tool_calls from crew_core format to OpenAI format
+                let tool_calls = m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter()
+                        .map(|tc| OpenAIToolCall {
+                            id: tc.id.clone(),
+                            call_type: "function".to_string(),
+                            function: FunctionCall {
+                                name: tc.name.clone(),
+                                arguments: tc.arguments.to_string(),
+                            },
+                        })
+                        .collect()
+                });
                 OpenAIMessage {
                     role,
                     content: build_openai_content(m),
+                    reasoning_content: m.reasoning_content.as_deref(),
                     tool_call_id: m.tool_call_id.as_deref(),
-                    tool_calls: None,
+                    tool_calls,
                 }
             })
             .collect();
@@ -86,11 +100,24 @@ impl OpenAIProvider {
             )
         };
 
+        // GPT-5+, o1, o3, o4 models use max_completion_tokens instead of max_tokens
+        let uses_completion_tokens = self.model.starts_with("gpt-5")
+            || self.model.starts_with("o1")
+            || self.model.starts_with("o3")
+            || self.model.starts_with("o4");
+
+        // Some models (o1, o3, kimi-k2.5) don't support custom temperature
+        let fixed_temperature = self.model.starts_with("o1")
+            || self.model.starts_with("o3")
+            || self.model.contains("k2.5");
+        let temperature = if fixed_temperature { None } else { config.temperature };
+
         OpenAIRequest {
             model: &self.model,
             messages: openai_messages,
-            max_tokens: config.max_tokens,
-            temperature: config.temperature,
+            max_tokens: if uses_completion_tokens { None } else { config.max_tokens },
+            max_completion_tokens: if uses_completion_tokens { config.max_tokens.or(Some(4096)) } else { None },
+            temperature,
             tools: openai_tools,
         }
     }
@@ -160,6 +187,7 @@ impl LlmProvider for OpenAIProvider {
 
         Ok(ChatResponse {
             content: choice.message.content,
+            reasoning_content: choice.message.reasoning_content,
             tool_calls,
             stop_reason,
             usage: TokenUsage {
@@ -233,6 +261,8 @@ struct OpenAIRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool<'a>>>,
@@ -243,6 +273,8 @@ struct OpenAIMessage<'a> {
     role: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<OpenAIContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,7 +308,15 @@ fn build_openai_content(msg: &Message) -> Option<OpenAIContent> {
 
     if images.is_empty() {
         if msg.content.is_empty() {
-            return None;
+            // Tool messages require a content string (OpenAI spec).
+            // User messages must not be empty (many providers reject them).
+            // Assistant messages can have null content when tool_calls are present;
+            // some providers (Moonshot/kimi) reject empty-string content on assistant msgs.
+            return match msg.role {
+                MessageRole::Tool => Some(OpenAIContent::Text(String::new())),
+                MessageRole::User => Some(OpenAIContent::Text("[empty message]".to_string())),
+                _ => None,
+            };
         }
         return Some(OpenAIContent::Text(msg.content.clone()));
     }
@@ -327,13 +367,20 @@ struct Choice {
 #[derive(Deserialize)]
 struct ResponseMessage {
     content: Option<String>,
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<OpenAIToolCall>>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct OpenAIToolCall {
     id: String,
+    #[serde(rename = "type", default = "default_function_type")]
+    call_type: String,
     function: FunctionCall,
+}
+
+fn default_function_type() -> String {
+    "function".to_string()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -364,6 +411,13 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
 
     if let Some(choices) = data["choices"].as_array() {
         for choice in choices {
+            // Reasoning/thinking content (kimi-k2.5, o1, etc.)
+            if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str() {
+                if !reasoning.is_empty() {
+                    events.push(StreamEvent::ReasoningDelta(reasoning.to_string()));
+                }
+            }
+
             if let Some(content) = choice["delta"]["content"].as_str() {
                 if !content.is_empty() {
                     events.push(StreamEvent::TextDelta(content.to_string()));
@@ -419,6 +473,7 @@ mod tests {
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }
     }

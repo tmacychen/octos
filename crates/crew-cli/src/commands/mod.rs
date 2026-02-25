@@ -14,6 +14,8 @@ mod serve;
 mod skills;
 mod status;
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use eyre::Result;
 
@@ -73,6 +75,40 @@ pub enum Command {
 /// Trait for executable commands (following dora-rs pattern).
 pub trait Executable {
     fn execute(self) -> Result<()>;
+}
+
+/// Resolve the data directory for episodes, memory, sessions, etc.
+///
+/// Priority: `--data-dir` CLI flag > `CREW_HOME` env var > `~/.crew` default.
+pub(crate) fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<PathBuf> {
+    let dir = if let Some(d) = cli_override {
+        d
+    } else if let Ok(env_dir) = std::env::var("CREW_HOME") {
+        PathBuf::from(env_dir)
+    } else {
+        dirs::home_dir()
+            .ok_or_else(|| eyre::eyre!("cannot determine home directory"))?
+            .join(".crew")
+    };
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir)
+}
+
+/// Load optional bootstrap/personality files from the .crew/ directory.
+/// Used by both chat and gateway to build the system prompt from AGENTS.md, SOUL.md, etc.
+pub(crate) fn load_bootstrap_files(data_dir: &std::path::Path) -> String {
+    const FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"];
+    let mut parts = Vec::new();
+    for filename in FILES {
+        let path = data_dir.join(filename);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                parts.push(format!("## {filename}\n\n{trimmed}"));
+            }
+        }
+    }
+    parts.join("\n\n")
 }
 
 impl Executable for Command {

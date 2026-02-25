@@ -11,11 +11,12 @@ use crew_core::{InboundMessage, OutboundMessage};
 use eyre::{Result, WrapErr};
 use reqwest::Client;
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, UpdateKind};
+use teloxide::types::{ChatId, FileId, InputFile, ParseMode, UpdateKind};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::channel::Channel;
+use crate::markdown_html::markdown_to_telegram_html;
 use crate::media::download_media;
 
 pub struct TelegramChannel {
@@ -55,10 +56,10 @@ impl TelegramChannel {
     }
 
     /// Download a file from Telegram by file_id.
-    async fn download_telegram_file(&self, file_id: &str, ext: &str) -> Result<PathBuf> {
+    async fn download_telegram_file(&self, file_id: &FileId, ext: &str) -> Result<PathBuf> {
         let file = self
             .bot
-            .get_file(file_id)
+            .get_file(file_id.clone())
             .await
             .wrap_err("failed to get file info from Telegram")?;
 
@@ -202,10 +203,36 @@ impl Channel for TelegramChannel {
             .parse()
             .wrap_err_with(|| format!("invalid Telegram chat_id: {}", msg.chat_id))?;
 
-        self.bot
-            .send_message(ChatId(chat_id), &msg.content)
-            .await
-            .wrap_err("failed to send Telegram message")?;
+        if !msg.media.is_empty() {
+            // Send files as documents
+            let caption = if msg.content.is_empty() {
+                None
+            } else {
+                Some(markdown_to_telegram_html(&msg.content))
+            };
+
+            for (i, path) in msg.media.iter().enumerate() {
+                let file = InputFile::file(std::path::PathBuf::from(path));
+                let mut req = self.bot.send_document(ChatId(chat_id), file);
+                // Only attach caption to the first file
+                if i == 0 {
+                    if let Some(ref cap) = caption {
+                        req = req.caption(cap).parse_mode(ParseMode::Html);
+                    }
+                }
+                req.await
+                    .wrap_err_with(|| format!("failed to send document: {path}"))?;
+            }
+        } else {
+            // Normal text message
+            let html = markdown_to_telegram_html(&msg.content);
+
+            self.bot
+                .send_message(ChatId(chat_id), &html)
+                .parse_mode(ParseMode::Html)
+                .await
+                .wrap_err("failed to send Telegram message")?;
+        }
 
         Ok(())
     }

@@ -131,7 +131,7 @@ impl LlmProvider for ProviderChain {
                     return Ok(response);
                 }
                 Err(e) => {
-                    let retryable = RetryProvider::is_retryable_error(&e);
+                    let retryable = RetryProvider::should_failover(&e);
                     self.record_failure(idx);
 
                     if retryable && offset + 1 < self.slots.len() {
@@ -174,7 +174,7 @@ impl LlmProvider for ProviderChain {
                     return Ok(stream);
                 }
                 Err(e) => {
-                    let retryable = RetryProvider::is_retryable_error(&e);
+                    let retryable = RetryProvider::should_failover(&e);
                     self.record_failure(idx);
 
                     if retryable && offset + 1 < self.slots.len() {
@@ -249,6 +249,7 @@ mod tests {
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
                 content: Some("ok".to_string()),
+                reasoning_content: None,
                 tool_calls: vec![],
                 stop_reason: crate::types::StopReason::EndTurn,
                 usage: TokenUsage::default(),

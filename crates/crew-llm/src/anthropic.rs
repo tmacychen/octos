@@ -145,6 +145,7 @@ impl LlmProvider for AnthropicProvider {
 
         Ok(ChatResponse {
             content,
+            reasoning_content: None,
             tool_calls,
             stop_reason,
             usage: TokenUsage {
@@ -316,10 +317,31 @@ fn map_anthropic_sse(
     state: &mut AnthropicStreamState,
     event: &crate::sse::SseEvent,
 ) -> Vec<StreamEvent> {
+    // Handle SSE-level error events (e.g. Z.AI returns `event: error` with HTTP 200)
+    if event.event.as_deref() == Some("error") {
+        let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
+            Ok(v) => v["error"]["message"]
+                .as_str()
+                .unwrap_or(&event.data)
+                .to_string(),
+            Err(_) => event.data.clone(),
+        };
+        return vec![StreamEvent::Error(msg)];
+    }
+
     let data: serde_json::Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
+
+    // Handle error payloads without SSE event type (fallback)
+    if data.get("error").is_some() {
+        let msg = data["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown API error")
+            .to_string();
+        return vec![StreamEvent::Error(msg)];
+    }
 
     match data["type"].as_str().unwrap_or("") {
         "message_start" => {

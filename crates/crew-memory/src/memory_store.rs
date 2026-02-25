@@ -1,7 +1,11 @@
 //! Markdown-based persistent memory store.
 //!
-//! Stores long-term memory in `MEMORY.md` and daily notes in `YYYY-MM-DD.md`
-//! under a `.crew/memory/` directory.
+//! Stores long-term memory in `MEMORY.md`, daily notes in `YYYY-MM-DD.md`,
+//! and a memory bank of entity pages in `bank/entities/` under `.crew/memory/`.
+//!
+//! The memory bank provides two-level retrieval:
+//! - Level 1: Compact abstracts of all entities (injected into system prompt)
+//! - Level 2: Full entity pages (loaded on demand via `recall_memory` tool)
 
 use std::path::{Path, PathBuf};
 
@@ -117,9 +121,137 @@ impl MemoryStore {
         ctx
     }
 
+    // --- Memory Bank ---
+
+    /// Path to `bank/entities/` directory.
+    fn bank_dir(&self) -> PathBuf {
+        self.memory_dir.join("bank").join("entities")
+    }
+
+    /// Ensure the `bank/entities/` directory exists.
+    pub async fn ensure_bank_dir(&self) -> Result<()> {
+        tokio::fs::create_dir_all(self.bank_dir())
+            .await
+            .wrap_err("failed to create memory bank directory")
+    }
+
+    /// List all entity files, returning `(slug, abstract_line)` pairs sorted by name.
+    pub async fn list_entities(&self) -> Result<Vec<(String, String)>> {
+        let dir = self.bank_dir();
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).wrap_err("failed to read bank entities directory"),
+        };
+
+        let mut result = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "md") {
+                let slug = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+                let abstract_line = extract_abstract(&content);
+                result.push((slug, abstract_line));
+            }
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(result)
+    }
+
+    /// Read the full content of a named entity. Returns `None` if not found.
+    pub async fn read_entity(&self, name: &str) -> Result<Option<String>> {
+        let path = self.bank_dir().join(format!("{name}.md"));
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => Ok(Some(content)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).wrap_err_with(|| format!("failed to read entity: {name}")),
+        }
+    }
+
+    /// Write (create or update) an entity page. Creates bank directory if needed.
+    pub async fn write_entity(&self, name: &str, content: &str) -> Result<()> {
+        self.ensure_bank_dir().await?;
+        let path = self.bank_dir().join(format!("{name}.md"));
+        tokio::fs::write(&path, content)
+            .await
+            .wrap_err_with(|| format!("failed to write entity: {name}"))
+    }
+
+    /// Build a compact bank summary for system prompt injection.
+    pub async fn get_bank_summary(&self) -> String {
+        let entities = self.list_entities().await.unwrap_or_default();
+        if entities.is_empty() {
+            return String::new();
+        }
+
+        let mut summary = String::from(
+            "## Memory Bank\n\
+             These are facts you know about the user and their world. Treat them as ground \
+             truth — use them directly when relevant (e.g. if you know the user's city, use it \
+             for weather/time questions without asking). Use `recall_memory` to load full details \
+             when abstracts don't have enough information.\n",
+        );
+        for (name, abstract_line) in &entities {
+            summary.push_str(&format!("- **{name}**: {abstract_line}\n"));
+        }
+        summary
+    }
+
     fn today_path(&self) -> PathBuf {
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         self.memory_dir.join(format!("{date}.md"))
+    }
+}
+
+/// Extract an abstract from entity content.
+/// Skips YAML frontmatter, takes first non-empty non-heading line, truncates to 100 chars.
+fn extract_abstract(content: &str) -> String {
+    let body = strip_frontmatter(content);
+    let first_line = body
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.starts_with('#'));
+
+    match first_line {
+        Some(line) if line.len() > 100 => {
+            // Truncate at UTF-8 boundary
+            let mut end = 97;
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &line[..end])
+        }
+        Some(line) => line.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Strip YAML frontmatter (`---` delimited), returning only the body.
+fn strip_frontmatter(content: &str) -> &str {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return content;
+    }
+    let after_first = &trimmed[3..];
+    // Skip past the first newline after opening ---
+    let after_first = after_first
+        .strip_prefix('\r')
+        .unwrap_or(after_first)
+        .strip_prefix('\n')
+        .unwrap_or(after_first);
+    if let Some(end) = after_first.find("\n---") {
+        let body_start = end + 4; // skip "\n---"
+        after_first[body_start..]
+            .strip_prefix('\r')
+            .unwrap_or(&after_first[body_start..])
+            .strip_prefix('\n')
+            .unwrap_or(&after_first[body_start..])
+    } else {
+        content
     }
 }
 
@@ -216,6 +348,111 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].0, yesterday);
         assert!(recent[0].1.contains("some notes"));
+    }
+
+    #[test]
+    fn test_extract_abstract_with_frontmatter() {
+        let content = "---\nname: test\ntype: project\n---\n# Test\n\nA cool project for testing.\n\n## Details\nMore info.";
+        assert_eq!(extract_abstract(content), "A cool project for testing.");
+    }
+
+    #[test]
+    fn test_extract_abstract_no_frontmatter() {
+        let content = "# My Project\n\nSimple description here.\n";
+        assert_eq!(extract_abstract(content), "Simple description here.");
+    }
+
+    #[test]
+    fn test_extract_abstract_truncation() {
+        let long = "A".repeat(150);
+        let content = format!("# Title\n\n{long}\n");
+        let abs = extract_abstract(&content);
+        assert!(abs.len() <= 103); // 97 + "..."
+        assert!(abs.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_abstract_empty() {
+        assert_eq!(extract_abstract(""), "");
+        assert_eq!(extract_abstract("# Just a heading\n"), "");
+    }
+
+    #[test]
+    fn test_strip_frontmatter() {
+        let content = "---\nname: test\n---\nBody here.";
+        assert_eq!(strip_frontmatter(content), "Body here.");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_no_frontmatter() {
+        let content = "Just plain text.";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[tokio::test]
+    async fn test_list_entities_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let entities = store.list_entities().await.unwrap();
+        assert!(entities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        let content = "---\nname: test-project\n---\n# Test\n\nA test project.\n";
+        store.write_entity("test-project", content).await.unwrap();
+
+        let read = store.read_entity("test-project").await.unwrap();
+        assert_eq!(read, Some(content.to_string()));
+
+        // Not found
+        let missing = store.read_entity("nonexistent").await.unwrap();
+        assert_eq!(missing, None);
+    }
+
+    #[tokio::test]
+    async fn test_list_entities_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        store
+            .write_entity("zebra", "# Zebra\n\nA zebra entity.\n")
+            .await
+            .unwrap();
+        store
+            .write_entity("alpha", "# Alpha\n\nAn alpha entity.\n")
+            .await
+            .unwrap();
+
+        let entities = store.list_entities().await.unwrap();
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0].0, "alpha");
+        assert_eq!(entities[0].1, "An alpha entity.");
+        assert_eq!(entities[1].0, "zebra");
+        assert_eq!(entities[1].1, "A zebra entity.");
+    }
+
+    #[tokio::test]
+    async fn test_get_bank_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+
+        // Empty bank
+        assert_eq!(store.get_bank_summary().await, "");
+
+        // With entities
+        store
+            .write_entity("crew-rs", "# crew-rs\n\nRust AI agent framework.\n")
+            .await
+            .unwrap();
+
+        let summary = store.get_bank_summary().await;
+        assert!(summary.contains("## Memory Bank"));
+        assert!(summary.contains("**crew-rs**"));
+        assert!(summary.contains("Rust AI agent framework."));
     }
 
     #[tokio::test]

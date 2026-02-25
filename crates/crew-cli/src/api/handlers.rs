@@ -33,6 +33,15 @@ pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+    let agent = state.agent.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No LLM provider configured. Set up a profile with an API key first.".into(),
+    ))?;
+    let sessions = state.sessions.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sessions not available".into(),
+    ))?;
+
     if req.message.len() > MAX_MESSAGE_LEN {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -43,38 +52,39 @@ pub async fn chat(
     let session_key = SessionKey::new("api", req.session_id.as_deref().unwrap_or("default"));
 
     let history: Vec<Message> = {
-        let mut sessions = state.sessions.lock().await;
-        let session = sessions.get_or_create(&session_key);
+        let mut sess = sessions.lock().await;
+        let session = sess.get_or_create(&session_key);
         session.get_history(50).to_vec()
     };
 
-    let response = state
-        .agent
+    let response = agent
         .process_message(&req.message, &history, vec![])
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Save to session
     {
-        let mut sessions = state.sessions.lock().await;
+        let mut sess = sessions.lock().await;
         let user_msg = Message {
             role: MessageRole::User,
             content: req.message,
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         };
-        let _ = sessions.add_message(&session_key, user_msg).await;
+        let _ = sess.add_message(&session_key, user_msg).await;
         let assistant_msg = Message {
             role: MessageRole::Assistant,
             content: response.content.clone(),
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         };
-        let _ = sessions.add_message(&session_key, assistant_msg).await;
+        let _ = sess.add_message(&session_key, assistant_msg).await;
     }
 
     Ok(Json(ChatResponse {
@@ -114,9 +124,15 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
-pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionInfo>> {
-    let sessions = state.sessions.lock().await;
-    let list = sessions
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<SessionInfo>>, (StatusCode, String)> {
+    let sessions = state.sessions.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sessions not available".into(),
+    ))?;
+    let sess = sessions.lock().await;
+    let list = sess
         .list_sessions()
         .into_iter()
         .map(|(id, count)| SessionInfo {
@@ -124,7 +140,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<Sessi
             message_count: count,
         })
         .collect();
-    Json(list)
+    Ok(Json(list))
 }
 
 /// GET /api/sessions/:id/messages -- get session history.
@@ -146,13 +162,19 @@ pub async fn session_messages(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
-) -> Result<Json<Vec<MessageInfo>>, StatusCode> {
+) -> Result<Json<Vec<MessageInfo>>, (StatusCode, String)> {
+    let sessions = state.sessions.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sessions not available".into(),
+    ))?;
     let limit = params.limit.min(500);
     let offset = params.offset.min(10_000);
-    let fetch_count = offset.checked_add(limit).ok_or(StatusCode::BAD_REQUEST)?;
+    let fetch_count = offset
+        .checked_add(limit)
+        .ok_or((StatusCode::BAD_REQUEST, "invalid pagination".into()))?;
     let key = SessionKey::new("api", &id);
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions.get_or_create(&key);
+    let mut sess = sessions.lock().await;
+    let session = sess.get_or_create(&key);
     let messages = session
         .get_history(fetch_count)
         .iter()
@@ -181,14 +203,23 @@ pub struct StatusResponse {
     pub model: String,
     pub provider: String,
     pub uptime_secs: i64,
+    pub agent_configured: bool,
 }
 
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = chrono::Utc::now() - state.started_at;
+    let (model, provider) = match &state.agent {
+        Some(agent) => (
+            agent.model_id().to_string(),
+            agent.provider_name().to_string(),
+        ),
+        None => ("none".to_string(), "none".to_string()),
+    };
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        model: state.agent.model_id().to_string(),
-        provider: state.agent.provider_name().to_string(),
+        model,
+        provider,
         uptime_secs: uptime.num_seconds(),
+        agent_configured: state.agent.is_some(),
     })
 }

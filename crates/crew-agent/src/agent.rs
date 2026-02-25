@@ -162,6 +162,16 @@ impl Agent {
         self
     }
 
+    /// Append additional content to the current system prompt (e.g. bootstrap files).
+    pub fn append_system_prompt(&self, extra: &str) {
+        let mut guard = self.system_prompt.write().unwrap_or_else(|e| {
+            tracing::warn!("system prompt lock was poisoned, recovering");
+            e.into_inner()
+        });
+        guard.push_str("\n\n");
+        guard.push_str(extra);
+    }
+
     /// Update the system prompt at runtime (hot-reload).
     pub fn set_system_prompt(&self, prompt: String) {
         *self.system_prompt.write().unwrap_or_else(|e| {
@@ -201,17 +211,25 @@ impl Agent {
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }];
 
         messages.extend_from_slice(history);
 
+        let content = if user_content.is_empty() && !media.is_empty() {
+            "[User sent an image]".to_string()
+        } else {
+            user_content.to_string()
+        };
+
         messages.push(Message {
             role: MessageRole::User,
-            content: user_content.to_string(),
+            content,
             media,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         });
 
@@ -433,6 +451,7 @@ impl Agent {
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }];
 
@@ -495,6 +514,7 @@ impl Agent {
                     media: vec![],
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                     timestamp: chrono::Utc::now(),
                 });
             }
@@ -524,6 +544,7 @@ impl Agent {
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
             timestamp: chrono::Utc::now(),
         });
 
@@ -541,6 +562,7 @@ impl Agent {
                 Some(response.tool_calls.clone())
             },
             tool_call_id: None,
+            reasoning_content: response.reasoning_content.clone(),
             timestamp: chrono::Utc::now(),
         }
     }
@@ -585,6 +607,7 @@ impl Agent {
                                 media: vec![],
                                 tool_calls: None,
                                 tool_call_id: Some(tool_call.id.clone()),
+                                reasoning_content: None,
                                 timestamp: chrono::Utc::now(),
                             },
                             None,
@@ -676,6 +699,7 @@ impl Agent {
                         media: vec![],
                         tool_calls: None,
                         tool_call_id: Some(tool_call.id.clone()),
+                        reasoning_content: None,
                         timestamp: chrono::Utc::now(),
                     },
                     file_modified,
@@ -759,6 +783,7 @@ impl Agent {
                 media: vec![],
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
                 timestamp: chrono::Utc::now(),
             },
         );
@@ -830,6 +855,7 @@ impl Agent {
         });
 
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut tool_calls: Vec<(String, String, String)> = Vec::new();
         let mut usage = crew_llm::TokenUsage::default();
         let mut stop_reason = StopReason::EndTurn;
@@ -846,6 +872,9 @@ impl Agent {
             let Some(event) = event else { break };
 
             match event {
+                StreamEvent::ReasoningDelta(delta) => {
+                    reasoning.push_str(&delta);
+                }
                 StreamEvent::TextDelta(delta) => {
                     self.reporter.report(ProgressEvent::StreamChunk {
                         text: delta.clone(),
@@ -910,9 +939,12 @@ impl Agent {
             })
             .collect();
 
+        let reasoning_content = if reasoning.is_empty() { None } else { Some(reasoning) };
+
         Ok((
             ChatResponse {
                 content,
+                reasoning_content,
                 tool_calls,
                 stop_reason,
                 usage,
@@ -983,7 +1015,31 @@ impl Agent {
         None
     }
 
+    /// Maximum retries for transient LLM failures (empty responses, stream errors).
+    const LLM_RETRY_MAX: u32 = 3;
+
+    /// Check if an LLM response is empty (0 output tokens, no content, no tool calls).
+    /// This typically indicates a transient API issue (e.g. server overload).
+    fn is_empty_response(response: &ChatResponse) -> bool {
+        response.usage.output_tokens == 0
+            && response.content.as_ref().is_none_or(|c| c.is_empty())
+            && response.tool_calls.is_empty()
+    }
+
+    /// Check if an error looks like a transient server issue worth retrying.
+    fn is_retryable_stream_error(err: &eyre::Report) -> bool {
+        let msg = err.to_string().to_lowercase();
+        msg.contains("overloaded")
+            || msg.contains("temporarily")
+            || msg.contains("429")
+            || msg.contains("502")
+            || msg.contains("503")
+            || msg.contains("1305")
+            || msg.contains("rate limit")
+    }
+
     /// Call the LLM with before/after lifecycle hooks.
+    /// Automatically retries on empty responses and retryable stream errors.
     async fn call_llm_with_hooks(
         &self,
         messages: &[Message],
@@ -998,22 +1054,68 @@ impl Agent {
             }
         }
 
-        let stream = self.llm.chat_stream(messages, tools_spec, config).await?;
-        let (response, streamed) = self.consume_stream(stream, iteration).await?;
+        let mut last_error: Option<eyre::Report> = None;
 
-        if let Some(ref hooks) = self.hooks {
-            let payload = HookPayload::after_llm(
-                self.llm.model_id(),
-                iteration,
-                &format!("{:?}", response.stop_reason),
-                !response.tool_calls.is_empty(),
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-            );
-            let _ = hooks.run(HookEvent::AfterLlmCall, &payload).await;
+        for attempt in 0..=Self::LLM_RETRY_MAX {
+            // Try the full LLM call (stream creation + consumption)
+            let call_result = async {
+                let stream = self.llm.chat_stream(messages, tools_spec, config).await?;
+                self.consume_stream(stream, iteration).await
+            }
+            .await;
+
+            match call_result {
+                Ok((response, streamed)) => {
+                    if !Self::is_empty_response(&response) || attempt == Self::LLM_RETRY_MAX {
+                        // Success or final attempt — use this response
+                        if let Some(ref hooks) = self.hooks {
+                            let payload = HookPayload::after_llm(
+                                self.llm.model_id(),
+                                iteration,
+                                &format!("{:?}", response.stop_reason),
+                                !response.tool_calls.is_empty(),
+                                response.usage.input_tokens,
+                                response.usage.output_tokens,
+                            );
+                            let _ = hooks.run(HookEvent::AfterLlmCall, &payload).await;
+                        }
+                        return Ok((response, streamed));
+                    }
+
+                    // Empty response — retry
+                    let delay = Duration::from_secs(1 << attempt);
+                    warn!(
+                        attempt = attempt + 1,
+                        max = Self::LLM_RETRY_MAX,
+                        delay_s = delay.as_secs(),
+                        iteration,
+                        "empty (0-token) LLM response, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    if attempt < Self::LLM_RETRY_MAX && Self::is_retryable_stream_error(&e) {
+                        let delay = Duration::from_secs(1 << attempt);
+                        warn!(
+                            attempt = attempt + 1,
+                            max = Self::LLM_RETRY_MAX,
+                            delay_s = delay.as_secs(),
+                            error = %e,
+                            iteration,
+                            "retryable stream error, retrying"
+                        );
+                        last_error = Some(e);
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        // Non-retryable error or last attempt — propagate
+                        return Err(e);
+                    }
+                }
+            }
         }
 
-        Ok((response, streamed))
+        // All retries exhausted with errors
+        Err(last_error.unwrap_or_else(|| eyre::eyre!("LLM call failed after retries")))
     }
 
     /// Execute tool calls from an LLM response and accumulate results.

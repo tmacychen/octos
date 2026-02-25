@@ -87,6 +87,9 @@ pub struct FallbackModel {
     /// Custom base URL.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Override the API key env var for this fallback.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 /// A sub-provider available for subagent spawning via the spawn tool.
@@ -333,6 +336,7 @@ impl Config {
             "openai" => "OPENAI_API_KEY".to_string(),
             "gemini" => "GEMINI_API_KEY".to_string(),
             "zhipu" | "glm" => "ZHIPU_API_KEY".to_string(),
+            "zai" | "z.ai" => "ZAI_API_KEY".to_string(),
             _ => format!("{}_API_KEY", provider.to_uppercase()),
         });
 
@@ -362,6 +366,8 @@ impl Config {
                 "minimax",
                 "zhipu",
                 "glm",
+                "zai",
+                "z.ai",
                 "nvidia",
                 "nim",
                 "ollama",
@@ -423,6 +429,7 @@ impl Config {
                 "openai" => "OPENAI_API_KEY".to_string(),
                 "gemini" => "GEMINI_API_KEY".to_string(),
                 "zhipu" | "glm" => "ZHIPU_API_KEY".to_string(),
+                "zai" | "z.ai" => "ZAI_API_KEY".to_string(),
                 _ => format!("{}_API_KEY", provider.to_uppercase()),
             });
             warnings.push(format!("{} environment variable not set", env_var));
@@ -462,6 +469,7 @@ fn is_valid_model_for_provider(provider: &str, model: &str) -> bool {
         "moonshot" | "kimi" => m.contains("kimi") || m.contains("moonshot"),
         "dashscope" | "qwen" => m.contains("qwen"),
         "zhipu" | "glm" => m.contains("glm"),
+        "zai" | "z.ai" => true, // Z.AI hosts multiple models (GLM, Claude, etc.)
         "minimax" => m.contains("minimax"),
         // These host many models, accept any
         "groq" | "nvidia" | "nim" | "ollama" | "vllm" | "openrouter" => true,

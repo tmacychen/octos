@@ -11,6 +11,10 @@ pub mod compaction;
 pub mod config;
 pub mod config_watcher;
 pub mod cron_tool;
+#[cfg(feature = "api")]
+pub mod process_manager;
+#[cfg(feature = "api")]
+pub mod profiles;
 
 use commands::{Args, Executable};
 
@@ -29,7 +33,10 @@ fn main() -> Result<()> {
 fn init_tracing() -> Result<()> {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        // Suppress noisy HTML5 parser warnings ("foster parenting not implemented")
+        .add_directive("html5ever=error".parse().unwrap());
 
     // Check if JSON format is requested via environment
     let json_logs = std::env::var("CREW_LOG_JSON").is_ok();

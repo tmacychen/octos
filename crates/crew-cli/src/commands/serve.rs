@@ -33,6 +33,10 @@ pub struct ServeCommand {
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
 
+    /// Data directory for episodes, memory, sessions (defaults to $CREW_HOME or ~/.crew).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+
     /// Path to config file.
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -66,8 +70,8 @@ impl Executable for ServeCommand {
 
 impl ServeCommand {
     async fn run_async(self) -> Result<()> {
-        let cwd = match self.cwd {
-            Some(p) => p,
+        let cwd = match &self.cwd {
+            Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
 
@@ -77,10 +81,118 @@ impl ServeCommand {
             Config::load(&cwd)?
         };
 
-        let model = self.model.or(config.model.clone());
+        // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
+        let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
+
+        // Try to create the LLM provider + agent, but don't fail if no API key.
+        // The admin dashboard works without it.
+        let agent_and_sessions = self
+            .try_create_agent(&config, &cwd, &data_dir)
+            .await;
+
+        let (agent, sessions) = match agent_and_sessions {
+            Ok((a, s)) => (Some(Arc::new(a)), Some(s)),
+            Err(e) => {
+                tracing::warn!("LLM agent not available: {e}");
+                tracing::info!("Admin dashboard will still work. Configure profiles via /admin/");
+                (None, None)
+            }
+        };
+
+        let broadcaster = Arc::new(SseBroadcaster::new(256));
+        let metrics_handle = Some(init_metrics());
+
+        // Security: warn if binding to non-localhost without auth token
+        let auth_token = if self.auth_token.is_some() {
+            self.auth_token
+        } else if self.host != "127.0.0.1" && self.host != "localhost" && self.host != "::1" {
+            tracing::warn!(
+                "Binding to {} without --auth-token is dangerous! \
+                 Generating a random token for this session.",
+                self.host
+            );
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            std::time::SystemTime::now().hash(&mut h);
+            std::process::id().hash(&mut h);
+            let token = format!("{:016x}{:016x}", h.finish(), h.finish().wrapping_mul(6364136223846793005));
+            println!(
+                "{}: {} (auto-generated, pass --auth-token to set your own)",
+                "Auth token".yellow(),
+                token
+            );
+            Some(token)
+        } else {
+            None
+        };
+
+        // Initialize profile store and process manager for admin dashboard
+        let profile_store = Arc::new(
+            crate::profiles::ProfileStore::open(&data_dir)
+                .wrap_err("failed to open profile store")?,
+        );
+        let process_manager = Arc::new(crate::process_manager::ProcessManager::new(
+            profile_store.clone(),
+        ));
+
+        let state = Arc::new(AppState {
+            agent,
+            sessions,
+            broadcaster,
+            started_at: chrono::Utc::now(),
+            auth_token,
+            metrics_handle,
+            profile_store: Some(profile_store.clone()),
+            process_manager: Some(process_manager.clone()),
+        });
+
+        // Auto-start enabled profiles
+        let profiles = profile_store.list().unwrap_or_default();
+        let enabled_count = profiles.iter().filter(|p| p.enabled).count();
+        if enabled_count > 0 {
+            for p in &profiles {
+                if p.enabled {
+                    if let Err(e) = process_manager.start(p).await {
+                        tracing::warn!(profile = %p.id, error = %e, "failed to auto-start gateway");
+                    }
+                }
+            }
+        }
+
+        let app = build_router(state);
+        let addr = format!("{}:{}", self.host, self.port);
+
+        println!("{}", "crew-rs API server".cyan().bold());
+        println!("{}: http://{}", "Listening".green(), addr);
+        println!("{}: http://{}/admin/", "Dashboard".green(), addr);
+        if enabled_count > 0 {
+            println!(
+                "{}: {} profiles auto-started",
+                "Gateways".green(),
+                enabled_count
+            );
+        }
+        println!();
+
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app).await?;
+
+        Ok(())
+    }
+
+    /// Try to create an Agent + SessionManager. Returns Err if API key is missing etc.
+    async fn try_create_agent(
+        &self,
+        config: &Config,
+        cwd: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<(Agent, Arc<tokio::sync::Mutex<SessionManager>>)> {
+        let model = self.model.clone().or(config.model.clone());
         let base_url = config.base_url.clone();
         let provider_name = self
             .provider
+            .clone()
             .or(config.provider.clone())
             .or_else(|| {
                 model
@@ -91,7 +203,7 @@ impl ServeCommand {
             .unwrap_or_else(|| "anthropic".to_string());
 
         let base_provider: Arc<dyn LlmProvider> =
-            create_provider(&provider_name, &config, model, base_url)?;
+            create_provider(&provider_name, config, model, base_url)?;
 
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
             base_provider
@@ -99,15 +211,15 @@ impl ServeCommand {
             Arc::new(RetryProvider::new(base_provider))
         };
 
-        let data_dir = cwd.join(".crew");
         let memory = Arc::new(
-            EpisodeStore::open(&data_dir)
+            EpisodeStore::open(data_dir)
                 .await
                 .wrap_err("failed to open episode store")?,
         );
 
         let sandbox = crew_agent::create_sandbox(&config.sandbox);
-        let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+        let mut tools = ToolRegistry::with_builtins_and_sandbox(cwd, sandbox);
+        tools.register(crew_agent::DeepSearchTool::new(data_dir.join("research")));
 
         // MCP tools
         if !config.mcp_servers.is_empty() {
@@ -118,50 +230,26 @@ impl ServeCommand {
         }
 
         // Plugins
-        let plugin_dirs = Config::plugin_dirs(&cwd);
+        let plugin_dirs = Config::plugin_dirs(cwd);
         if !plugin_dirs.is_empty() {
             let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs);
         }
 
-        let broadcaster = Arc::new(SseBroadcaster::new(256));
         let mut agent = Agent::new(AgentId::new("api"), llm, tools, memory)
             .with_config(AgentConfig {
                 max_iterations: 20,
                 save_episodes: false,
                 ..Default::default()
-            })
-            .with_reporter(broadcaster.clone());
+            });
 
         if !config.hooks.is_empty() {
             agent = agent.with_hooks(Arc::new(HookExecutor::new(config.hooks.clone())));
         }
 
         let sessions = Arc::new(tokio::sync::Mutex::new(
-            SessionManager::open(&data_dir).wrap_err("failed to open session manager")?,
+            SessionManager::open(data_dir).wrap_err("failed to open session manager")?,
         ));
 
-        let auth_token = self.auth_token;
-        let metrics_handle = Some(init_metrics());
-
-        let state = Arc::new(AppState {
-            agent: Arc::new(agent),
-            sessions,
-            broadcaster,
-            started_at: chrono::Utc::now(),
-            auth_token,
-            metrics_handle,
-        });
-
-        let app = build_router(state);
-        let addr = format!("{}:{}", self.host, self.port);
-
-        println!("{}", "crew-rs API server".cyan().bold());
-        println!("{}: http://{}", "Listening".green(), addr);
-        println!();
-
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app).await?;
-
-        Ok(())
+        Ok((agent, sessions))
     }
 }

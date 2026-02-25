@@ -1,13 +1,11 @@
 //! Deep research integration tests for the browser tool.
 //!
 //! These tests exercise real headless Chrome against live websites.
-//! Run with: `cargo test -p crew-agent --features browser -- --ignored browser_research`
+//! Run with: `cargo test -p crew-agent -- --ignored browser_research`
 //!
 //! Requirements:
 //! - Chrome/Chromium installed on the system
 //! - Network access
-
-#![cfg(feature = "browser")]
 
 use crew_agent::Tool;
 use crew_agent::tools::browser::BrowserTool;

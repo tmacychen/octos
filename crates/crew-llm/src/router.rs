@@ -272,6 +272,7 @@ mod tests {
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
                 content: Some(format!("response from {}", self.model)),
+                reasoning_content: None,
                 tool_calls: vec![],
                 stop_reason: crate::StopReason::EndTurn,
                 usage: TokenUsage::default(),
