@@ -35,12 +35,15 @@ pub struct UserProfile {
 /// LLM and gateway configuration for a profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileConfig {
-    /// LLM provider name (anthropic, openai, etc.).
+    /// LLM provider name (anthropic, openai, moonshot, deepseek, etc.).
     #[serde(default)]
     pub provider: Option<String>,
     /// Model name.
     #[serde(default)]
     pub model: Option<String>,
+    /// Custom base URL override. If set, takes priority over provider mapping.
+    #[serde(default)]
+    pub base_url: Option<String>,
     /// Env var name for API key.
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -288,8 +291,17 @@ impl ProfileStore {
         let mut config = serde_json::json!({
             "gateway": gateway,
         });
+
+        // Resolve provider: map friendly names to native provider + base_url
         if let Some(ref p) = profile.config.provider {
-            config["provider"] = serde_json::json!(p);
+            let (native_provider, default_base_url) = resolve_provider(p);
+            config["provider"] = serde_json::json!(native_provider);
+            // base_url priority: explicit override > provider mapping
+            if let Some(ref url) = profile.config.base_url {
+                config["base_url"] = serde_json::json!(url);
+            } else if let Some(url) = default_base_url {
+                config["base_url"] = serde_json::json!(url);
+            }
         }
         if let Some(ref m) = profile.config.model {
             config["model"] = serde_json::json!(m);
@@ -348,6 +360,31 @@ fn validate_profile_id(id: &str) -> Result<()> {
         bail!("profile ID must not start or end with a hyphen");
     }
     Ok(())
+}
+
+/// Map a friendly provider name to (native_provider, optional_base_url).
+///
+/// Native providers (anthropic, openai, gemini, openrouter) are passed through.
+/// OpenAI-compatible providers are mapped to "openai" with their API base URL.
+fn resolve_provider(name: &str) -> (&str, Option<&str>) {
+    match name {
+        // Native providers — no base_url needed
+        "anthropic" => ("anthropic", None),
+        "openai" => ("openai", None),
+        "gemini" => ("gemini", None),
+        "openrouter" => ("openrouter", None),
+        // OpenAI-compatible providers
+        "deepseek" => ("openai", Some("https://api.deepseek.com/v1")),
+        "groq" => ("openai", Some("https://api.groq.com/openai/v1")),
+        "moonshot" => ("openai", Some("https://api.moonshot.ai/v1")),
+        "dashscope" => ("openai", Some("https://dashscope.aliyuncs.com/compatible-mode/v1")),
+        "minimax" => ("openai", Some("https://api.minimax.chat/v1")),
+        "zhipu" => ("openai", Some("https://open.bigmodel.cn/api/paas/v4")),
+        "ollama" => ("openai", Some("http://localhost:11434/v1")),
+        "vllm" => ("openai", Some("http://localhost:8000/v1")),
+        // Unknown — pass through as-is
+        other => (other, None),
+    }
 }
 
 /// Convert a `ChannelCredentials` to a crew-rs `ChannelEntry` JSON value.
@@ -438,6 +475,7 @@ mod tests {
             config: ProfileConfig {
                 provider: Some("anthropic".into()),
                 model: Some("claude-sonnet-4-20250514".into()),
+                base_url: None,
                 api_key_env: Some("ANTHROPIC_API_KEY".into()),
                 channels: vec![ChannelCredentials::Telegram {
                     token_env: "TG_TOKEN".into(),
@@ -479,6 +517,7 @@ mod tests {
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 model: Some("gpt-4o".into()),
+                base_url: None,
                 api_key_env: None,
                 channels: vec![
                     ChannelCredentials::Telegram {
@@ -511,6 +550,38 @@ mod tests {
         assert_eq!(json["gateway"]["max_history"], 100);
         assert_eq!(json["gateway"]["system_prompt"], "Hello");
         assert_eq!(json["gateway"]["channels"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_generate_config_provider_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        let profile = UserProfile {
+            id: "moonshot-test".into(),
+            name: "Moonshot".into(),
+            enabled: true,
+            data_dir: None,
+            config: ProfileConfig {
+                provider: Some("moonshot".into()),
+                model: Some("kimi-k2.5".into()),
+                base_url: None,
+                api_key_env: Some("MOONSHOT_API_KEY".into()),
+                channels: vec![],
+                gateway: GatewaySettings::default(),
+                env_vars: Default::default(),
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let config_path = store.generate_config(&profile).unwrap();
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // "moonshot" should be mapped to "openai" with Moonshot base_url
+        assert_eq!(json["provider"], "openai");
+        assert_eq!(json["base_url"], "https://api.moonshot.ai/v1");
+        assert_eq!(json["model"], "kimi-k2.5");
     }
 
     #[test]
