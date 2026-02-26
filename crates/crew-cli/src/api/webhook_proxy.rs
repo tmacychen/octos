@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -24,7 +24,30 @@ pub async fn feishu_webhook_proxy(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    proxy_to_gateway(state, profile_id, "/webhook/event", headers, body).await
+    // Read body first so we can inspect it for url_verification
+    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "request body too large"),
+    };
+
+    // Handle Feishu url_verification challenge at the proxy level.
+    // This allows webhook URL verification in the Lark console even if
+    // the gateway hasn't started yet or is in websocket mode.
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        if json.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
+            let challenge = json
+                .get("challenge")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            tracing::info!(
+                profile = %profile_id,
+                "webhook proxy: handling url_verification challenge directly"
+            );
+            return axum::Json(serde_json::json!({"challenge": challenge})).into_response();
+        }
+    }
+
+    proxy_to_gateway_with_bytes(state, profile_id, "/webhook/event", headers, body_bytes).await
 }
 
 /// Proxy Twilio webhook events to the gateway's local webhook server.
@@ -34,34 +57,37 @@ pub async fn twilio_webhook_proxy(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    proxy_to_gateway(state, profile_id, "/twilio/webhook", headers, body).await
+    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "request body too large"),
+    };
+    proxy_to_gateway_with_bytes(state, profile_id, "/twilio/webhook", headers, body_bytes).await
 }
 
 /// Forward a request to the gateway's local webhook server.
-async fn proxy_to_gateway(
+async fn proxy_to_gateway_with_bytes(
     state: Arc<AppState>,
     profile_id: String,
     upstream_path: &str,
     headers: HeaderMap,
-    body: Body,
+    body_bytes: Bytes,
 ) -> Response {
     let pm = match state.process_manager.as_ref() {
         Some(pm) => pm,
-        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        None => return json_error(StatusCode::SERVICE_UNAVAILABLE, "process manager not available"),
     };
 
     let port = match pm.webhook_port(&profile_id).await {
         Some(port) => port,
-        None => return StatusCode::BAD_GATEWAY.into_response(),
+        None => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("no webhook port for profile '{profile_id}' (gateway not running or not in webhook mode)"),
+            )
+        }
     };
 
     let url = format!("http://127.0.0.1:{port}{upstream_path}");
-
-    // Convert axum body to reqwest body
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
 
     // Build upstream request preserving headers
     let mut req = state.http_client.post(&url).body(body_bytes.to_vec());
@@ -90,7 +116,10 @@ async fn proxy_to_gateway(
                 error = %e,
                 "webhook proxy: upstream request failed"
             );
-            return StatusCode::BAD_GATEWAY.into_response();
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream request failed: {e}"),
+            );
         }
     };
 
@@ -100,7 +129,7 @@ async fn proxy_to_gateway(
     let resp_headers = resp.headers().clone();
     let resp_body = match resp.bytes().await {
         Ok(b) => b,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        Err(_) => return json_error(StatusCode::BAD_GATEWAY, "failed to read upstream response"),
     };
 
     let mut response = (status, resp_body.to_vec()).into_response();
@@ -110,4 +139,10 @@ async fn proxy_to_gateway(
     }
 
     response
+}
+
+/// Return a JSON error response so Feishu/Lark doesn't complain about non-JSON.
+fn json_error(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({"error": message});
+    (status, axum::Json(body)).into_response()
 }
