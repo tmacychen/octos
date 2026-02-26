@@ -81,6 +81,9 @@ impl OpenAIProvider {
                 }
             })
             .collect();
+        // Merge consecutive system messages into one (some providers like
+        // MiniMax reject multiple system messages with error 2013).
+        let openai_messages = merge_system_messages(openai_messages);
 
         let openai_tools: Option<Vec<OpenAITool>> = if tools.is_empty() {
             None
@@ -110,13 +113,25 @@ impl OpenAIProvider {
         let fixed_temperature = self.model.starts_with("o1")
             || self.model.starts_with("o3")
             || self.model.contains("k2.5");
-        let temperature = if fixed_temperature { None } else { config.temperature };
+        let temperature = if fixed_temperature {
+            None
+        } else {
+            config.temperature
+        };
 
         OpenAIRequest {
             model: &self.model,
             messages: openai_messages,
-            max_tokens: if uses_completion_tokens { None } else { config.max_tokens },
-            max_completion_tokens: if uses_completion_tokens { config.max_tokens.or(Some(4096)) } else { None },
+            max_tokens: if uses_completion_tokens {
+                None
+            } else {
+                config.max_tokens
+            },
+            max_completion_tokens: if uses_completion_tokens {
+                config.max_tokens.or(Some(4096))
+            } else {
+                None
+            },
             temperature,
             tools: openai_tools,
         }
@@ -175,6 +190,7 @@ impl LlmProvider for OpenAIProvider {
                 id: tc.id,
                 name: tc.function.name,
                 arguments: serde_json::from_str(&tc.function.arguments).unwrap_or_default(),
+                metadata: None,
             })
             .collect();
 
@@ -301,6 +317,36 @@ enum OpenAIContentPart {
 #[derive(Serialize)]
 struct OpenAIImageUrl {
     url: String,
+}
+
+/// Merge consecutive system messages into a single system message.
+///
+/// Some OpenAI-compatible providers (e.g. MiniMax) reject requests with
+/// multiple system messages. This combines their text content with a newline
+/// separator while preserving all other messages in order.
+fn merge_system_messages(messages: Vec<OpenAIMessage<'_>>) -> Vec<OpenAIMessage<'_>> {
+    let mut result: Vec<OpenAIMessage> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if msg.role == "system" {
+            if let Some(last) = result.last_mut() {
+                if last.role == "system" {
+                    // Merge content: extract text from both and combine
+                    let existing = match &last.content {
+                        Some(OpenAIContent::Text(t)) => t.clone(),
+                        _ => String::new(),
+                    };
+                    let new_text = match &msg.content {
+                        Some(OpenAIContent::Text(t)) => t.as_str(),
+                        _ => "",
+                    };
+                    last.content = Some(OpenAIContent::Text(format!("{existing}\n\n{new_text}")));
+                    continue;
+                }
+            }
+        }
+        result.push(msg);
+    }
+    result
 }
 
 fn build_openai_content(msg: &Message) -> Option<OpenAIContent> {

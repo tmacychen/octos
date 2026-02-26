@@ -139,8 +139,12 @@ impl GatewayCommand {
                 } else {
                     config.clone()
                 };
-                match create_provider(&fb.provider, &fb_config, fb.model.clone(), fb.base_url.clone())
-                {
+                match create_provider(
+                    &fb.provider,
+                    &fb_config,
+                    fb.model.clone(),
+                    fb.base_url.clone(),
+                ) {
                     Ok(p) => providers.push(Arc::new(RetryProvider::new(p))),
                     Err(e) => {
                         warn!(provider = %fb.provider, error = %e, "skipping fallback provider");
@@ -1039,4 +1043,3 @@ fn merge_queued_by_session(
         })
         .collect()
 }
-

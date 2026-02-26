@@ -144,7 +144,10 @@ impl RetryProvider {
         // Try to parse "try again in Xs" or "try again in X.XXXs"
         if let Some(idx) = msg.find("try again in ") {
             let after = &msg[idx + "try again in ".len()..];
-            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            let num_str: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
             if let Ok(secs) = num_str.parse::<f64>() {
                 // Add 1s buffer
                 return Some(Duration::from_secs_f64(secs + 1.0));
@@ -331,9 +334,8 @@ mod tests {
 
     #[test]
     fn test_rate_limit_delay_fallback() {
-        let err = eyre::eyre!(
-            "OpenAI API error: 429 Too Many Requests - tokens per min limit exceeded"
-        );
+        let err =
+            eyre::eyre!("OpenAI API error: 429 Too Many Requests - tokens per min limit exceeded");
         let delay = RetryProvider::rate_limit_delay(&err).unwrap();
         assert_eq!(delay, Duration::from_secs(30));
     }

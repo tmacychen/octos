@@ -1,10 +1,14 @@
 //! Web search tool with multiple provider support.
 //!
-//! Provider priority (first available key wins):
-//! 1. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized answers with citations
-//! 2. You.com (`YDC_API_KEY`) — rich JSON results with snippets
-//! 3. Brave Search (`BRAVE_API_KEY`) — traditional search results
-//! 4. DuckDuckGo (no key) — free HTML fallback
+//! Provider priority (cheapest first, paid AI search as fallback):
+//! 1. DuckDuckGo (no key) — free HTML search
+//! 2. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
+//! 3. You.com (`YDC_API_KEY`) — rich JSON results with snippets
+//! 4. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
+//!
+//! Each provider is tried in order. If a provider returns no results or fails,
+//! the next one is attempted. Perplexity is last because it costs the most but
+//! gives the best answers (AI-synthesized with citations).
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -141,21 +145,47 @@ impl Tool for WebSearchTool {
 
         let count = input.count.clamp(1, 10);
 
-        // Provider priority: Perplexity > You.com > Brave > DuckDuckGo
+        // Provider priority: free/cheap first, Perplexity as AI-powered fallback.
+        // 1. DuckDuckGo (free, always available)
+        // 2. Brave Search (free tier: 2k queries/month)
+        // 3. You.com (API key required)
+        // 4. Perplexity Sonar (AI-synthesized, most expensive — fallback only)
+
+        // Try DuckDuckGo first (free, no key needed)
+        let ddg_result = self.ddg_search(&input.query, count).await;
+        if let Ok(ref r) = ddg_result {
+            if r.success && !r.output.contains("No results found") {
+                return ddg_result;
+            }
+        }
+
+        // Brave Search
+        if let Ok(api_key) = std::env::var("BRAVE_API_KEY") {
+            let result = self.brave_search(&input.query, count, &api_key).await;
+            if let Ok(ref r) = result {
+                if r.success && !r.output.contains("No results found") {
+                    return result;
+                }
+            }
+        }
+
+        // You.com
+        if let Ok(api_key) = std::env::var("YDC_API_KEY") {
+            let result = self.you_search(&input.query, count, &api_key).await;
+            if let Ok(ref r) = result {
+                if r.success && !r.output.contains("No results found") {
+                    return result;
+                }
+            }
+        }
+
+        // Perplexity Sonar as last resort (AI-synthesized, costs money)
         if let Ok(api_key) = std::env::var("PERPLEXITY_API_KEY") {
             return self.perplexity_search(&input.query, &api_key).await;
         }
 
-        if let Ok(api_key) = std::env::var("YDC_API_KEY") {
-            return self.you_search(&input.query, count, &api_key).await;
-        }
-
-        if let Ok(api_key) = std::env::var("BRAVE_API_KEY") {
-            return self.brave_search(&input.query, count, &api_key).await;
-        }
-
-        // Free fallback: DuckDuckGo HTML
-        self.ddg_search(&input.query, count).await
+        // Return whatever DDG gave us (even if empty)
+        ddg_result
     }
 }
 
@@ -252,10 +282,7 @@ impl WebSearchTool {
             .await
             .wrap_err("failed to parse You.com response")?;
 
-        let results = you
-            .results
-            .and_then(|r| r.web)
-            .unwrap_or_default();
+        let results = you.results.and_then(|r| r.web).unwrap_or_default();
 
         if results.is_empty() {
             return Ok(ToolResult {
@@ -349,10 +376,7 @@ impl WebSearchTool {
     // --- DuckDuckGo HTML fallback ---
 
     async fn ddg_search(&self, query: &str, count: u8) -> Result<ToolResult> {
-        let url = format!(
-            "https://html.duckduckgo.com/html/?q={}",
-            urlencoded(query)
-        );
+        let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoded(query));
 
         let response = self
             .client
@@ -607,7 +631,10 @@ mod tests {
 
     #[test]
     fn test_urldecoded() {
-        assert_eq!(urldecoded("https%3A%2F%2Fexample.com"), "https://example.com");
+        assert_eq!(
+            urldecoded("https%3A%2F%2Fexample.com"),
+            "https://example.com"
+        );
         assert_eq!(urldecoded("hello%20world"), "hello world");
     }
 

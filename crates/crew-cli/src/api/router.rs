@@ -51,14 +51,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/profiles/{id}", get(admin::get_profile))
         .route("/api/admin/profiles/{id}", put(admin::update_profile))
         .route("/api/admin/profiles/{id}", delete(admin::delete_profile))
-        .route(
-            "/api/admin/profiles/{id}/start",
-            post(admin::start_gateway),
-        )
-        .route(
-            "/api/admin/profiles/{id}/stop",
-            post(admin::stop_gateway),
-        )
+        .route("/api/admin/profiles/{id}/start", post(admin::start_gateway))
+        .route("/api/admin/profiles/{id}/stop", post(admin::stop_gateway))
         .route(
             "/api/admin/profiles/{id}/restart",
             post(admin::restart_gateway),
@@ -67,10 +61,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/profiles/{id}/status",
             get(admin::gateway_status),
         )
-        .route(
-            "/api/admin/profiles/{id}/logs",
-            get(admin::gateway_logs),
-        )
+        .route("/api/admin/profiles/{id}/logs", get(admin::gateway_logs))
         .route("/api/admin/start-all", post(admin::start_all))
         .route("/api/admin/stop-all", post(admin::stop_all));
 
@@ -157,10 +148,7 @@ async fn auth_middleware(
         let query_token = req
             .uri()
             .query()
-            .and_then(|q| {
-                q.split('&')
-                    .find_map(|pair| pair.strip_prefix("token="))
-            })
+            .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
             .unwrap_or("");
 
         let token = if !header_token.is_empty() {

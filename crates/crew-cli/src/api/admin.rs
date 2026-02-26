@@ -75,14 +75,17 @@ pub async fn overview(
     let profiles = state
         .profile_store
         .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin not configured".into()))?
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin not configured".into(),
+        ))?
         .list()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let pm = state
-        .process_manager
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin not configured".into()))?;
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
 
     let mut running = 0;
     let mut items = Vec::with_capacity(profiles.len());
@@ -406,8 +409,10 @@ pub async fn gateway_status(
 pub async fn gateway_logs(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)>
-{
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, String),
+> {
     let pm = state.process_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),

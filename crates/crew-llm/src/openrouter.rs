@@ -141,6 +141,7 @@ impl LlmProvider for OpenRouterProvider {
                 id: tc.id,
                 name: tc.function.name,
                 arguments: serde_json::from_str(&tc.function.arguments).unwrap_or_default(),
+                metadata: None,
             })
             .collect();
 

@@ -116,8 +116,7 @@ pub fn markdown_to_telegram_html(input: &str) -> String {
         if line.trim_start().starts_with("> ") || line.trim_start() == ">" {
             let mut quote_lines = Vec::new();
             while i < len
-                && (lines[i].trim_start().starts_with("> ")
-                    || lines[i].trim_start() == ">")
+                && (lines[i].trim_start().starts_with("> ") || lines[i].trim_start() == ">")
             {
                 let content = lines[i]
                     .trim_start()
@@ -215,7 +214,10 @@ fn parse_table_cells(line: &str) -> Vec<String> {
         .unwrap_or(trimmed)
         .strip_suffix('|')
         .unwrap_or(trimmed);
-    inner.split('|').map(|cell| cell.trim().to_string()).collect()
+    inner
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
 }
 
 /// Render a markdown table into Telegram-compatible HTML.
@@ -407,7 +409,12 @@ fn convert_inline(input: &str) -> String {
 
 /// Extract content between single-character delimiters.
 /// Returns (content, position after closing delimiter).
-fn extract_delimited(chars: &[char], start: usize, open: char, close: char) -> Option<(String, usize)> {
+fn extract_delimited(
+    chars: &[char],
+    start: usize,
+    open: char,
+    close: char,
+) -> Option<(String, usize)> {
     if chars[start] != open {
         return None;
     }
@@ -570,8 +577,7 @@ mod tests {
     #[test]
     fn test_code_block() {
         let input = "```rust\nfn main() {\n    println!(\"hello\");\n}\n```";
-        let expected =
-            "<pre><code class=\"language-rust\">fn main() {\n    println!(&quot;hello&quot;);\n}</code></pre>";
+        let expected = "<pre><code class=\"language-rust\">fn main() {\n    println!(&quot;hello&quot;);\n}</code></pre>";
         assert_eq!(markdown_to_telegram_html(input), expected);
     }
 
@@ -617,8 +623,7 @@ mod tests {
     #[test]
     fn test_mixed_formatting() {
         let input = "# Hello\n\nThis is **bold** and *italic* with `code`.\n\n- Item 1\n- Item 2";
-        let expected =
-            "<b>Hello</b>\n\nThis is <b>bold</b> and <i>italic</i> with <code>code</code>.\n\n• Item 1\n• Item 2";
+        let expected = "<b>Hello</b>\n\nThis is <b>bold</b> and <i>italic</i> with <code>code</code>.\n\n• Item 1\n• Item 2";
         assert_eq!(markdown_to_telegram_html(input), expected);
     }
 

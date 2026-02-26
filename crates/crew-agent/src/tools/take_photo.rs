@@ -208,9 +208,7 @@ impl Tool for TakePhotoTool {
                 })
             }
             Err(e) => Ok(ToolResult {
-                output: format!(
-                    "Error: failed to run ffmpeg (is it installed?): {e}"
-                ),
+                output: format!("Error: failed to run ffmpeg (is it installed?): {e}"),
                 success: false,
                 ..Default::default()
             }),
@@ -246,10 +244,7 @@ mod tests {
         let tool = TakePhotoTool::new(tx);
         // No context set, send=true (default)
 
-        let result = tool
-            .execute(&serde_json::json!({}))
-            .await
-            .unwrap();
+        let result = tool.execute(&serde_json::json!({})).await.unwrap();
 
         // Either ffmpeg fails (no camera in CI) or succeeds but can't send (no target)
         // Either way, should not panic

@@ -223,6 +223,8 @@ async fn test_multi_model_sync_subagents() {
                     "mode": "sync",
                     "model": "cheap/gpt-4o-mini"
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -237,6 +239,8 @@ async fn test_multi_model_sync_subagents() {
                     "mode": "sync",
                     "model": "cheap/gpt-4o-mini"
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -285,6 +289,8 @@ async fn test_multi_model_file_operations() {
                         "path": "server.py",
                         "content": "from flask import Flask\napp = Flask(__name__)\n"
                     }),
+
+                    metadata: None,
                 }],
                 100,
                 50,
@@ -299,6 +305,8 @@ async fn test_multi_model_file_operations() {
                         "path": "index.html",
                         "content": "<html><body><h1>Hello</h1></body></html>"
                     }),
+
+                    metadata: None,
                 }],
                 100,
                 50,
@@ -318,6 +326,8 @@ async fn test_multi_model_file_operations() {
                     id: "r1".into(),
                     name: "read_file".into(),
                     arguments: serde_json::json!({"path": "server.py"}),
+
+                    metadata: None,
                 }],
                 100,
                 50,
@@ -343,6 +353,8 @@ async fn test_multi_model_file_operations() {
                     "mode": "sync",
                     "model": "fast/claude-haiku"
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -357,6 +369,8 @@ async fn test_multi_model_file_operations() {
                     "mode": "sync",
                     "model": "fast/claude-haiku"
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -371,6 +385,8 @@ async fn test_multi_model_file_operations() {
                     "mode": "sync",
                     "model": "strong/gpt-4o"
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -434,6 +450,8 @@ async fn test_data_pipeline_with_routing() {
                         "path": "results.json",
                         "content": "{\"urls\": [\"https://example.com/data1\", \"https://example.com/data2\"], \"count\": 2}"
                     }),
+
+                    metadata: None,
                 }],
                 100,
                 50,
@@ -455,6 +473,8 @@ async fn test_data_pipeline_with_routing() {
                     "mode": "sync",
                     "model": "cheap/gpt-4o-mini"
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -469,6 +489,8 @@ async fn test_data_pipeline_with_routing() {
                     "mode": "sync",
                     "model": "cheap/gpt-4o-mini"
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -479,6 +501,8 @@ async fn test_data_pipeline_with_routing() {
                 id: "p3".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path": "results.json"}),
+
+                metadata: None,
             }],
             200,
             80,
@@ -536,6 +560,8 @@ async fn test_context_window_override_subagent() {
                             "mode": "sync",
                             "context_window": 8000
                         }),
+
+                        metadata: None,
                     }],
                     50,
                     30,
@@ -644,6 +670,8 @@ async fn test_provider_failover_retry() {
                     "mode": "sync",
                     "model": "flaky/flaky-model"
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -658,6 +686,8 @@ async fn test_provider_failover_retry() {
                     "mode": "sync",
                     "model": "reliable/reliable-model"
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -703,6 +733,8 @@ async fn test_tool_policy_with_routing() {
                     id: "t1".into(),
                     name: "shell".into(),
                     arguments: serde_json::json!({"command": "echo hello"}),
+
+                    metadata: None,
                 }],
                 100,
                 50,
@@ -713,6 +745,8 @@ async fn test_tool_policy_with_routing() {
                     id: "t2".into(),
                     name: "read_file".into(),
                     arguments: serde_json::json!({"path": "data.txt"}),
+
+                    metadata: None,
                 }],
                 100,
                 50,
@@ -735,6 +769,8 @@ async fn test_tool_policy_with_routing() {
                     "model": "cheap/gpt-4o-mini",
                     "allowed_tools": ["read_file", "grep"]
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -954,6 +990,8 @@ async fn test_custom_system_prompt_reaches_subagent() {
                     "model": "reviewer",
                     "system_prompt": "You are a security-focused code reviewer. Flag OWASP Top 10 issues. Be thorough and precise."
                 }),
+
+                metadata: None,
             }],
             200,
             100,
@@ -1021,6 +1059,8 @@ async fn test_default_system_prompt_without_override() {
                     "mode": "sync",
                     "model": "worker"
                 }),
+
+                metadata: None,
             }],
             200,
             100,

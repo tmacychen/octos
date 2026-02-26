@@ -373,11 +373,7 @@ impl ChatCommand {
                     );
                     println!("  Report saved to: {}", notif.report_path.display());
                 } else {
-                    println!(
-                        "{} Research failed: {}",
-                        "✗".red().bold(),
-                        notif.summary
-                    );
+                    println!("{} Research failed: {}", "✗".red().bold(), notif.summary);
                 }
             }
 

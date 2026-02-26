@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod plugins;
 pub mod policy;
 pub mod progress;
+pub mod prompt_guard;
 pub mod sandbox;
 mod sanitize;
 pub mod skills;
@@ -29,9 +30,9 @@ pub use sandbox::{Sandbox, SandboxConfig, create_sandbox};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use tools::{
     DeepResearchTool, DeepSearchTool, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool,
-    MessageTool, ReadFileTool, RecallMemoryTool, ResearchNotification, SaveMemoryTool, SendFileTool,
-    ShellTool, SpawnTool, TakePhotoTool, Tool, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    MessageTool, ReadFileTool, RecallMemoryTool, ResearchNotification, SaveMemoryTool,
+    SendFileTool, ShellTool, SpawnTool, TakePhotoTool, Tool, ToolPolicy, ToolRegistry, ToolResult,
+    WebFetchTool, WebSearchTool, WriteFileTool,
 };
 
 #[cfg(test)]

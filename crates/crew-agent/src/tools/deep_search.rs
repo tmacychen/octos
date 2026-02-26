@@ -213,12 +213,7 @@ impl DeepSearchTool {
             }
         }
 
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .wrap_err("fetch failed")?;
+        let response = self.client.get(url).send().await.wrap_err("fetch failed")?;
 
         if !response.status().is_success() {
             eyre::bail!("HTTP {}", response.status());
@@ -254,11 +249,10 @@ fn slugify(s: &str) -> String {
 fn host_slug(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
-        .and_then(|u| u.host_str().map(|h| {
-            h.strip_prefix("www.")
-                .unwrap_or(h)
-                .replace('.', "-")
-        }))
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.strip_prefix("www.").unwrap_or(h).replace('.', "-"))
+        })
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -333,7 +327,8 @@ mod tests {
 
     #[test]
     fn test_extract_urls_from_perplexity_citations() {
-        let output = "Answer text\n\nSources:\n  [1] https://example.com\n  [2] https://other.com\n";
+        let output =
+            "Answer text\n\nSources:\n  [1] https://example.com\n  [2] https://other.com\n";
         let urls = extract_urls(output);
         assert_eq!(urls.len(), 2);
     }

@@ -253,9 +253,22 @@ impl Agent {
             let tools_spec = self.tools.specs();
             self.trim_to_context_window(&mut messages);
 
+            tracing::debug!(
+                iteration,
+                messages = messages.len(),
+                tools = tools_spec.len(),
+                "calling LLM"
+            );
             let (response, streamed) = self
                 .call_llm_with_hooks(&messages, &tools_spec, &config, iteration)
                 .await?;
+            tracing::debug!(
+                iteration,
+                stop_reason = ?response.stop_reason,
+                content_len = response.content.as_ref().map(|c| c.len()).unwrap_or(0),
+                tool_calls = response.tool_calls.len(),
+                "LLM response received"
+            );
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
 
@@ -856,7 +869,8 @@ impl Agent {
 
         let mut text = String::new();
         let mut reasoning = String::new();
-        let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+        // (id, name, args_json, metadata)
+        let mut tool_calls: Vec<(String, String, String, Option<serde_json::Value>)> = Vec::new();
         let mut usage = crew_llm::TokenUsage::default();
         let mut stop_reason = StopReason::EndTurn;
 
@@ -869,7 +883,11 @@ impl Agent {
                 }
             };
 
-            let Some(event) = event else { break };
+            let Some(event) = event else {
+                tracing::debug!("stream ended (None)");
+                break;
+            };
+            tracing::debug!(?event, "stream event received");
 
             match event {
                 StreamEvent::ReasoningDelta(delta) => {
@@ -889,7 +907,7 @@ impl Agent {
                     arguments_delta,
                 } => {
                     while tool_calls.len() <= index {
-                        tool_calls.push((String::new(), String::new(), String::new()));
+                        tool_calls.push((String::new(), String::new(), String::new(), None));
                     }
                     if let Some(id) = id {
                         tool_calls[index].0 = id;
@@ -898,6 +916,12 @@ impl Agent {
                         tool_calls[index].1 = name;
                     }
                     tool_calls[index].2.push_str(&arguments_delta);
+                }
+                StreamEvent::ToolCallMetadata { index, metadata } => {
+                    while tool_calls.len() <= index {
+                        tool_calls.push((String::new(), String::new(), String::new(), None));
+                    }
+                    tool_calls[index].3 = Some(metadata);
                 }
                 StreamEvent::Usage(u) => {
                     usage = u;
@@ -920,8 +944,8 @@ impl Agent {
         let content = if text.is_empty() { None } else { Some(text) };
         let tool_calls: Vec<crew_core::ToolCall> = tool_calls
             .into_iter()
-            .filter(|(_, name, _)| !name.is_empty())
-            .map(|(id, name, args)| {
+            .filter(|(_, name, _, _)| !name.is_empty())
+            .map(|(id, name, args, metadata)| {
                 let arguments = serde_json::from_str(&args).unwrap_or_else(|e| {
                     tracing::warn!(tool = %name, error = %e, raw = %args, "malformed tool call JSON");
                     // Return a String value so the tool's deserialize step fails
@@ -935,11 +959,16 @@ impl Agent {
                     id,
                     name,
                     arguments,
+                    metadata,
                 }
             })
             .collect();
 
-        let reasoning_content = if reasoning.is_empty() { None } else { Some(reasoning) };
+        let reasoning_content = if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        };
 
         Ok((
             ChatResponse {

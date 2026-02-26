@@ -205,6 +205,7 @@ mod tests {
                 id: tool_id.to_string(),
                 name: tool_name.to_string(),
                 arguments: serde_json::json!({"path": "/secret/file", "content": "x".repeat(1000)}),
+                metadata: None,
             }]),
             tool_call_id: None,
             reasoning_content: None,

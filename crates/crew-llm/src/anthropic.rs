@@ -131,6 +131,7 @@ impl LlmProvider for AnthropicProvider {
                         id,
                         name,
                         arguments: input,
+                        metadata: None,
                     });
                 }
             }

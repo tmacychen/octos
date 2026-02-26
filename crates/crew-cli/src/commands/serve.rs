@@ -86,9 +86,7 @@ impl ServeCommand {
 
         // Try to create the LLM provider + agent, but don't fail if no API key.
         // The admin dashboard works without it.
-        let agent_and_sessions = self
-            .try_create_agent(&config, &cwd, &data_dir)
-            .await;
+        let agent_and_sessions = self.try_create_agent(&config, &cwd, &data_dir).await;
 
         let (agent, sessions) = match agent_and_sessions {
             Ok((a, s)) => (Some(Arc::new(a)), Some(s)),
@@ -116,7 +114,11 @@ impl ServeCommand {
             let mut h = DefaultHasher::new();
             std::time::SystemTime::now().hash(&mut h);
             std::process::id().hash(&mut h);
-            let token = format!("{:016x}{:016x}", h.finish(), h.finish().wrapping_mul(6364136223846793005));
+            let token = format!(
+                "{:016x}{:016x}",
+                h.finish(),
+                h.finish().wrapping_mul(6364136223846793005)
+            );
             println!(
                 "{}: {} (auto-generated, pass --auth-token to set your own)",
                 "Auth token".yellow(),
@@ -235,8 +237,8 @@ impl ServeCommand {
             let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs);
         }
 
-        let mut agent = Agent::new(AgentId::new("api"), llm, tools, memory)
-            .with_config(AgentConfig {
+        let mut agent =
+            Agent::new(AgentId::new("api"), llm, tools, memory).with_config(AgentConfig {
                 max_iterations: 20,
                 save_episodes: false,
                 ..Default::default()

@@ -65,6 +65,11 @@ pub enum StreamEvent {
         name: Option<String>,
         arguments_delta: String,
     },
+    /// Provider-specific metadata for a tool call (e.g. Gemini thought_signature).
+    ToolCallMetadata {
+        index: usize,
+        metadata: serde_json::Value,
+    },
     /// Token usage (sent at stream end by most providers).
     Usage(TokenUsage),
     /// Stream finished with stop reason.

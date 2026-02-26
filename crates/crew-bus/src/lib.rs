@@ -4,10 +4,10 @@ pub mod bus;
 pub mod channel;
 pub mod cli_channel;
 pub mod coalesce;
-pub mod markdown_html;
 pub mod cron_service;
 pub mod cron_types;
 pub mod heartbeat;
+pub mod markdown_html;
 pub mod media;
 pub mod session;
 

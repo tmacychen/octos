@@ -120,6 +120,8 @@ async fn test_agent_tool_call_loop() {
                 id: "call_1".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path": "hello.txt"}),
+
+                metadata: None,
             }],
             200,
             100,
@@ -152,6 +154,8 @@ async fn test_agent_max_iterations() {
                     id: format!("call_{i}"),
                     name: "read_file".into(),
                     arguments: serde_json::json!({"path": "nonexistent.txt"}),
+
+                    metadata: None,
                 }],
                 100,
                 50,
@@ -183,6 +187,8 @@ async fn test_agent_token_budget() {
                 id: "call_1".into(),
                 name: "list_dir".into(),
                 arguments: serde_json::json!({"path": "."}),
+
+                metadata: None,
             }],
             500,
             500,

@@ -17,8 +17,8 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
-use crate::agent::AgentConfig;
 use crate::Agent;
+use crate::agent::AgentConfig;
 
 /// Notification sent when a background research task completes.
 pub struct ResearchNotification {
@@ -101,10 +101,7 @@ impl DeepResearchTool {
         // Try content first, then reasoning_content (some models put output there)
         let text = match response.content.as_deref() {
             Some(c) if !c.trim().is_empty() => c.to_string(),
-            _ => response
-                .reasoning_content
-                .clone()
-                .unwrap_or_default(),
+            _ => response.reasoning_content.clone().unwrap_or_default(),
         };
 
         if text.trim().is_empty() {
@@ -112,8 +109,7 @@ impl DeepResearchTool {
         }
 
         // Extract JSON array from response (handle markdown code blocks, truncation)
-        let json_str = extract_json_array(&text)
-            .unwrap_or_else(|| text.clone());
+        let json_str = extract_json_array(&text).unwrap_or_else(|| text.clone());
         let questions: Vec<String> = serde_json::from_str(&json_str)
             .wrap_err_with(|| format!("failed to parse sub-questions from: {text}"))?;
 
@@ -208,8 +204,7 @@ impl DeepResearchTool {
         // Step 2: Spawn parallel sub-agents
         info!(
             count = n,
-            per_agent_iter,
-            "spawning parallel research sub-agents"
+            per_agent_iter, "spawning parallel research sub-agents"
         );
 
         let mut handles = Vec::new();
@@ -294,11 +289,7 @@ impl DeepResearchTool {
                         partials.push((sub_q.clone(), content));
                     }
 
-                    info!(
-                        agent = i,
-                        success = r.success,
-                        "sub-agent completed"
-                    );
+                    info!(agent = i, success = r.success, "sub-agent completed");
                 }
                 Err(e) => {
                     warn!(agent = i, error = %e, "sub-agent failed");
@@ -322,8 +313,7 @@ impl DeepResearchTool {
             "synthesizing final report from partial reports"
         );
 
-        let (final_report, synth_tokens) =
-            self.synthesize_reports(question, &partials).await?;
+        let (final_report, synth_tokens) = self.synthesize_reports(question, &partials).await?;
 
         total_tokens.input_tokens += synth_tokens.input_tokens;
         total_tokens.output_tokens += synth_tokens.output_tokens;

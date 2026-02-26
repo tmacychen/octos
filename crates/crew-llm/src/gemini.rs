@@ -57,31 +57,7 @@ impl LlmProvider for GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        // Build contents array from messages
-        let mut contents: Vec<GeminiContent> = Vec::new();
-        let mut system_instruction: Option<String> = None;
-
-        for msg in messages {
-            match msg.role {
-                crew_core::MessageRole::System => {
-                    system_instruction = Some(msg.content.clone());
-                }
-                crew_core::MessageRole::User | crew_core::MessageRole::Tool => {
-                    contents.push(GeminiContent {
-                        role: "user".to_string(),
-                        parts: build_gemini_parts(msg),
-                    });
-                }
-                crew_core::MessageRole::Assistant => {
-                    contents.push(GeminiContent {
-                        role: "model".to_string(),
-                        parts: vec![GeminiPart::Text {
-                            text: msg.content.clone(),
-                        }],
-                    });
-                }
-            }
-        }
+        let (contents, system_instruction) = build_gemini_contents(messages);
 
         // Build tools array
         let gemini_tools: Option<Vec<GeminiTool>> = if tools.is_empty() {
@@ -153,14 +129,18 @@ impl LlmProvider for GeminiProvider {
                     content = Some(text);
                 }
                 GeminiPart::FunctionCall { function_call } => {
+                    let metadata = function_call
+                        .thought_signature
+                        .map(|sig| serde_json::json!({ "thought_signature": sig }));
                     tool_calls.push(crew_core::ToolCall {
                         id: format!("call_{}", tool_calls.len()),
                         name: function_call.name,
                         arguments: function_call.args,
+                        metadata,
                     });
                 }
-                GeminiPart::InlineData { .. } => {
-                    // InlineData is only used in requests, not responses
+                GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
+                    // InlineData and FunctionResponse are only used in requests
                 }
             }
         }
@@ -196,30 +176,7 @@ impl LlmProvider for GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let mut contents: Vec<GeminiContent> = Vec::new();
-        let mut system_instruction: Option<String> = None;
-
-        for msg in messages {
-            match msg.role {
-                crew_core::MessageRole::System => {
-                    system_instruction = Some(msg.content.clone());
-                }
-                crew_core::MessageRole::User | crew_core::MessageRole::Tool => {
-                    contents.push(GeminiContent {
-                        role: "user".to_string(),
-                        parts: build_gemini_parts(msg),
-                    });
-                }
-                crew_core::MessageRole::Assistant => {
-                    contents.push(GeminiContent {
-                        role: "model".to_string(),
-                        parts: vec![GeminiPart::Text {
-                            text: msg.content.clone(),
-                        }],
-                    });
-                }
-            }
-        }
+        let (contents, system_instruction) = build_gemini_contents(messages);
 
         let gemini_tools: Option<Vec<GeminiTool>> = if tools.is_empty() {
             None
@@ -329,6 +286,16 @@ enum GeminiPart {
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCall,
     },
+    FunctionResponse {
+        #[serde(rename = "functionResponse")]
+        function_response: GeminiFunctionResponse,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeminiFunctionResponse {
+    name: String,
+    response: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -338,7 +305,102 @@ struct GeminiInlineData {
     data: String,
 }
 
-fn build_gemini_parts(msg: &Message) -> Vec<GeminiPart> {
+/// Build the Gemini `contents` array and optional system instruction from messages.
+///
+/// Gemini requires:
+/// - Assistant messages with tool calls → `model` role with `functionCall` parts
+/// - Tool result messages → `user` role with `functionResponse` parts
+/// - Consecutive same-role messages are merged (Gemini rejects adjacent same-role turns)
+fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<String>) {
+    let mut contents: Vec<GeminiContent> = Vec::new();
+    let mut system_instruction: Option<String> = None;
+
+    // Map tool_call_id → function name so tool results can reference the right name.
+    let mut call_id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for msg in messages {
+        match msg.role {
+            crew_core::MessageRole::System => {
+                system_instruction = Some(msg.content.clone());
+            }
+            crew_core::MessageRole::User => {
+                let parts = build_user_parts(msg);
+                push_or_merge(&mut contents, "user", parts);
+            }
+            crew_core::MessageRole::Assistant => {
+                let mut parts = Vec::new();
+                // Include text content if non-empty.
+                if !msg.content.is_empty() {
+                    parts.push(GeminiPart::Text {
+                        text: msg.content.clone(),
+                    });
+                }
+                // Include functionCall parts for any tool calls the model made.
+                if let Some(ref tcs) = msg.tool_calls {
+                    for tc in tcs {
+                        call_id_to_name.insert(tc.id.clone(), tc.name.clone());
+                        // Restore thought_signature from metadata if present.
+                        let thought_signature = tc
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get("thought_signature"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        parts.push(GeminiPart::FunctionCall {
+                            function_call: GeminiFunctionCall {
+                                name: tc.name.clone(),
+                                args: tc.arguments.clone(),
+                                thought_signature,
+                            },
+                        });
+                    }
+                }
+                // Gemini requires at least one part; add empty text if everything was empty.
+                if parts.is_empty() {
+                    parts.push(GeminiPart::Text {
+                        text: String::new(),
+                    });
+                }
+                push_or_merge(&mut contents, "model", parts);
+            }
+            crew_core::MessageRole::Tool => {
+                // Resolve function name from the matching tool call.
+                let name = msg
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| call_id_to_name.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                let part = GeminiPart::FunctionResponse {
+                    function_response: GeminiFunctionResponse {
+                        name,
+                        response: serde_json::json!({ "content": msg.content }),
+                    },
+                };
+                push_or_merge(&mut contents, "user", vec![part]);
+            }
+        }
+    }
+    (contents, system_instruction)
+}
+
+/// Merge parts into the last content entry if roles match (Gemini rejects adjacent same-role).
+fn push_or_merge(contents: &mut Vec<GeminiContent>, role: &str, parts: Vec<GeminiPart>) {
+    if let Some(last) = contents.last_mut() {
+        if last.role == role {
+            last.parts.extend(parts);
+            return;
+        }
+    }
+    contents.push(GeminiContent {
+        role: role.to_string(),
+        parts,
+    });
+}
+
+fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
     let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
 
     if images.is_empty() {
@@ -370,6 +432,13 @@ fn build_gemini_parts(msg: &Message) -> Vec<GeminiPart> {
 struct GeminiFunctionCall {
     name: String,
     args: serde_json::Value,
+    /// Gemini thinking models require this signature to be echoed back.
+    #[serde(
+        rename = "thoughtSignature",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    thought_signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -446,12 +515,24 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
                             .get("args")
                             .cloned()
                             .unwrap_or(serde_json::Value::Object(Default::default()));
+                        // Capture thought_signature for Gemini thinking models.
+                        let thought_sig = fc
+                            .get("thoughtSignature")
+                            .and_then(|v| v.as_str())
+                            .map(|s| serde_json::json!({ "thought_signature": s }));
                         events.push(StreamEvent::ToolCallDelta {
                             index: state.tool_count,
                             id: Some(format!("call_{}", state.tool_count)),
                             name: Some(name),
                             arguments_delta: args.to_string(),
                         });
+                        // Emit metadata as a separate event so the agent can store it.
+                        if let Some(meta) = thought_sig {
+                            events.push(StreamEvent::ToolCallMetadata {
+                                index: state.tool_count,
+                                metadata: meta,
+                            });
+                        }
                         state.tool_count += 1;
                     }
                 }

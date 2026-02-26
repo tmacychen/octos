@@ -40,6 +40,7 @@ pub fn parse_sse_response(response: reqwest::Response) -> impl Stream<Item = Sse
                         }
                     }
                     Some(Err(e)) => {
+                        tracing::warn!("SSE stream error: {e}");
                         // Emit error as a synthetic SSE event so consumers can handle it
                         let error = SseEvent {
                             event: Some("error".to_string()),
@@ -48,6 +49,7 @@ pub fn parse_sse_response(response: reqwest::Response) -> impl Stream<Item = Sse
                         return Some((error, (stream, buffer)));
                     }
                     None => {
+                        tracing::debug!(remaining_buffer = buffer.len(), "SSE byte stream ended");
                         if !buffer.trim().is_empty() {
                             let block = std::mem::take(&mut buffer);
                             if let Some(event) = parse_event_block(&block) {

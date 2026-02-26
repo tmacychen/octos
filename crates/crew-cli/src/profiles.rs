@@ -157,8 +157,9 @@ impl ProfileStore {
     /// Open (or create) the profile store at `data_dir/profiles/`.
     pub fn open(data_dir: &Path) -> Result<Self> {
         let profiles_dir = data_dir.join("profiles");
-        std::fs::create_dir_all(&profiles_dir)
-            .wrap_err_with(|| format!("failed to create profiles dir: {}", profiles_dir.display()))?;
+        std::fs::create_dir_all(&profiles_dir).wrap_err_with(|| {
+            format!("failed to create profiles dir: {}", profiles_dir.display())
+        })?;
         Ok(Self { profiles_dir })
     }
 
@@ -215,8 +216,8 @@ impl ProfileStore {
         }
 
         let path = self.profile_path(&profile.id);
-        let content = serde_json::to_string_pretty(profile)
-            .wrap_err("failed to serialize profile")?;
+        let content =
+            serde_json::to_string_pretty(profile).wrap_err("failed to serialize profile")?;
         std::fs::write(&path, &content)
             .wrap_err_with(|| format!("failed to write profile: {}", path.display()))?;
 
@@ -243,8 +244,7 @@ impl ProfileStore {
         if !path.exists() {
             return Ok(false);
         }
-        std::fs::remove_file(&path)
-            .wrap_err_with(|| format!("failed to delete profile: {id}"))?;
+        std::fs::remove_file(&path).wrap_err_with(|| format!("failed to delete profile: {id}"))?;
         Ok(true)
     }
 
