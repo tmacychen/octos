@@ -31,3 +31,4 @@ node_modules/
 !CLAUDE.md
 !CHANGELOG.md
 !docs/**/*.md
+!crates/crew-agent/skills/**/SKILL.md
