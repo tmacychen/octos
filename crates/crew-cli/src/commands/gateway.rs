@@ -10,7 +10,7 @@ use clap::Args;
 use colored::Colorize;
 use crew_agent::{
     Agent, AgentConfig, HookExecutor, MessageTool, SendFileTool, SilentReporter, SkillsLoader,
-    SpawnTool, /* TakePhotoTool, */ ToolRegistry,
+    SpawnTool, TokenTracker, /* TakePhotoTool, */ ToolRegistry,
 };
 use crew_bus::{
     ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager, create_bus,
@@ -31,9 +31,9 @@ use super::Executable;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
 use crate::config::{Config, QueueMode, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
+use crate::cron_tool::CronTool;
 use crate::persona_service::PersonaService;
 use crate::status_indicator::StatusIndicator;
-use crate::cron_tool::CronTool;
 
 /// Run as a persistent gateway daemon.
 #[derive(Debug, Args)]
@@ -181,16 +181,15 @@ impl GatewayCommand {
                     }
                 }
             }
-            if let Some(ref ar) = config.adaptive_routing {
-                if ar.enabled {
-                    info!("adaptive routing enabled");
-                    Arc::new(AdaptiveRouter::new(
-                        providers,
-                        AdaptiveConfig::from(ar),
-                    ))
-                } else {
-                    Arc::new(ProviderChain::new(providers))
-                }
+            // Auto-enable adaptive routing when multiple providers exist
+            if providers.len() > 1 {
+                let adaptive_config = config
+                    .adaptive_routing
+                    .as_ref()
+                    .map(|ar| AdaptiveConfig::from(ar))
+                    .unwrap_or_default();
+                info!("adaptive routing enabled ({} providers)", providers.len());
+                Arc::new(AdaptiveRouter::new(providers, adaptive_config))
             } else {
                 Arc::new(ProviderChain::new(providers))
             }
@@ -198,6 +197,24 @@ impl GatewayCommand {
 
         // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
         let data_dir = super::resolve_data_dir(self.data_dir)?;
+
+        // Spawn periodic metrics exporter (writes provider_metrics.json every 30s)
+        if llm.export_metrics().is_some() {
+            let metrics_llm = llm.clone();
+            let metrics_path = data_dir.join("provider_metrics.json");
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    if let Some(value) = metrics_llm.export_metrics() {
+                        if let Ok(json) = serde_json::to_string_pretty(&value) {
+                            let _ = tokio::fs::write(&metrics_path, json).await;
+                        }
+                    }
+                }
+            });
+        }
+
         let media_dir = data_dir.join("media");
         let _ = &media_dir; // used by channel feature gates below
 
@@ -223,24 +240,12 @@ impl GatewayCommand {
         // Initialize skills loader (project-level, from cwd/.crew/)
         let project_dir = cwd.join(".crew");
 
-        // Auto-install system-skills and app-skills if no skills are installed yet
+        // Bootstrap bundled app-skill binaries into .crew/skills/
         let skills_dir = project_dir.join("skills");
-        if !skills_dir.exists() || is_dir_empty(&skills_dir) {
-            info!("No skills installed. Auto-installing default skills...");
-            let crew_exe = std::env::current_exe().unwrap_or("crew".into());
-            for repo in ["hagency-org/system-skills", "hagency-org/app-skills"] {
-                let status = std::process::Command::new(&crew_exe)
-                    .args(["skills", "install", repo, "--cwd"])
-                    .arg(&cwd)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .status();
-                match status {
-                    Ok(s) if s.success() => info!("{repo} installed successfully"),
-                    Ok(s) => warn!("{repo} install exited with: {s}"),
-                    Err(e) => warn!("Failed to auto-install {repo}: {e}"),
-                }
-            }
+        std::fs::create_dir_all(&skills_dir).ok();
+        let n = crew_agent::bootstrap::bootstrap_bundled_skills(&skills_dir);
+        if n > 0 {
+            info!(count = n, "bootstrapped bundled app-skills");
         }
 
         let skills_loader = SkillsLoader::new(&project_dir);
@@ -431,6 +436,11 @@ impl GatewayCommand {
         let shutdown_clone = shutdown.clone();
 
         let llm_for_compaction = llm.clone();
+        tracing::info!(
+            "SYSTEM_PROMPT_DEBUG len={} first200={:?}",
+            system_prompt.len(),
+            &system_prompt[..system_prompt.len().min(200)]
+        );
         let mut agent = Agent::new(AgentId::new("gateway"), llm, tools, memory)
             .with_config(agent_config)
             .with_reporter(Arc::new(SilentReporter))
@@ -651,8 +661,7 @@ impl GatewayCommand {
                 }
                 #[cfg(feature = "wecom")]
                 "wecom" => {
-                    let corp_id_env =
-                        settings_str(&entry.settings, "corp_id_env", "WECOM_CORP_ID");
+                    let corp_id_env = settings_str(&entry.settings, "corp_id_env", "WECOM_CORP_ID");
                     let secret_env =
                         settings_str(&entry.settings, "agent_secret_env", "WECOM_AGENT_SECRET");
                     let corp_id = std::env::var(&corp_id_env)
@@ -662,8 +671,7 @@ impl GatewayCommand {
                     let agent_id = settings_str(&entry.settings, "agent_id", "");
                     let verification_token =
                         settings_str(&entry.settings, "verification_token", "");
-                    let encoding_aes_key =
-                        settings_str(&entry.settings, "encoding_aes_key", "");
+                    let encoding_aes_key = settings_str(&entry.settings, "encoding_aes_key", "");
                     let webhook_port: u16 = entry
                         .settings
                         .get("webhook_port")
@@ -779,15 +787,8 @@ impl GatewayCommand {
                     let agent = agent_for_persona.clone();
                     tokio::spawn(async move {
                         let sl = SkillsLoader::new(&pd);
-                        let new_prompt = build_system_prompt(
-                            base.as_deref(),
-                            &dd,
-                            &pd,
-                            &ms,
-                            &sl,
-                            &tc,
-                        )
-                        .await;
+                        let new_prompt =
+                            build_system_prompt(base.as_deref(), &dd, &pd, &ms, &sl, &tc).await;
                         agent.set_system_prompt(new_prompt);
                         info!("system prompt updated with new persona");
                     });
@@ -900,25 +901,19 @@ impl GatewayCommand {
 
             let session_key = inbound.session_key();
 
-            // Handle /new command inline (quick operation, no concurrency needed)
+            // Handle /new command inline — clear current session history
             if inbound.content.trim() == "/new" {
-                let new_id = format!(
-                    "{}_{}_{}",
-                    inbound.sender_id,
-                    inbound.chat_id,
-                    chrono::Utc::now().timestamp_millis(),
-                );
                 match session_mgr
                     .lock()
                     .await
-                    .fork(&session_key, &new_id, 10)
+                    .clear(&session_key)
                     .await
                 {
-                    Ok(new_key) => {
+                    Ok(()) => {
                         let msg = OutboundMessage {
                             channel: reply_channel.clone(),
                             chat_id: reply_chat_id.clone(),
-                            content: format!("Session forked. New session: {new_key}"),
+                            content: "Session cleared.".to_string(),
                             reply_to: None,
                             media: vec![],
                             metadata: serde_json::json!({}),
@@ -926,7 +921,7 @@ impl GatewayCommand {
                         let _ = agent_handle.send_outbound(msg).await;
                     }
                     Err(e) => {
-                        warn!("session fork failed: {e}");
+                        warn!("session clear failed: {e}");
                     }
                 }
                 continue;
@@ -1104,13 +1099,21 @@ async fn process_session_message(
         session.get_history(max_history).to_vec()
     };
 
-    // Start dynamic status indicator (typing + rotating status message)
-    let status_handle =
-        status_indicator.map(|si| si.start(reply_chat_id.to_string(), &inbound.content));
+    // Shared token tracker for real-time status updates
+    let token_tracker = Arc::new(TokenTracker::new());
+
+    // Start dynamic status indicator (typing + rotating status message + token counts)
+    let status_handle = status_indicator.map(|si| {
+        si.start(
+            reply_chat_id.to_string(),
+            &inbound.content,
+            Arc::clone(&token_tracker),
+        )
+    });
 
     // Process message through agent (potentially long LLM call, no lock held)
     let response = agent
-        .process_message(&inbound.content, &history, image_media)
+        .process_message_tracked(&inbound.content, &history, image_media, &token_tracker)
         .await;
 
     // Stop status indicator and clean up status message
@@ -1230,9 +1233,28 @@ async fn build_system_prompt(
     tool_config: &crew_agent::ToolConfigStore,
 ) -> String {
     let default_prompt = "You are Crew, an AI assistant. \
-        Reply directly — never say \"Thinking\" or narrate your reasoning process. \
-        Only use the `message` tool to send an early heads-up when you need to run slow tools \
-        (deep_search, deep_research, spawn, take_photo) — NOT for simple questions. \
+        Reply directly — never say \"Thinking\" or narrate your reasoning process.\
+        \n\n## Research & Search Rules\
+        \n\nWhen the user asks you to research, investigate, search, or look into a topic, \
+        FIRST confirm which approach:\
+        \n\n1. 🔍 Quick search — fast web lookup (`web_search`)\
+        \n2. 📚 Deep research — comprehensive multi-source report, 5-10 min (`deep_research`)\
+        \n3. 🌐 Deep crawl — crawl a specific website URL in depth (`deep_research` with custom system_prompt targeting that URL)\
+        \n\nMatch the user's language (Chinese question → Chinese options).\
+        \n\nSKIP confirmation and act directly ONLY when:\
+        \n- User explicitly names the method: \"深度调查/深度研究/深度搜索\" → deep_research, \"爬取这个网站\" → deep_crawl\
+        \n- User replies with a choice (1/2/3) → execute immediately\
+        \n\nFor ALL other search/lookup requests (including \"查一下\", \"搜一下\", \"帮我查\", \"search for\"), \
+        ALWAYS ask the user to pick 1/2/3 first. Do NOT assume web_search is enough.\
+        \n\nAfter choosing, you MUST actually call the tool. NEVER just reply with text like \
+        \"I'm starting research\" — invoke the tool.\
+        \n\n## Grounding Rules\
+        \n\nFor real-time data (weather, time, location, stock prices, sports scores, exchange rates, \
+        news, current events, flight status, package tracking), ALWAYS use `web_search` or `web_fetch`. \
+        NEVER fabricate or guess real-time information — if you cannot fetch it, say so.\
+        \n\n## Other Rules\
+        \n\nOnly use the `message` tool to send an early heads-up when you need to run slow tools \
+        (deep_research, spawn, take_photo) — NOT for simple questions. \
         Save important user preferences with `save_memory`.";
     let mut prompt = base.unwrap_or(default_prompt).to_string();
 
@@ -1310,15 +1332,6 @@ fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> Strin
         .and_then(|v| v.as_str())
         .unwrap_or(default)
         .to_string()
-}
-
-
-/// Check if a directory is empty (no entries) or doesn't exist.
-fn is_dir_empty(path: &std::path::Path) -> bool {
-    match std::fs::read_dir(path) {
-        Ok(mut entries) => entries.next().is_none(),
-        Err(_) => true,
-    }
 }
 
 /// Merge queued inbound messages by session key.
