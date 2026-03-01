@@ -106,6 +106,16 @@ impl Tool for MessageTool {
             });
         }
 
+        // Suppress low-value "thinking/processing" acknowledgment messages
+        let normalized = input.content.trim().to_lowercase();
+        if is_thinking_filler(&normalized) {
+            return Ok(ToolResult {
+                output: "Skipped: don't send thinking/processing messages.".into(),
+                success: true,
+                ..Default::default()
+            });
+        }
+
         let msg = OutboundMessage {
             channel: channel.clone(),
             chat_id: chat_id.clone(),
@@ -126,6 +136,29 @@ impl Tool for MessageTool {
             ..Default::default()
         })
     }
+}
+
+/// Check if a message is just a low-value "thinking/processing" filler.
+fn is_thinking_filler(s: &str) -> bool {
+    const FILLER_PATTERNS: &[&str] = &[
+        "thinking",
+        "thinking...",
+        "thinking…",
+        "let me think",
+        "processing",
+        "processing...",
+        "processing…",
+        "working on it",
+        "请稍等",
+        "稍等",
+        "思考中",
+        "正在思考",
+        "正在处理",
+        "让我想想",
+        "让我看看",
+    ];
+    let clean = s.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '…');
+    FILLER_PATTERNS.iter().any(|p| clean == *p)
 }
 
 #[cfg(test)]

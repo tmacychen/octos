@@ -138,9 +138,13 @@ impl Executable for SkillsCommand {
                 branch,
             } => cmd_install(&skills_dir, &repo, force, &branch),
             SkillsSubcommand::Remove { name } => cmd_remove(&skills_dir, &name),
-            SkillsSubcommand::Search { query, registry } => cmd_search(query.as_deref(), registry.as_deref()),
+            SkillsSubcommand::Search { query, registry } => {
+                cmd_search(query.as_deref(), registry.as_deref())
+            }
             SkillsSubcommand::Info { name } => cmd_info(&skills_dir, &name),
-            SkillsSubcommand::Update { name, branch } => cmd_update(&skills_dir, &name, branch.as_deref()),
+            SkillsSubcommand::Update { name, branch } => {
+                cmd_update(&skills_dir, &name, branch.as_deref())
+            }
         }
     }
 }
@@ -263,43 +267,37 @@ fn cmd_search(query: Option<&str>, registry_url: Option<&str>) -> Result<()> {
     }
 
     for entry in &filtered {
-        let version_str = entry.version.as_deref().map(|v| format!(" v{v}")).unwrap_or_default();
-        let tools_str = if entry.provides_tools { "  [tools]" } else { "" };
-        println!("  {}{}{}  {}", entry.name.cyan().bold(), version_str.dimmed(), tools_str.dimmed(), entry.description);
+        let version_str = entry
+            .version
+            .as_deref()
+            .map(|v| format!(" v{v}"))
+            .unwrap_or_default();
+        let tools_str = if entry.provides_tools {
+            "  [tools]"
+        } else {
+            ""
+        };
+        println!(
+            "  {}{}{}  {}",
+            entry.name.cyan().bold(),
+            version_str.dimmed(),
+            tools_str.dimmed(),
+            entry.description
+        );
         if !entry.skills.is_empty() {
-            println!(
-                "  {}  {}",
-                "Skills:".dimmed(),
-                entry.skills.join(", ")
-            );
+            println!("  {}  {}", "Skills:".dimmed(), entry.skills.join(", "));
         }
         if !entry.requires.is_empty() {
-            println!(
-                "  {} {}",
-                "Requires:".dimmed(),
-                entry.requires.join(", ")
-            );
+            println!("  {} {}", "Requires:".dimmed(), entry.requires.join(", "));
         }
         if !entry.tags.is_empty() {
-            println!(
-                "  {}     {}",
-                "Tags:".dimmed(),
-                entry.tags.join(", ")
-            );
+            println!("  {}     {}", "Tags:".dimmed(), entry.tags.join(", "));
         }
         if let Some(author) = &entry.author {
-            println!(
-                "  {}   {}",
-                "Author:".dimmed(),
-                author
-            );
+            println!("  {}   {}", "Author:".dimmed(), author);
         }
         if let Some(license) = &entry.license {
-            println!(
-                "  {}  {}",
-                "License:".dimmed(),
-                license
-            );
+            println!("  {}  {}", "License:".dimmed(), license);
         }
         println!(
             "  {} crew skills install {}",
@@ -627,10 +625,7 @@ fn write_source_info(dest: &Path, spec: &RepoSpec, branch: &str) -> Result<()> {
         branch: branch.to_string(),
         installed_at: chrono::Utc::now().to_rfc3339(),
     };
-    std::fs::write(
-        dest.join(".source"),
-        serde_json::to_string_pretty(&info)?,
-    )?;
+    std::fs::write(dest.join(".source"), serde_json::to_string_pretty(&info)?)?;
     Ok(())
 }
 
@@ -659,9 +654,7 @@ fn cmd_info(skills_dir: &Path, name: &str) -> Result<()> {
     let skill_file = skill_dir.join("SKILL.md");
 
     if !skill_file.exists() {
-        eyre::bail!(
-            "Skill '{name}' not found. Install it with: crew skills install <repo>/{name}"
-        );
+        eyre::bail!("Skill '{name}' not found. Install it with: crew skills install <repo>/{name}");
     }
 
     let content = std::fs::read_to_string(&skill_file)?;
@@ -701,7 +694,10 @@ fn cmd_info(skills_dir: &Path, name: &str) -> Result<()> {
                 println!("  {} ({} tool(s))", "Tools:".cyan(), tools.len());
                 for tool in tools {
                     let tname = tool.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                    let tdesc = tool.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                    let tdesc = tool
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
                     println!("    - {}  {}", tname.cyan(), tdesc.dimmed());
                 }
             }
@@ -768,14 +764,10 @@ fn update_single(skills_dir: &Path, name: &str, branch_override: Option<&str>) -
     let source_path = skill_dir.join(".source");
 
     if !source_path.exists() {
-        eyre::bail!(
-            "No source info for '{name}'. Was it installed with `crew skills install`?"
-        );
+        eyre::bail!("No source info for '{name}'. Was it installed with `crew skills install`?");
     }
 
-    let source: SourceInfo = serde_json::from_str(
-        &std::fs::read_to_string(&source_path)?,
-    )?;
+    let source: SourceInfo = serde_json::from_str(&std::fs::read_to_string(&source_path)?)?;
 
     let branch = branch_override.unwrap_or(&source.branch);
     let repo = if let Some(subdir) = &source.subdir {
@@ -789,7 +781,7 @@ fn update_single(skills_dir: &Path, name: &str, branch_override: Option<&str>) -
 
 /// Get the current platform key for binary downloads (e.g. "darwin-aarch64").
 fn platform_key() -> String {
-    let os = std::env::consts::OS;    // darwin, linux, windows
+    let os = std::env::consts::OS; // darwin, linux, windows
     let arch = std::env::consts::ARCH; // aarch64, x86_64
     format!("{os}-{arch}")
 }
@@ -858,7 +850,9 @@ fn download_binary(
         return Ok(false);
     }
 
-    let bytes = response.bytes().wrap_err("failed to read binary response")?;
+    let bytes = response
+        .bytes()
+        .wrap_err("failed to read binary response")?;
 
     // Verify SHA-256 if provided by registry
     if let Some(expected_hash) = &info.sha256 {
@@ -934,7 +928,9 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
         .stderr(std::process::Stdio::piped())
         .status()
         .map_err(|_| {
-            eyre::eyre!("cargo not found. Install Rust or ask the skill author for pre-built binaries.")
+            eyre::eyre!(
+                "cargo not found. Install Rust or ask the skill author for pre-built binaries."
+            )
         })?;
     if !status.success() {
         eyre::bail!("cargo build failed in {}", dir.display());
@@ -959,11 +955,7 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
                                 std::fs::Permissions::from_mode(0o755),
                             )?;
                         }
-                        println!(
-                            "  {} Built and installed binary '{}'",
-                            "OK".green(),
-                            name
-                        );
+                        println!("  {} Built and installed binary '{}'", "OK".green(), name);
                         break;
                     }
                 }

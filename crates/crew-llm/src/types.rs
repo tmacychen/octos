@@ -80,3 +80,97 @@ pub enum StreamEvent {
 
 /// A boxed stream of StreamEvents.
 pub type ChatStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>;
+
+/// Strip `<think>…</think>` blocks from LLM content.
+///
+/// Some models (DeepSeek, MiniMax, Qwen thinking variants) embed chain-of-thought
+/// inside `<think>` tags in the main content field instead of using the structured
+/// `reasoning_content` field. This extracts the thinking into a separate string
+/// and returns the cleaned content.
+///
+/// Returns `(cleaned_content, extracted_thinking)`.
+pub fn strip_think_tags(text: &str) -> (String, Option<String>) {
+    let mut thinking = String::new();
+    let mut cleaned = String::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("<think>") {
+        // Text before this <think> tag
+        cleaned.push_str(&rest[..start]);
+
+        let after_open = &rest[start + "<think>".len()..];
+        if let Some(end) = after_open.find("</think>") {
+            if !thinking.is_empty() {
+                thinking.push('\n');
+            }
+            thinking.push_str(after_open[..end].trim());
+            rest = &after_open[end + "</think>".len()..];
+        } else {
+            // Unclosed <think> — treat everything after as thinking
+            if !thinking.is_empty() {
+                thinking.push('\n');
+            }
+            thinking.push_str(after_open.trim());
+            rest = "";
+            break;
+        }
+    }
+    cleaned.push_str(rest);
+
+    let cleaned = cleaned.trim().to_string();
+    let thinking = if thinking.is_empty() {
+        None
+    } else {
+        Some(thinking)
+    };
+    (cleaned, thinking)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_think_tags_basic() {
+        let (content, thinking) =
+            strip_think_tags("<think>reasoning here</think>The answer is 42.");
+        assert_eq!(content, "The answer is 42.");
+        assert_eq!(thinking.unwrap(), "reasoning here");
+    }
+
+    #[test]
+    fn test_strip_think_tags_no_tags() {
+        let (content, thinking) = strip_think_tags("No thinking tags here.");
+        assert_eq!(content, "No thinking tags here.");
+        assert!(thinking.is_none());
+    }
+
+    #[test]
+    fn test_strip_think_tags_empty_think() {
+        let (content, thinking) = strip_think_tags("<think>\n\n</think>Just the answer.");
+        assert_eq!(content, "Just the answer.");
+        assert!(thinking.is_none());
+    }
+
+    #[test]
+    fn test_strip_think_tags_multiple() {
+        let (content, thinking) =
+            strip_think_tags("<think>step 1</think>First. <think>step 2</think>Second.");
+        assert_eq!(content, "First. Second.");
+        assert_eq!(thinking.unwrap(), "step 1\nstep 2");
+    }
+
+    #[test]
+    fn test_strip_think_tags_unclosed() {
+        let (content, thinking) = strip_think_tags("Before <think>unclosed reasoning");
+        assert_eq!(content, "Before");
+        assert_eq!(thinking.unwrap(), "unclosed reasoning");
+    }
+
+    #[test]
+    fn test_strip_think_tags_only_think() {
+        let (content, thinking) = strip_think_tags("<think>all thinking no content</think>");
+        assert_eq!(content, "");
+        assert_eq!(thinking.unwrap(), "all thinking no content");
+    }
+}

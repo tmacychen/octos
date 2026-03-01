@@ -14,6 +14,7 @@ slack = ["tokio-tungstenite"]
 whatsapp = ["tokio-tungstenite"]
 feishu = ["tokio-tungstenite", "axum"]
 twilio = ["axum"]
+wecom = ["axum"]
 email = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mailparse"]
 
 [dependencies]

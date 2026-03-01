@@ -139,6 +139,8 @@ impl PluginLoader {
             ".{}_verified",
             executable.file_name().unwrap_or_default().to_string_lossy()
         ));
+        // Remove existing verified file first (it has 0o500 perms and can't be overwritten)
+        let _ = std::fs::remove_file(&verified_exe);
         std::fs::write(&verified_exe, &exe_bytes)
             .map_err(|e| eyre::eyre!("cannot write verified executable: {e}"))?;
         #[cfg(unix)]

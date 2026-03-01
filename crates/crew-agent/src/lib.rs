@@ -8,7 +8,9 @@
 //! - Integration with codex sandboxing (when enabled)
 
 mod agent;
+pub mod bootstrap;
 pub mod builtin_skills;
+pub mod bundled_app_skills;
 mod compaction;
 pub mod hooks;
 pub mod mcp;

@@ -6,6 +6,7 @@
 //! - Google Gemini
 //! - Ollama (local models)
 
+pub mod adaptive;
 mod config;
 pub mod context;
 mod context_override;
@@ -26,6 +27,10 @@ pub mod openrouter;
 pub mod registry;
 pub mod transcription;
 
+pub use adaptive::{
+    AdaptiveConfig, AdaptiveRouter, MetricsSnapshot, SharedMetrics, SharedPolicy,
+    SharedProviderMetrics,
+};
 pub use config::{ChatConfig, ToolChoice};
 pub use context_override::ContextWindowOverride;
 pub use embedding::{EmbeddingProvider, OpenAIEmbedder};
@@ -34,4 +39,6 @@ pub use provider::LlmProvider;
 pub use retry::{RetryConfig, RetryProvider};
 pub use router::{ProviderRouter, SubProviderMeta};
 pub use transcription::GroqTranscriber;
-pub use types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
+pub use types::{
+    ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec, strip_think_tags,
+};

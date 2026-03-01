@@ -480,6 +480,23 @@ pub async fn my_whatsapp_qr(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// GET /api/my/profile/metrics
+pub async fn my_provider_metrics(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let user_id = get_user_id(&identity)?;
+    let pm = state
+        .process_manager
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    match pm.read_metrics(&user_id).await {
+        Some(metrics) => Ok(Json(metrics)),
+        None => Ok(Json(serde_json::json!(null))),
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 fn get_user_id(identity: &AuthIdentity) -> Result<String, StatusCode> {

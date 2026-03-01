@@ -118,7 +118,9 @@ impl SessionManager {
                                 .map(|c| c.lines().count())
                                 .unwrap_or(0)
                         };
-                        result.push((name.to_string(), count));
+                        // Decode percent-encoded filename back to session key
+                        let decoded = Self::decode_session_name(name);
+                        result.push((decoded, count));
                     }
                 }
             }
@@ -187,6 +189,28 @@ impl SessionManager {
             safe_name.push_str(&format!("_{hash:016X}"));
         }
         self.sessions_dir.join(format!("{safe_name}.jsonl"))
+    }
+
+    /// Decode a percent-encoded session filename back to the original session key.
+    fn decode_session_name(encoded: &str) -> String {
+        let mut bytes = Vec::new();
+        let mut chars = encoded.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let hi = chars.next().unwrap_or('0');
+                let lo = chars.next().unwrap_or('0');
+                if let Ok(byte) = u8::from_str_radix(&format!("{hi}{lo}"), 16) {
+                    bytes.push(byte);
+                } else {
+                    bytes.push(b'%');
+                    bytes.extend_from_slice(hi.encode_utf8(&mut [0; 4]).as_bytes());
+                    bytes.extend_from_slice(lo.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+            } else {
+                bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+        }
+        String::from_utf8(bytes).unwrap_or_else(|_| encoded.to_string())
     }
 
     /// Load a session from its JSONL file.
@@ -736,6 +760,43 @@ mod tests {
             path1, path2,
             "truncated keys with different suffixes must produce different paths"
         );
+    }
+
+    #[test]
+    fn test_decode_session_name() {
+        assert_eq!(
+            SessionManager::decode_session_name("feishu%3Aoc_abc123"),
+            "feishu:oc_abc123"
+        );
+        assert_eq!(
+            SessionManager::decode_session_name("cli%3Adefault"),
+            "cli:default"
+        );
+        assert_eq!(
+            SessionManager::decode_session_name("plain-name"),
+            "plain-name"
+        );
+        // Double-byte UTF-8 round-trip
+        assert_eq!(
+            SessionManager::decode_session_name("hello%E4%B8%96%E7%95%8C"),
+            "hello\u{4e16}\u{754c}" // hello世界
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_returns_decoded_keys() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("feishu", "oc_abc123");
+
+        mgr.add_message(&key, make_message(MessageRole::User, "hello"))
+            .await
+            .unwrap();
+
+        let sessions = mgr.list_sessions();
+        assert_eq!(sessions.len(), 1);
+        // Should return decoded key, not percent-encoded filename
+        assert_eq!(sessions[0].0, "feishu:oc_abc123");
     }
 
     #[test]

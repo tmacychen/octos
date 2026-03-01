@@ -9,6 +9,7 @@ import type {
   OtpVerifyResponse,
   MeResponse,
   User,
+  SharedMetrics,
 } from './types'
 
 const BASE = '/api/admin'
@@ -113,6 +114,9 @@ export const api = {
   whatsappQr: (id: string) =>
     request<BridgeQrInfo>(`/profiles/${id}/whatsapp/qr`),
 
+  providerMetrics: (id: string) =>
+    request<SharedMetrics | null>(`/profiles/${id}/metrics`),
+
   // User management (admin)
   listUsers: () => request<{ users: User[] }>('/users'),
 
@@ -176,6 +180,9 @@ export const myApi = {
 
   whatsappQr: () =>
     authedRequest<BridgeQrInfo>('/my/profile/whatsapp/qr'),
+
+  providerMetrics: () =>
+    authedRequest<SharedMetrics | null>('/my/profile/metrics'),
 
   testProvider: (data: { provider: string; model: string; api_key?: string; api_key_env?: string; base_url?: string }) =>
     authedRequest<{ ok: boolean; message?: string; error?: string }>('/my/test-provider', {

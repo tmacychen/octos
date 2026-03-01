@@ -330,6 +330,22 @@ impl Channel for WhatsAppChannel {
         self.shutdown.store(true, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn send_typing(&self, chat_id: &str) -> Result<()> {
+        let mut lock = self.ws_tx.lock().await;
+        let Some(ref mut tx) = *lock else {
+            return Ok(());
+        };
+
+        let payload = serde_json::json!({
+            "type": "typing",
+            "to": chat_id,
+        });
+        tx.send(WsMessage::Text(payload.to_string().into()))
+            .await
+            .map_err(|e| eyre::eyre!("failed to send WhatsApp typing: {e}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

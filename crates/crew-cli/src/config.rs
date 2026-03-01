@@ -90,6 +90,11 @@ pub struct Config {
     #[serde(default)]
     pub sub_providers: Vec<SubProviderConfig>,
 
+    /// Adaptive routing configuration for dynamic provider selection.
+    /// When enabled, replaces static priority failover with metrics-driven routing.
+    #[serde(default)]
+    pub adaptive_routing: Option<AdaptiveRoutingConfig>,
+
     /// Email sending configuration for the send_email tool.
     #[serde(default)]
     pub email: Option<EmailConfig>,
@@ -208,20 +213,103 @@ pub struct EmailConfig {
     pub feishu_region: Option<String>,
 }
 
+/// Adaptive routing configuration for dynamic LLM provider selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveRoutingConfig {
+    /// Enable adaptive routing. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Latency threshold (ms) above which a soft penalty is applied. Default: 30000.
+    #[serde(default = "default_latency_threshold_ms")]
+    pub latency_threshold_ms: u64,
+
+    /// Error rate (0..1) above which provider is deprioritized. Default: 0.3.
+    #[serde(default = "default_error_rate_threshold")]
+    pub error_rate_threshold: f64,
+
+    /// Probability (0..1) of probing a non-primary provider. Default: 0.1.
+    #[serde(default = "default_probe_probability")]
+    pub probe_probability: f64,
+
+    /// Minimum seconds between probes to the same provider. Default: 60.
+    #[serde(default = "default_probe_interval_secs")]
+    pub probe_interval_secs: u64,
+
+    /// Consecutive failures before circuit breaker opens. Default: 3.
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+}
+
+impl Default for AdaptiveRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            latency_threshold_ms: default_latency_threshold_ms(),
+            error_rate_threshold: default_error_rate_threshold(),
+            probe_probability: default_probe_probability(),
+            probe_interval_secs: default_probe_interval_secs(),
+            failure_threshold: default_failure_threshold(),
+        }
+    }
+}
+
+impl From<&AdaptiveRoutingConfig> for crew_llm::AdaptiveConfig {
+    fn from(c: &AdaptiveRoutingConfig) -> Self {
+        Self {
+            failure_threshold: c.failure_threshold,
+            latency_threshold_ms: c.latency_threshold_ms,
+            error_rate_threshold: c.error_rate_threshold,
+            probe_probability: c.probe_probability,
+            probe_interval_secs: c.probe_interval_secs,
+            ..Default::default()
+        }
+    }
+}
+
+fn default_latency_threshold_ms() -> u64 {
+    30_000
+}
+fn default_error_rate_threshold() -> f64 {
+    0.3
+}
+fn default_probe_probability() -> f64 {
+    0.1
+}
+fn default_probe_interval_secs() -> u64 {
+    60
+}
+fn default_failure_threshold() -> u32 {
+    3
+}
+
 impl Config {
-    /// Directories to scan for plugins: local (.crew/plugins/) then global (~/.crew/plugins/).
+    /// Directories to scan for plugins and skill packages with tools.
+    ///
+    /// Scans both `.crew/plugins/` (legacy) and `.crew/skills/` (unified packages).
+    /// Skill packages that include a `manifest.json` are auto-discovered as tool
+    /// providers by `PluginLoader` (packages without manifest.json are skipped).
     pub fn plugin_dirs(cwd: &Path) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
-        let local = cwd.join(".crew").join("plugins");
-        if local.exists() {
-            dirs.push(local);
+        let local_plugins = cwd.join(".crew").join("plugins");
+        if local_plugins.exists() {
+            dirs.push(local_plugins);
+        }
+        let local_skills = cwd.join(".crew").join("skills");
+        if local_skills.exists() {
+            dirs.push(local_skills);
         }
         if let Some(home) = dirs::home_dir() {
-            let global = home.join(".crew").join("plugins");
-            if global.exists() {
-                dirs.push(global);
+            let global_plugins = home.join(".crew").join("plugins");
+            if global_plugins.exists() {
+                dirs.push(global_plugins);
+            }
+            let global_skills = home.join(".crew").join("skills");
+            if global_skills.exists() {
+                dirs.push(global_skills);
             }
         }
+        dirs.dedup();
         dirs
     }
 }

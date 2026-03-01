@@ -59,6 +59,7 @@ whatsapp = ["crew-bus/whatsapp"]
 email = ["crew-bus/email"]
 feishu = ["crew-bus/feishu"]
 twilio = ["crew-bus/twilio"]
+wecom = ["crew-bus/wecom"]
 git = ["crew-agent/git"]
 ast = ["crew-agent/ast"]
 

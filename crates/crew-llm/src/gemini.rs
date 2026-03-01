@@ -66,10 +66,14 @@ impl LlmProvider for GeminiProvider {
             Some(vec![GeminiTool {
                 function_declarations: tools
                     .iter()
-                    .map(|t| GeminiFunctionDeclaration {
-                        name: t.name.clone(),
-                        description: t.description.clone(),
-                        parameters: t.input_schema.clone(),
+                    .map(|t| {
+                        let mut params = t.input_schema.clone();
+                        sanitize_schema_for_gemini(&mut params);
+                        GeminiFunctionDeclaration {
+                            name: t.name.clone(),
+                            description: t.description.clone(),
+                            parameters: params,
+                        }
                     })
                     .collect(),
             }])
@@ -108,10 +112,12 @@ impl LlmProvider for GeminiProvider {
             );
         }
 
-        let api_response: GeminiResponse = response
-            .json()
+        let response_text = response
+            .text()
             .await
-            .wrap_err("failed to parse Gemini response")?;
+            .wrap_err("failed to read Gemini response body")?;
+        let api_response: GeminiResponse =
+            serde_json::from_str(&response_text).wrap_err("failed to parse Gemini response")?;
 
         // Extract content from response
         let candidate = api_response
@@ -186,10 +192,14 @@ impl LlmProvider for GeminiProvider {
             Some(vec![GeminiTool {
                 function_declarations: tools
                     .iter()
-                    .map(|t| GeminiFunctionDeclaration {
-                        name: t.name.clone(),
-                        description: t.description.clone(),
-                        parameters: t.input_schema.clone(),
+                    .map(|t| {
+                        let mut params = t.input_schema.clone();
+                        sanitize_schema_for_gemini(&mut params);
+                        GeminiFunctionDeclaration {
+                            name: t.name.clone(),
+                            description: t.description.clone(),
+                            parameters: params,
+                        }
                     })
                     .collect(),
             }])
@@ -271,6 +281,7 @@ struct GeminiSystemInstruction {
 #[derive(Serialize, Deserialize)]
 struct GeminiContent {
     role: String,
+    #[serde(default)]
     parts: Vec<GeminiPart>,
 }
 
@@ -397,9 +408,14 @@ fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<St
 }
 
 /// Merge parts into the last content entry if roles match (Gemini rejects adjacent same-role).
+///
+/// However, Gemini also silently fails when `functionResponse` parts are mixed with `text`
+/// parts in the same turn. To avoid this, we only merge parts of compatible types:
+/// functionResponse parts merge with other functionResponse parts, and text/inlineData
+/// parts merge with other text/inlineData parts.
 fn push_or_merge(contents: &mut Vec<GeminiContent>, role: &str, parts: Vec<GeminiPart>) {
     if let Some(last) = contents.last_mut() {
-        if last.role == role {
+        if last.role == role && parts_compatible(&last.parts, &parts) {
             last.parts.extend(parts);
             return;
         }
@@ -408,6 +424,25 @@ fn push_or_merge(contents: &mut Vec<GeminiContent>, role: &str, parts: Vec<Gemin
         role: role.to_string(),
         parts,
     });
+}
+
+/// Check if two sets of parts can be merged without mixing incompatible types.
+fn parts_compatible(existing: &[GeminiPart], new: &[GeminiPart]) -> bool {
+    let existing_has_func_response = existing
+        .iter()
+        .any(|p| matches!(p, GeminiPart::FunctionResponse { .. }));
+    let new_has_func_response = new
+        .iter()
+        .any(|p| matches!(p, GeminiPart::FunctionResponse { .. }));
+    let existing_has_text = existing
+        .iter()
+        .any(|p| matches!(p, GeminiPart::Text { .. } | GeminiPart::InlineData { .. }));
+    let new_has_text = new
+        .iter()
+        .any(|p| matches!(p, GeminiPart::Text { .. } | GeminiPart::InlineData { .. }));
+
+    // Don't merge if one side has functionResponse and the other has text
+    !(existing_has_func_response && new_has_text) && !(existing_has_text && new_has_func_response)
 }
 
 fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
@@ -454,6 +489,42 @@ struct GeminiFunctionDeclaration {
     name: String,
     description: String,
     parameters: serde_json::Value,
+}
+
+/// Sanitize a JSON Schema for Gemini's restricted schema support.
+///
+/// Gemini only supports a subset of JSON Schema. This recursively removes
+/// unsupported fields that cause 400 errors or silent empty responses:
+/// - `additionalProperties`
+/// - Empty `items` schemas (`"items": {}`)
+/// - `$schema`, `$ref`, `$id`
+fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("additionalProperties");
+        obj.remove("$schema");
+        obj.remove("$ref");
+        obj.remove("$id");
+
+        // Gemini requires `items` to have a type when present.
+        // Replace empty `"items": {}` with `"items": {"type": "string"}`.
+        if let Some(items) = obj.get("items") {
+            if items.as_object().is_some_and(|o| o.is_empty()) {
+                obj.insert("items".to_string(), serde_json::json!({"type": "string"}));
+            }
+        }
+
+        // Recurse into nested objects
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        for key in keys {
+            if let Some(v) = obj.get_mut(&key) {
+                sanitize_schema_for_gemini(v);
+            }
+        }
+    } else if let Some(arr) = value.as_array_mut() {
+        for item in arr {
+            sanitize_schema_for_gemini(item);
+        }
+    }
 }
 
 #[derive(Serialize)]

@@ -80,6 +80,12 @@ impl RetryProvider {
             }
         }
 
+        // Content-format 400 errors: the request may work with a different
+        // provider that has different validation rules for message content.
+        if error_str.contains("400") && error_str.contains("must not be empty") {
+            return true;
+        }
+
         // Everything retryable is also failover-worthy
         Self::is_retryable_error(error)
     }
@@ -320,6 +326,14 @@ mod tests {
     fn test_should_not_failover_400() {
         let err = eyre::eyre!("API error: 400 - bad request");
         assert!(!RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_should_failover_400_content_empty() {
+        let err = eyre::eyre!(
+            "OpenAI API error: 400 Bad Request - the message with role 'assistant' must not be empty"
+        );
+        assert!(RetryProvider::should_failover(&err));
     }
 
     #[test]

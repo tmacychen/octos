@@ -137,16 +137,15 @@ impl ChatCommand {
                     }
                 }
             }
-            if let Some(ref ar) = config.adaptive_routing {
-                if ar.enabled {
-                    tracing::info!("adaptive routing enabled");
-                    Arc::new(AdaptiveRouter::new(
-                        providers,
-                        AdaptiveConfig::from(ar),
-                    ))
-                } else {
-                    Arc::new(ProviderChain::new(providers))
-                }
+            // Auto-enable adaptive routing when multiple providers exist
+            if providers.len() > 1 {
+                let adaptive_config = config
+                    .adaptive_routing
+                    .as_ref()
+                    .map(|ar| AdaptiveConfig::from(ar))
+                    .unwrap_or_default();
+                tracing::info!("adaptive routing enabled ({} providers)", providers.len());
+                Arc::new(AdaptiveRouter::new(providers, adaptive_config))
             } else {
                 Arc::new(ProviderChain::new(providers))
             }

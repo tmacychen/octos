@@ -244,7 +244,8 @@ impl LlmProvider for OpenAIProvider {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             eyre::bail!(
-                "API error ({}): {status} - {}", self.model,
+                "API error ({}): {status} - {}",
+                self.model,
                 crate::provider::truncate_error_body(&body)
             );
         }
@@ -280,9 +281,27 @@ impl LlmProvider for OpenAIProvider {
             _ => StopReason::EndTurn,
         };
 
+        // Strip <think> tags from content (DeepSeek, MiniMax, Qwen thinking models
+        // embed chain-of-thought in <think> tags instead of reasoning_content).
+        let (content, reasoning_content) = match choice.message.content {
+            Some(text) => {
+                let (cleaned, thinking) = crate::types::strip_think_tags(&text);
+                let content = if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned)
+                };
+                // Prefer the structured reasoning_content if the provider sent one;
+                // otherwise use what we extracted from <think> tags.
+                let reasoning = choice.message.reasoning_content.or(thinking);
+                (content, reasoning)
+            }
+            None => (None, choice.message.reasoning_content),
+        };
+
         Ok(ChatResponse {
-            content: choice.message.content,
-            reasoning_content: choice.message.reasoning_content,
+            content,
+            reasoning_content,
             tool_calls,
             stop_reason,
             usage: TokenUsage {
@@ -328,7 +347,8 @@ impl LlmProvider for OpenAIProvider {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             eyre::bail!(
-                "API error ({}): {status} - {}", self.model,
+                "API error ({}): {status} - {}",
+                self.model,
                 crate::provider::truncate_error_body(&text)
             );
         }
@@ -456,11 +476,12 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
         if msg.content.is_empty() && media_note.is_none() {
             // Tool messages require a content string (OpenAI spec).
             // User messages must not be empty (many providers reject them).
-            // Assistant messages can have null content when tool_calls are present;
-            // some providers (Moonshot/kimi) reject empty-string content on assistant msgs.
+            // Assistant messages: some providers (Kimi, DeepSeek) reject omitted content,
+            // NVIDIA NIM rejects empty string — use a single space as universal safe value.
             return match msg.role {
                 MessageRole::Tool => Some(OpenAIContent::Text(String::new())),
                 MessageRole::User => Some(OpenAIContent::Text("[empty message]".to_string())),
+                MessageRole::Assistant => Some(OpenAIContent::Text(" ".to_string())),
                 _ => None,
             };
         }

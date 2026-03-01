@@ -18,10 +18,10 @@ futures = { workspace = true }
 secrecy = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true }
+chrono = { workspace = true }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-chrono.workspace = true
 tokio-test = { workspace = true }

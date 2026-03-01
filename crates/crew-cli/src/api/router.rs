@@ -82,6 +82,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/my/profile/whatsapp/qr",
             get(auth_handlers::my_whatsapp_qr),
         )
+        .route(
+            "/api/my/profile/metrics",
+            get(auth_handlers::my_provider_metrics),
+        )
         .route("/api/auth/me", get(auth_handlers::me))
         .route("/api/my/test-provider", post(admin::test_provider))
         .route("/api/my/test-search", post(admin::test_search));
@@ -106,6 +110,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(admin::gateway_status),
         )
         .route("/api/admin/profiles/{id}/logs", get(admin::gateway_logs))
+        .route(
+            "/api/admin/profiles/{id}/metrics",
+            get(admin::provider_metrics),
+        )
         .route(
             "/api/admin/profiles/{id}/whatsapp/qr",
             get(admin::whatsapp_qr),

@@ -21,6 +21,7 @@ export interface ChannelCredentials {
 export interface FallbackModel {
   provider: string
   model?: string | null
+  base_url?: string | null
   api_key_env?: string | null
   api_type?: string | null
 }
@@ -154,4 +155,39 @@ export interface BridgeQrInfo {
   http_port: number
   phone_number: string | null
   lid: string | null
+}
+
+// ── Provider QoS Metrics ─────────────────────────────────────────────
+
+export interface ProviderMetricsSnapshot {
+  latency_ema_ms: number
+  p95_latency_ms: number
+  success_count: number
+  failure_count: number
+  consecutive_failures: number
+  error_rate: number
+}
+
+export interface SharedProviderMetrics extends ProviderMetricsSnapshot {
+  provider: string
+  model: string
+  score: number
+}
+
+export interface SharedPolicy {
+  ema_alpha: number
+  failure_threshold: number
+  latency_threshold_ms: number
+  error_rate_threshold: number
+  probe_probability: number
+  probe_interval_secs: number
+  weight_latency: number
+  weight_error_rate: number
+  weight_priority: number
+}
+
+export interface SharedMetrics {
+  updated_at: string
+  policy: SharedPolicy
+  providers: SharedProviderMetrics[]
 }

@@ -1,7 +1,7 @@
 //! Agent implementation.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,27 @@ pub struct ConversationResponse {
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
     pub streamed: bool,
+}
+
+/// Shared atomic counters for real-time token tracking (used by status indicators).
+pub struct TokenTracker {
+    pub input_tokens: AtomicU32,
+    pub output_tokens: AtomicU32,
+}
+
+impl TokenTracker {
+    pub fn new() -> Self {
+        Self {
+            input_tokens: AtomicU32::new(0),
+            output_tokens: AtomicU32::new(0),
+        }
+    }
+}
+
+impl Default for TokenTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Reason why the agent loop stopped due to budget constraints.
@@ -198,6 +219,30 @@ impl Agent {
         history: &[Message],
         media: Vec<String>,
     ) -> Result<ConversationResponse> {
+        self.process_message_inner(user_content, history, media, None)
+            .await
+    }
+
+    /// Like `process_message`, but updates a `TokenTracker` in real-time after each LLM call.
+    /// Used by the gateway status indicator to show live token counts.
+    pub async fn process_message_tracked(
+        &self,
+        user_content: &str,
+        history: &[Message],
+        media: Vec<String>,
+        tracker: &TokenTracker,
+    ) -> Result<ConversationResponse> {
+        self.process_message_inner(user_content, history, media, Some(tracker))
+            .await
+    }
+
+    async fn process_message_inner(
+        &self,
+        user_content: &str,
+        history: &[Message],
+        media: Vec<String>,
+        tracker: Option<&TokenTracker>,
+    ) -> Result<ConversationResponse> {
         let mut messages = vec![Message {
             role: MessageRole::System,
             content: self
@@ -253,24 +298,32 @@ impl Agent {
             let tools_spec = self.tools.specs();
             self.trim_to_context_window(&mut messages);
 
-            tracing::debug!(
+            tracing::info!(
                 iteration,
                 messages = messages.len(),
                 tools = tools_spec.len(),
+                tool_names = %tools_spec.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
                 "calling LLM"
             );
             let (response, streamed) = self
                 .call_llm_with_hooks(&messages, &tools_spec, &config, iteration)
                 .await?;
-            tracing::debug!(
+            tracing::info!(
                 iteration,
                 stop_reason = ?response.stop_reason,
                 content_len = response.content.as_ref().map(|c| c.len()).unwrap_or(0),
                 tool_calls = response.tool_calls.len(),
+                tool_call_names = %response.tool_calls.iter().map(|tc| tc.name.as_str()).collect::<Vec<_>>().join(", "),
                 "LLM response received"
             );
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
+            if let Some(t) = tracker {
+                t.input_tokens
+                    .store(total_usage.input_tokens, Ordering::Relaxed);
+                t.output_tokens
+                    .store(total_usage.output_tokens, Ordering::Relaxed);
+            }
 
             match response.stop_reason {
                 StopReason::EndTurn | StopReason::StopSequence => {
@@ -288,6 +341,7 @@ impl Agent {
                         &mut messages,
                         &mut files_modified,
                         &mut total_usage,
+                        tracker,
                     )
                     .await?;
                 }
@@ -431,6 +485,7 @@ impl Agent {
                             &mut messages,
                             &mut files_modified,
                             &mut total_usage,
+                            None,
                         )
                         .await?;
                     }
@@ -941,6 +996,16 @@ impl Agent {
                 .report(ProgressEvent::StreamDone { iteration });
         }
 
+        // Strip <think> tags from accumulated streaming content (some models
+        // embed chain-of-thought in <think> tags via TextDelta instead of
+        // using ReasoningDelta events).
+        let (text, think_extracted) = crew_llm::strip_think_tags(&text);
+        if let Some(ref extracted) = think_extracted {
+            if reasoning.is_empty() {
+                reasoning = extracted.clone();
+            }
+        }
+
         let content = if text.is_empty() { None } else { Some(text) };
         let tool_calls: Vec<crew_core::ToolCall> = tool_calls
             .into_iter()
@@ -1154,6 +1219,7 @@ impl Agent {
         messages: &mut Vec<Message>,
         files_modified: &mut Vec<PathBuf>,
         total_usage: &mut TokenUsage,
+        tracker: Option<&TokenTracker>,
     ) -> Result<()> {
         messages.push(self.response_to_message(response));
         let (tool_messages, tool_files, tool_tokens) = self.execute_tools(response).await?;
@@ -1161,6 +1227,12 @@ impl Agent {
         files_modified.extend(tool_files);
         total_usage.input_tokens += tool_tokens.input_tokens;
         total_usage.output_tokens += tool_tokens.output_tokens;
+        if let Some(t) = tracker {
+            t.input_tokens
+                .store(total_usage.input_tokens, Ordering::Relaxed);
+            t.output_tokens
+                .store(total_usage.output_tokens, Ordering::Relaxed);
+        }
         Ok(())
     }
 

@@ -682,6 +682,18 @@ impl FeishuChannel {
 
     /// Send a typed message via Feishu REST API.
     async fn send_message(&self, chat_id: &str, msg_type: &str, content: &str) -> Result<()> {
+        self.send_message_returning_id(chat_id, msg_type, content)
+            .await?;
+        Ok(())
+    }
+
+    /// Send a message and return its message_id from the API response.
+    async fn send_message_returning_id(
+        &self,
+        chat_id: &str,
+        msg_type: &str,
+        content: &str,
+    ) -> Result<Option<String>> {
         let token = self.get_token().await?;
         let id_type = Self::receive_id_type(chat_id);
 
@@ -713,9 +725,17 @@ impl FeishuChannel {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             warn!("Feishu send error: {err_msg}");
+            return Ok(None);
         }
 
-        Ok(())
+        // Extract message_id from response: { "data": { "message_id": "om_..." } }
+        let message_id = resp
+            .get("data")
+            .and_then(|d| d.get("message_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(message_id)
     }
 
     /// Check if a message ID has been seen; add if not. Trims when over capacity.
@@ -1262,6 +1282,89 @@ impl Channel for FeishuChannel {
 
     async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
+        if msg.content.is_empty() {
+            return Ok(None);
+        }
+        let card = serde_json::json!({
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": msg.content,
+                }
+            ]
+        });
+        self.send_message_returning_id(&msg.chat_id, "interactive", &card.to_string())
+            .await
+    }
+
+    async fn edit_message(
+        &self,
+        _chat_id: &str,
+        message_id: &str,
+        new_content: &str,
+    ) -> Result<()> {
+        let token = self.get_token().await?;
+        let card = serde_json::json!({
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": new_content,
+                }
+            ]
+        });
+        let body = serde_json::json!({
+            "msg_type": "interactive",
+            "content": card.to_string(),
+        });
+
+        let resp: serde_json::Value = self
+            .http
+            .patch(format!("{}/im/v1/messages/{}", self.base_url, message_id))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to edit Feishu message")?
+            .json()
+            .await?;
+
+        let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let err_msg = resp
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            warn!("Feishu edit error: {err_msg}");
+        }
+        Ok(())
+    }
+
+    async fn delete_message(&self, _chat_id: &str, message_id: &str) -> Result<()> {
+        let token = self.get_token().await?;
+
+        let resp: serde_json::Value = self
+            .http
+            .delete(format!("{}/im/v1/messages/{}", self.base_url, message_id))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .wrap_err("failed to delete Feishu message")?
+            .json()
+            .await?;
+
+        let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let err_msg = resp
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            warn!("Feishu delete error: {err_msg}");
+        }
         Ok(())
     }
 }

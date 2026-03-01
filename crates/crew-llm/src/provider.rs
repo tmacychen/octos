@@ -58,6 +58,12 @@ pub trait LlmProvider: Send + Sync {
 
     /// Get the provider name (e.g., "anthropic", "openai").
     fn provider_name(&self) -> &str;
+
+    /// Export provider QoS metrics as JSON (for adaptive routers).
+    /// Returns `None` for simple providers; overridden by `AdaptiveRouter`.
+    fn export_metrics(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// Truncate an API error body to avoid leaking verbose internal details.

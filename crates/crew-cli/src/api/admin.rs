@@ -397,6 +397,22 @@ pub async fn gateway_status(
     Ok(Json(pm.status(&id).await))
 }
 
+/// GET /api/admin/profiles/:id/metrics — Provider QoS metrics.
+pub async fn provider_metrics(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+
+    match pm.read_metrics(&id).await {
+        Some(metrics) => Ok(Json(metrics)),
+        None => Ok(Json(serde_json::json!(null))),
+    }
+}
+
 /// GET /api/admin/profiles/:id/logs — SSE log stream.
 pub async fn gateway_logs(
     State(state): State<Arc<AppState>>,

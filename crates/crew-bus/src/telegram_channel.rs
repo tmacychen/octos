@@ -245,6 +245,66 @@ impl Channel for TelegramChannel {
         self.shutdown.store(true, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn send_typing(&self, chat_id: &str) -> Result<()> {
+        let id: i64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Telegram chat_id: {chat_id}"))?;
+        self.bot
+            .send_chat_action(ChatId(id), teloxide::types::ChatAction::Typing)
+            .await
+            .wrap_err("failed to send typing action")?;
+        Ok(())
+    }
+
+    async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
+        let chat_id: i64 = msg
+            .chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Telegram chat_id: {}", msg.chat_id))?;
+
+        let html = markdown_to_telegram_html(&msg.content);
+        let sent = self
+            .bot
+            .send_message(ChatId(chat_id), &html)
+            .parse_mode(ParseMode::Html)
+            .await
+            .wrap_err("failed to send Telegram message")?;
+
+        Ok(Some(sent.id.0.to_string()))
+    }
+
+    async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
+        let cid: i64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Telegram chat_id: {chat_id}"))?;
+        let mid: i32 = message_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Telegram message_id: {message_id}"))?;
+
+        let html = markdown_to_telegram_html(new_content);
+        self.bot
+            .edit_message_text(ChatId(cid), teloxide::types::MessageId(mid), &html)
+            .parse_mode(ParseMode::Html)
+            .await
+            .wrap_err("failed to edit Telegram message")?;
+        Ok(())
+    }
+
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        let cid: i64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Telegram chat_id: {chat_id}"))?;
+        let mid: i32 = message_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Telegram message_id: {message_id}"))?;
+
+        self.bot
+            .delete_message(ChatId(cid), teloxide::types::MessageId(mid))
+            .await
+            .wrap_err("failed to delete Telegram message")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

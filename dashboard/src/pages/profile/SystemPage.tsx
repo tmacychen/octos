@@ -5,15 +5,17 @@ import SaveFooter from '../../components/SaveFooter'
 import GatewayTab from '../../components/tabs/GatewayTab'
 import EnvVarsEditor from '../../components/EnvVarsEditor'
 import LogPanel from '../../components/LogPanel'
+import ProviderQosTab from '../../components/tabs/ProviderQosTab'
 
 const TABS = [
   { key: 'gateway', label: 'Gateway Settings' },
   { key: 'env', label: 'Env Vars' },
+  { key: 'qos', label: 'Provider QoS' },
   { key: 'logs', label: 'Logs' },
 ]
 
 export default function SystemPage() {
-  const { config, setConfig, save, saving, loading, logStreamUrl } = useProfile()
+  const { config, setConfig, save, saving, loading, logStreamUrl, profileId } = useProfile()
   const [activeTab, setActiveTab] = useState('gateway')
 
   if (loading) {
@@ -34,9 +36,10 @@ export default function SystemPage() {
         <div className="p-5">
           {activeTab === 'gateway' && <GatewayTab config={config} onChange={setConfig} />}
           {activeTab === 'env' && <EnvVarsEditor config={config} onChange={setConfig} />}
+          {activeTab === 'qos' && <ProviderQosTab profileId={profileId} />}
           {activeTab === 'logs' && <LogPanel logStreamUrl={logStreamUrl} />}
         </div>
-        {activeTab !== 'logs' && <SaveFooter onSave={save} saving={saving} />}
+        {activeTab !== 'logs' && activeTab !== 'qos' && <SaveFooter onSave={save} saving={saving} />}
       </div>
     </div>
   )

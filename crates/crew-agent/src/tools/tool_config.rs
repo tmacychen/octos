@@ -1291,9 +1291,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let store = ToolConfigStore::open(dir.path()).await.unwrap();
 
-        let out = store
-            .handle_config_command("set web_search.count 8")
-            .await;
+        let out = store.handle_config_command("set web_search.count 8").await;
         assert!(out.contains("Set web_search.count = 8"));
         assert_eq!(store.get_u64("web_search", "count").await, Some(8));
     }
@@ -1310,9 +1308,7 @@ mod tests {
         assert!(out.contains("invalid value"));
 
         // Out of range
-        let out = store
-            .handle_config_command("set web_search.count 99")
-            .await;
+        let out = store.handle_config_command("set web_search.count 99").await;
         assert!(out.contains("out of range"));
 
         // Unknown tool

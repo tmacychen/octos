@@ -110,6 +110,9 @@ pub struct FallbackModelConfig {
     /// Model name.
     #[serde(default)]
     pub model: Option<String>,
+    /// Custom base URL override (for DashScope, MiniMax, NVIDIA NIM, etc.).
+    #[serde(default)]
+    pub base_url: Option<String>,
     /// Env var name for API key (if different from primary).
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -437,7 +440,7 @@ pub(crate) fn config_from_profile(
         .map(|fb| FallbackModel {
             provider: fb.provider.clone(),
             model: fb.model.clone(),
-            base_url: None,
+            base_url: fb.base_url.clone(),
             api_key_env: fb.api_key_env.clone(),
             model_hints: None,
             api_type: fb.api_type.clone(),
@@ -488,6 +491,7 @@ pub(crate) fn config_from_profile(
                 feishu_from_address: e.feishu_from_address.clone(),
                 feishu_region: e.feishu_region.clone(),
             }),
+        adaptive_routing: None,
         #[cfg(feature = "api")]
         dashboard_auth: None,
     }

@@ -39,6 +39,33 @@ pub trait Channel: Send + Sync {
     async fn stop(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Send a typing/composing indicator. Platforms that don't support it return Ok(()).
+    async fn send_typing(&self, _chat_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Send a message and return its platform message ID (for later editing/deletion).
+    /// Default: delegates to `send()` and returns None.
+    async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
+        self.send(msg).await?;
+        Ok(None)
+    }
+
+    /// Edit an existing message by platform message ID.
+    async fn edit_message(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+        _new_content: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete a message by platform message ID.
+    async fn delete_message(&self, _chat_id: &str, _message_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Manages registered channels and dispatches outbound messages.
@@ -127,6 +154,11 @@ impl ChannelManager {
         });
 
         Ok(())
+    }
+
+    /// Get a channel by name, for direct access (typing indicators, message editing).
+    pub fn get_channel(&self, name: &str) -> Option<Arc<dyn Channel>> {
+        self.channels.get(name).cloned()
     }
 
     pub async fn stop_all(&self) -> Result<()> {

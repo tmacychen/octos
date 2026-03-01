@@ -1,0 +1,31 @@
+{
+  "name": "deep-search",
+  "version": "1.0.0",
+  "author": "hagency",
+  "description": "Web search with parallel page content fetching. Searches the web, crawls top results, and saves full page content to local files for later reference.",
+  "tools": [
+    {
+      "name": "deep_search",
+      "description": "Search the web and crawl all result URLs in parallel. Saves each page as a markdown file under ./research/<query>/. Returns an index of saved files with inline previews -- use read_file to examine specific pages for detailed synthesis.",
+      "entrypoint": "target/release/deep-search",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The search query to research"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Number of results to search and crawl (1-10, default: 8)"
+          },
+          "search_engine": {
+            "type": "string",
+            "description": "Preferred search engine: duckduckgo, brave, you, perplexity (default: auto-detect from available API keys)"
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  ]
+}

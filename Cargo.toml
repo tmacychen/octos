@@ -7,6 +7,10 @@ members = [
     "crates/crew-agent",
     "crates/crew-bus",
     "crates/crew-cli",
+    "crates/app-skills/news",
+    "crates/app-skills/deep-search",
+    "crates/app-skills/deep-crawl",
+    "crates/app-skills/send-email",
 ]
 
 [workspace.package]

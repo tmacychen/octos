@@ -1238,11 +1238,11 @@ async fn build_system_prompt(
         \n\nWhen the user asks you to research, investigate, search, or look into a topic, \
         FIRST confirm which approach:\
         \n\n1. 🔍 Quick search — fast web lookup (`web_search`)\
-        \n2. 📚 Deep research — comprehensive multi-source report, 5-10 min (`deep_research`)\
-        \n3. 🌐 Deep crawl — crawl a specific website URL in depth (`deep_research` with custom system_prompt targeting that URL)\
+        \n2. 📚 Deep search — comprehensive multi-source report, 5-10 min (`deep_search`)\
+        \n3. 🌐 Deep crawl — crawl a specific website URL in depth (`deep_crawl`)\
         \n\nMatch the user's language (Chinese question → Chinese options).\
         \n\nSKIP confirmation and act directly ONLY when:\
-        \n- User explicitly names the method: \"深度调查/深度研究/深度搜索\" → deep_research, \"爬取这个网站\" → deep_crawl\
+        \n- User explicitly names the method: \"深度调查/深度研究/深度搜索\" → deep_search, \"爬取这个网站\" → deep_crawl\
         \n- User replies with a choice (1/2/3) → execute immediately\
         \n\nFor ALL other search/lookup requests (including \"查一下\", \"搜一下\", \"帮我查\", \"search for\"), \
         ALWAYS ask the user to pick 1/2/3 first. Do NOT assume web_search is enough.\
@@ -1254,7 +1254,7 @@ async fn build_system_prompt(
         NEVER fabricate or guess real-time information — if you cannot fetch it, say so.\
         \n\n## Other Rules\
         \n\nOnly use the `message` tool to send an early heads-up when you need to run slow tools \
-        (deep_research, spawn, take_photo) — NOT for simple questions. \
+        (deep_search, deep_crawl, spawn, take_photo) — NOT for simple questions. \
         Save important user preferences with `save_memory`.";
     let mut prompt = base.unwrap_or(default_prompt).to_string();
 
