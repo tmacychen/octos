@@ -1074,7 +1074,12 @@ impl GatewayCommand {
             let shutdown = shutdown.clone();
             let queue_mode = gw_config.queue_mode.clone();
             let collect_inbound_tx = collect_inbound_tx.clone();
-            let status_indicator = status_indicators.get(&reply_channel).cloned();
+            // Skip status indicator for cron/heartbeat messages — they're background tasks
+            let status_indicator = if inbound.channel == "system" {
+                None
+            } else {
+                status_indicators.get(&reply_channel).cloned()
+            };
 
             let session_key_str = session_key.to_string();
             let locks_for_prune = session_locks.clone();
