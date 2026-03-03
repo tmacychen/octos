@@ -32,3 +32,4 @@ node_modules/
 !CHANGELOG.md
 !docs/**/*.md
 !crates/crew-agent/skills/**/SKILL.md
+!crates/app-skills/**/SKILL.md

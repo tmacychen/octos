@@ -15,7 +15,7 @@ use eyre::Result;
 use futures::StreamExt;
 use tracing::{Instrument, debug, info, info_span, warn};
 
-use crate::hooks::{HookEvent, HookExecutor, HookPayload, HookResult};
+use crate::hooks::{HookContext, HookEvent, HookExecutor, HookPayload, HookResult};
 use crate::progress::{ProgressEvent, ProgressReporter, SilentReporter};
 use crate::tools::ToolRegistry;
 
@@ -116,6 +116,8 @@ pub struct Agent {
     reporter: Arc<dyn ProgressReporter>,
     /// Lifecycle hooks executor.
     hooks: Option<Arc<HookExecutor>>,
+    /// Session-level context for hook payloads.
+    hook_context: std::sync::Mutex<Option<HookContext>>,
     /// Shutdown signal.
     shutdown: Arc<AtomicBool>,
 }
@@ -140,6 +142,7 @@ impl Agent {
             config: AgentConfig::default(),
             reporter: Arc::new(SilentReporter),
             hooks: None,
+            hook_context: std::sync::Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -172,6 +175,28 @@ impl Agent {
     pub fn with_hooks(mut self, hooks: Arc<HookExecutor>) -> Self {
         self.hooks = Some(hooks);
         self
+    }
+
+    /// Set session-level context for hook payloads.
+    pub fn with_hook_context(self, ctx: HookContext) -> Self {
+        *self.hook_context.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+        self
+    }
+
+    /// Update the session ID in the hook context (call before each message).
+    pub fn set_session_id(&self, session_id: &str) {
+        let mut guard = self.hook_context.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut ctx) = *guard {
+            ctx.session_id = Some(session_id.to_string());
+        }
+    }
+
+    /// Get a snapshot of the current hook context.
+    fn hook_ctx(&self) -> Option<HookContext> {
+        self.hook_context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Override the system prompt (e.g. for gateway mode).
@@ -306,11 +331,19 @@ impl Agent {
                 "calling LLM"
             );
             let (response, streamed) = self
-                .call_llm_with_hooks(&messages, &tools_spec, &config, iteration)
+                .call_llm_with_hooks(&messages, &tools_spec, &config, iteration, &total_usage)
                 .await?;
             {
-                let tool_names: Vec<&str> = response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
-                let tool_ids: Vec<&str> = response.tool_calls.iter().map(|tc| tc.id.as_str()).collect();
+                let tool_names: Vec<&str> = response
+                    .tool_calls
+                    .iter()
+                    .map(|tc| tc.name.as_str())
+                    .collect();
+                let tool_ids: Vec<&str> = response
+                    .tool_calls
+                    .iter()
+                    .map(|tc| tc.id.as_str())
+                    .collect();
                 tracing::info!(
                     iteration,
                     stop_reason = ?response.stop_reason,
@@ -406,7 +439,7 @@ impl Agent {
                 self.trim_to_context_window(&mut messages);
 
                 let (response, _streamed) = self
-                    .call_llm_with_hooks(&messages, &tools_spec, &config, iteration)
+                    .call_llm_with_hooks(&messages, &tools_spec, &config, iteration, &total_usage)
                     .await?;
                 total_usage.input_tokens += response.usage.input_tokens;
                 total_usage.output_tokens += response.usage.output_tokens;
@@ -647,7 +680,11 @@ impl Agent {
         response: &ChatResponse,
     ) -> Result<(Vec<Message>, Vec<std::path::PathBuf>, TokenUsage)> {
         // Log parallel tool execution details
-        let tool_names: Vec<&str> = response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+        let tool_names: Vec<&str> = response
+            .tool_calls
+            .iter()
+            .map(|tc| tc.name.as_str())
+            .collect();
         tracing::info!(
             parallel_tools = response.tool_calls.len(),
             tool_names = %tool_names.join(", "),
@@ -670,10 +707,12 @@ impl Agent {
 
                 // Before-tool hook: may deny execution
                 if let Some(ref hooks) = self.hooks {
+                    let ctx = self.hook_ctx();
                     let payload = HookPayload::before_tool(
                         &tool_call.name,
                         tool_call.arguments.clone(),
                         &tool_call.id,
+                        ctx.as_ref(),
                     );
                     if let HookResult::Deny(reason) =
                         hooks.run(HookEvent::BeforeToolCall, &payload).await
@@ -763,12 +802,14 @@ impl Agent {
 
                 // After-tool hook (fire-and-forget)
                 if let Some(ref hooks) = self.hooks {
+                    let ctx = self.hook_ctx();
                     let payload = HookPayload::after_tool(
                         &tool_call.name,
                         &tool_call.id,
                         crew_core::truncated_utf8(&content, 500, "..."),
                         tool_success,
                         duration.as_millis() as u64,
+                        ctx.as_ref(),
                     );
                     let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
                 }
@@ -1165,9 +1206,16 @@ impl Agent {
         tools_spec: &[ToolSpec],
         config: &ChatConfig,
         iteration: u32,
+        total_usage: &TokenUsage,
     ) -> Result<(ChatResponse, bool)> {
+        let ctx = self.hook_ctx();
         if let Some(ref hooks) = self.hooks {
-            let payload = HookPayload::before_llm(self.llm.model_id(), messages.len(), iteration);
+            let payload = HookPayload::before_llm(
+                self.llm.model_id(),
+                messages.len(),
+                iteration,
+                ctx.as_ref(),
+            );
             if let HookResult::Deny(reason) = hooks.run(HookEvent::BeforeLlmCall, &payload).await {
                 eyre::bail!("LLM call denied by hook: {reason}");
             }
@@ -1176,6 +1224,7 @@ impl Agent {
         let mut last_error: Option<eyre::Report> = None;
 
         for attempt in 0..=Self::LLM_RETRY_MAX {
+            let call_start = Instant::now();
             // Try the full LLM call (stream creation + consumption)
             let call_result = async {
                 let stream = self.llm.chat_stream(messages, tools_spec, config).await?;
@@ -1188,6 +1237,14 @@ impl Agent {
                     if !Self::is_empty_response(&response) || attempt == Self::LLM_RETRY_MAX {
                         // Success or final attempt — use this response
                         if let Some(ref hooks) = self.hooks {
+                            let latency_ms = call_start.elapsed().as_millis() as u64;
+                            let cum_in = total_usage.input_tokens + response.usage.input_tokens;
+                            let cum_out = total_usage.output_tokens + response.usage.output_tokens;
+                            let pricing = crew_llm::pricing::model_pricing(self.llm.model_id());
+                            let session_cost = pricing.map(|p| p.cost(cum_in, cum_out));
+                            let response_cost = pricing.map(|p| {
+                                p.cost(response.usage.input_tokens, response.usage.output_tokens)
+                            });
                             let payload = HookPayload::after_llm(
                                 self.llm.model_id(),
                                 iteration,
@@ -1195,6 +1252,13 @@ impl Agent {
                                 !response.tool_calls.is_empty(),
                                 response.usage.input_tokens,
                                 response.usage.output_tokens,
+                                self.llm.provider_name(),
+                                latency_ms,
+                                cum_in,
+                                cum_out,
+                                session_cost,
+                                response_cost,
+                                ctx.as_ref(),
                             );
                             let _ = hooks.run(HookEvent::AfterLlmCall, &payload).await;
                         }

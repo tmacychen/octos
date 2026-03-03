@@ -121,6 +121,7 @@ pub async fn verify(
                             name: user.name.clone(),
                             enabled: false,
                             data_dir: None,
+                            parent_id: None,
                             config: crate::profiles::ProfileConfig::default(),
                             created_at: chrono::Utc::now(),
                             updated_at: chrono::Utc::now(),

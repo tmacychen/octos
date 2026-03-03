@@ -81,6 +81,14 @@ pub struct GatewayCommand {
     /// Disable automatic retry on transient errors.
     #[arg(long)]
     pub no_retry: bool,
+
+    /// Path to parent profile JSON (sub-accounts inherit provider config).
+    #[arg(long, hide = true)]
+    pub parent_profile: Option<PathBuf>,
+
+    /// Crew home directory for ProfileStore access (used by managed gateways).
+    #[arg(long, hide = true)]
+    pub crew_home: Option<PathBuf>,
 }
 
 impl Executable for GatewayCommand {
@@ -104,12 +112,39 @@ impl GatewayCommand {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
 
+        let mut profile_id: Option<String> = None;
         let config = if let Some(ref profile_path) = self.profile {
             // Load config from profile JSON (single source of truth)
             let content = std::fs::read_to_string(profile_path)
                 .wrap_err_with(|| format!("failed to read profile: {}", profile_path.display()))?;
-            let profile: crate::profiles::UserProfile = serde_json::from_str(&content)
+            let mut profile: crate::profiles::UserProfile = serde_json::from_str(&content)
                 .wrap_err_with(|| format!("failed to parse profile: {}", profile_path.display()))?;
+            profile_id = Some(profile.id.clone());
+
+            // Sub-account: merge LLM provider config from parent profile
+            if let Some(ref parent_path) = self.parent_profile {
+                if let Ok(parent_content) = std::fs::read_to_string(parent_path) {
+                    if let Ok(parent) =
+                        serde_json::from_str::<crate::profiles::UserProfile>(&parent_content)
+                    {
+                        info!(
+                            parent = %parent.id,
+                            sub_account = %profile.id,
+                            "inheriting provider config from parent profile"
+                        );
+                        profile.config.provider = parent.config.provider;
+                        profile.config.model = parent.config.model;
+                        profile.config.base_url = parent.config.base_url;
+                        profile.config.api_key_env = parent.config.api_key_env;
+                        profile.config.api_type = parent.config.api_type;
+                        profile.config.fallback_models = parent.config.fallback_models;
+                        if profile.config.email.is_none() {
+                            profile.config.email = parent.config.email;
+                        }
+                    }
+                }
+            }
+
             crate::profiles::config_from_profile(
                 &profile,
                 self.bridge_url.as_deref(),
@@ -197,6 +232,29 @@ impl GatewayCommand {
 
         // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
         let data_dir = super::resolve_data_dir(self.data_dir)?;
+
+        // Open ProfileStore for /account commands (if crew-home is available)
+        let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
+            if let Some(ref crew_home) = self.crew_home {
+                crate::profiles::ProfileStore::open(crew_home)
+                    .ok()
+                    .map(Arc::new)
+            } else {
+                None
+            };
+
+        // Export CREW_HOME and CREW_PROFILE_ID so plugin tools (e.g. account-manager)
+        // can access the profile store and know which profile is running.
+        // SAFETY: gateway is single-threaded at this point (before tokio tasks spawn).
+        #[allow(unsafe_code)]
+        unsafe {
+            if let Some(ref crew_home) = self.crew_home {
+                std::env::set_var("CREW_HOME", crew_home);
+            }
+            if let Some(ref pid) = profile_id {
+                std::env::set_var("CREW_PROFILE_ID", pid);
+            }
+        }
 
         // Spawn periodic metrics exporter (writes provider_metrics.json every 30s)
         if llm.export_metrics().is_some() {
@@ -400,6 +458,29 @@ impl GatewayCommand {
             data_dir.clone(),
         ));
 
+        // Deep research pipeline (parallel multi-angle search + map-reduce synthesis)
+        tools.register(crew_agent::DeepResearchTool::new(
+            llm.clone(),
+            cwd.clone(),
+            data_dir.clone(),
+            plugin_dirs.clone(),
+        ));
+
+        // Pipeline tool (DOT-based multi-step workflows)
+        let mut pipeline_tool = crew_pipeline::RunPipelineTool::new(
+            llm.clone(),
+            memory.clone(),
+            cwd.clone(),
+            data_dir.clone(),
+        )
+        .with_provider_policy(tools.provider_policy().cloned())
+        .with_plugin_dirs(plugin_dirs.clone());
+        if let Some(ref router) = provider_router {
+            pipeline_tool = pipeline_tool.with_provider_router(router.clone());
+        }
+        let pipeline_tool = Arc::new(pipeline_tool);
+        tools.register_arc(pipeline_tool.clone() as Arc<dyn crew_agent::Tool>);
+
         // Memory bank tools (recall/save entity pages)
         tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
@@ -442,6 +523,14 @@ impl GatewayCommand {
 
         if !config.hooks.is_empty() {
             agent = agent.with_hooks(Arc::new(HookExecutor::new(config.hooks.clone())));
+        }
+
+        // Set hook context with profile_id (session_id updated per message)
+        if profile_id.is_some() || !config.hooks.is_empty() {
+            agent = agent.with_hook_context(crew_agent::HookContext {
+                session_id: None,
+                profile_id: profile_id.clone(),
+            });
         }
 
         if let Some(embedder) = create_embedder(&config) {
@@ -896,12 +985,7 @@ impl GatewayCommand {
 
             // Handle /new command inline — clear current session history
             if inbound.content.trim() == "/new" {
-                match session_mgr
-                    .lock()
-                    .await
-                    .clear(&session_key)
-                    .await
-                {
+                match session_mgr.lock().await.clear(&session_key).await {
                     Ok(()) => {
                         let msg = OutboundMessage {
                             channel: reply_channel.clone(),
@@ -942,6 +1026,30 @@ impl GatewayCommand {
                 continue;
             }
 
+            // Handle /account command inline — sub-account management
+            if inbound.content.trim() == "/account"
+                || inbound.content.trim().starts_with("/account ")
+            {
+                let args = inbound
+                    .content
+                    .trim()
+                    .strip_prefix("/account")
+                    .unwrap_or("")
+                    .trim();
+                let response =
+                    handle_account_command(args, profile_id.as_deref(), &profile_store).await;
+                let msg = OutboundMessage {
+                    channel: reply_channel.clone(),
+                    chat_id: reply_chat_id.clone(),
+                    content: response,
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                };
+                let _ = agent_handle.send_outbound(msg).await;
+                continue;
+            }
+
             info!(
                 channel = %inbound.channel,
                 sender = %inbound.sender_id,
@@ -959,6 +1067,7 @@ impl GatewayCommand {
             // let take_photo_tool = take_photo_tool.clone();
             let spawn_tool = spawn_tool.clone();
             let cron_tool = cron_tool.clone();
+            let pipeline_tool = pipeline_tool.clone();
             let llm_for_compaction = llm_for_compaction.clone();
             let out_tx = agent_handle.outbound_sender();
             let max_history = max_history.clone();
@@ -1000,6 +1109,7 @@ impl GatewayCommand {
                     // &take_photo_tool,
                     &spawn_tool,
                     &cron_tool,
+                    &pipeline_tool,
                     &llm_for_compaction,
                     &out_tx,
                     &inbound,
@@ -1066,6 +1176,7 @@ async fn process_session_message(
     // take_photo_tool: &TakePhotoTool,
     spawn_tool: &SpawnTool,
     cron_tool: &CronTool,
+    pipeline_tool: &crew_pipeline::RunPipelineTool,
     llm: &Arc<dyn LlmProvider>,
     out_tx: &tokio::sync::mpsc::Sender<OutboundMessage>,
     inbound: &crew_core::InboundMessage,
@@ -1097,12 +1208,22 @@ async fn process_session_message(
 
     // Start dynamic status indicator (typing + rotating status message + token counts)
     let status_handle = status_indicator.map(|si| {
+        // Set up pipeline status bridge so pipeline nodes update the status words
+        let bridge = crew_pipeline::PipelineStatusBridge::new(
+            si.status_words_handle(),
+            Arc::clone(&token_tracker),
+        );
+        pipeline_tool.set_status_bridge(bridge);
+
         si.start(
             reply_chat_id.to_string(),
             &inbound.content,
             Arc::clone(&token_tracker),
         )
     });
+
+    // Update hook context with current session ID
+    agent.set_session_id(&session_key.to_string());
 
     // Process message through agent (potentially long LLM call, no lock held)
     let response = agent
@@ -1231,38 +1352,42 @@ async fn build_system_prompt(
         \n\nWhen the user asks you to research, investigate, search, or look into a topic, \
         FIRST confirm which approach:\
         \n\n1. 🔍 Quick search — fast web lookup (`web_search`)\
-        \n2. 📚 Deep search — comprehensive multi-source report, 5-10 min (`deep_search`)\
+        \n2. 📚 Deep research — comprehensive multi-angle parallel search + synthesis, 5-15 min (`deep_research`)\
         \n3. 🌐 Deep crawl — crawl a specific website URL in depth (`deep_crawl`)\
         \n\nMatch the user's language (Chinese question → Chinese options).\
         \n\nSKIP confirmation and act directly ONLY when:\
-        \n- User explicitly names the method: \"深度调查/深度研究/深度搜索\" → deep_search, \"爬取这个网站\" → deep_crawl\
+        \n- User explicitly names the method: \"深度调查/深度研究/深度搜索\" → deep_research, \"爬取这个网站\" → deep_crawl\
         \n- User replies with a choice (1/2/3) → execute immediately\
         \n\nFor ALL other search/lookup requests (including \"查一下\", \"搜一下\", \"帮我查\", \"search for\"), \
         ALWAYS ask the user to pick 1/2/3 first. Do NOT assume web_search is enough.\
         \n\nAfter choosing, you MUST actually call the tool. NEVER just reply with text like \
         \"I'm starting research\" — invoke the tool.\
-        \n\nWhen a query covers multiple independent subjects, call `deep_search` in parallel \
-        (one call per subject) rather than combining everything into a single query. \
-        This produces better coverage and more thorough results.\
-        \n\nAfter `deep_search` completes, ALWAYS use `synthesize_research` to analyze the saved \
-        source files in depth. Pass the research directory path (shown in deep_search output) and \
-        the original query. This reads ALL full-content source files and produces a comprehensive, \
-        data-rich synthesis — much more thorough than the truncated previews. Only fall back to \
-        `read_file` if you need to check one specific source.\
+        \n\n`deep_research` is the preferred tool for comprehensive research. It automatically:\
+        \n- Generates 4 search angles from the query\
+        \n- Runs parallel deep_search processes (one per angle)\
+        \n- Deduplicates sources across all angles\
+        \n- Extracts findings via map-reduce (parallel per batch)\
+        \n- Synthesizes a final comprehensive report with citations\
+        \n- Saves the report to disk\
+        \n\nFor simpler single-angle searches, use `deep_search` + `synthesize_research` manually.\
         \n\n## Grounding Rules\
         \n\nFor real-time data (weather, time, location, stock prices, sports scores, exchange rates, \
         news, current events, flight status, package tracking), ALWAYS use `web_search` or `web_fetch`. \
         NEVER fabricate or guess real-time information — if you cannot fetch it, say so.\
+        \n\n## Pipelines\
+        \n\nFor complex multi-step workflows, use `run_pipeline` instead of manual tool chaining.\
+        \n- `deep_research`: comprehensive research workflow (search → analyze → synthesize)\
+        \n- Custom pipelines from .crew/pipelines/*.dot\
+        \n\nPipelines run specialized agents at each step with their own prompts and models.\
         \n\n## Other Rules\
         \n\nOnly use the `message` tool to send an early heads-up when you need to run slow tools \
-        (deep_search, deep_crawl, spawn, take_photo) — NOT for simple questions. \
+        (deep_research, deep_search, deep_crawl, spawn, run_pipeline, take_photo) — NOT for simple questions. \
         Save important user preferences with `save_memory`.";
     let mut prompt = base.unwrap_or(default_prompt).to_string();
 
     // Inject current date so the model knows "今年" = which year
     let today = chrono::Local::now().format("%Y-%m-%d");
     prompt.push_str(&format!("\n\nCurrent date: {today}"));
-
 
     // Inject dynamically generated persona (from persona.md) if available
     if let Some(persona) = PersonaService::read_persona(data_dir) {
@@ -1372,4 +1497,104 @@ fn merge_queued_by_session(
             Some(base)
         })
         .collect()
+}
+
+// ── /account command handler ─────────────────────────────────────────
+
+async fn handle_account_command(
+    args: &str,
+    parent_profile_id: Option<&str>,
+    profile_store: &Option<Arc<crate::profiles::ProfileStore>>,
+) -> String {
+    let parent_id = match parent_profile_id {
+        Some(id) => id,
+        None => return "Account management requires a profile-based gateway.".to_string(),
+    };
+
+    let store = match profile_store {
+        Some(s) => s,
+        None => {
+            return "Account management is not available (no crew-home configured).".to_string();
+        }
+    };
+
+    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+    match parts.first().copied().unwrap_or("list") {
+        "" | "list" => match store.list_sub_accounts(parent_id) {
+            Ok(subs) if subs.is_empty() => {
+                format!("No sub-accounts.\nCreate one with: /account create <name>")
+            }
+            Ok(subs) => {
+                let mut lines = vec!["Sub-accounts:".to_string()];
+                for s in &subs {
+                    let status = if s.enabled { "enabled" } else { "disabled" };
+                    let ch_types: Vec<&str> = s
+                        .config
+                        .channels
+                        .iter()
+                        .map(|c| match c {
+                            crate::profiles::ChannelCredentials::Telegram { .. } => "telegram",
+                            crate::profiles::ChannelCredentials::Discord { .. } => "discord",
+                            crate::profiles::ChannelCredentials::Slack { .. } => "slack",
+                            crate::profiles::ChannelCredentials::WhatsApp { .. } => "whatsapp",
+                            crate::profiles::ChannelCredentials::Feishu { .. } => "feishu",
+                            crate::profiles::ChannelCredentials::Email { .. } => "email",
+                        })
+                        .collect();
+                    lines.push(format!(
+                        "  {} — {} ({}) [{}]",
+                        s.id,
+                        s.name,
+                        status,
+                        ch_types.join(", ")
+                    ));
+                }
+                lines.join("\n")
+            }
+            Err(e) => format!("Error: {e}"),
+        },
+
+        "create" => {
+            let name = parts.get(1).copied().unwrap_or("").trim();
+            if name.is_empty() {
+                return "Usage: /account create <name>".to_string();
+            }
+            match store.create_sub_account(
+                parent_id,
+                name,
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            ) {
+                Ok(sub) => format!(
+                    "Created sub-account: {}\nAdd channels via dashboard or CLI:\n  crew account create --profile {} {} --telegram-token <token>",
+                    sub.id, parent_id, name
+                ),
+                Err(e) => format!("Error: {e}"),
+            }
+        }
+
+        "delete" => {
+            let sub_id = parts.get(1).copied().unwrap_or("").trim();
+            if sub_id.is_empty() {
+                return "Usage: /account delete <sub-id>".to_string();
+            }
+            // Safety: verify it's a sub-account of this parent
+            match store.get(sub_id) {
+                Ok(Some(sub)) if sub.parent_id.as_deref() == Some(parent_id) => {
+                    match store.delete(sub_id) {
+                        Ok(true) => format!("Deleted sub-account: {sub_id}"),
+                        Ok(false) => format!("Sub-account '{sub_id}' not found"),
+                        Err(e) => format!("Error: {e}"),
+                    }
+                }
+                Ok(Some(_)) => format!("'{sub_id}' is not a sub-account of this profile."),
+                Ok(None) => format!("Sub-account '{sub_id}' not found."),
+                Err(e) => format!("Error: {e}"),
+            }
+        }
+
+        other => format!(
+            "Unknown sub-command: {other}\nUsage: /account [list|create|delete]\n  /account list — list sub-accounts\n  /account create <name> — create sub-account\n  /account delete <sub-id> — delete sub-account"
+        ),
+    }
 }

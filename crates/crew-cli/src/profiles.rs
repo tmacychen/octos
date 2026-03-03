@@ -26,6 +26,11 @@ pub struct UserProfile {
     /// Data directory override. Default: `~/.crew/profiles/{id}/data`
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// If set, this profile is a sub-account of the given parent profile.
+    /// Sub-accounts inherit LLM provider config (provider, model, base_url,
+    /// api_key_env, fallback_models, env_vars) from their parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     /// Inline configuration.
     pub config: ProfileConfig,
     /// When this profile was created.
@@ -68,6 +73,9 @@ pub struct ProfileConfig {
     /// Keys are env var names, values are the actual secrets.
     #[serde(default)]
     pub env_vars: HashMap<String, String>,
+    /// Lifecycle hooks for agent events (per-profile).
+    #[serde(default)]
+    pub hooks: Vec<crew_agent::HookConfig>,
 }
 
 /// Email sending tool configuration for a profile.
@@ -357,6 +365,120 @@ impl ProfileStore {
     pub(crate) fn profile_path(&self, id: &str) -> PathBuf {
         self.profiles_dir.join(format!("{id}.json"))
     }
+
+    /// Return the parent directory of the profiles dir (i.e. the crew home dir).
+    pub fn crew_home_dir(&self) -> &Path {
+        self.profiles_dir.parent().unwrap_or(&self.profiles_dir)
+    }
+
+    /// List sub-accounts for a given parent profile.
+    pub fn list_sub_accounts(&self, parent_id: &str) -> Result<Vec<UserProfile>> {
+        let all = self.list()?;
+        Ok(all
+            .into_iter()
+            .filter(|p| p.parent_id.as_deref() == Some(parent_id))
+            .collect())
+    }
+
+    /// Create a sub-account under a parent profile.
+    ///
+    /// The sub-account inherits LLM provider config from the parent at runtime.
+    /// It has its own channels, gateway settings, and data directory.
+    pub fn create_sub_account(
+        &self,
+        parent_id: &str,
+        sub_name: &str,
+        channels: Vec<ChannelCredentials>,
+        gateway: GatewaySettings,
+    ) -> Result<UserProfile> {
+        // Verify parent exists
+        let _parent = self
+            .get(parent_id)?
+            .ok_or_else(|| eyre::eyre!("parent profile '{parent_id}' not found"))?;
+
+        let sub_id = format!("{parent_id}--{}", slugify(sub_name));
+        validate_profile_id(&sub_id)?;
+
+        if self.get(&sub_id)?.is_some() {
+            bail!("sub-account '{sub_id}' already exists");
+        }
+
+        let now = Utc::now();
+        let profile = UserProfile {
+            id: sub_id,
+            name: sub_name.to_string(),
+            enabled: false,
+            data_dir: None,
+            parent_id: Some(parent_id.to_string()),
+            config: ProfileConfig {
+                // LLM fields left empty — inherited at runtime from parent
+                provider: None,
+                model: None,
+                base_url: None,
+                api_key_env: None,
+                fallback_models: vec![],
+                // Sub-account's own settings
+                channels,
+                gateway,
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.save(&profile)?;
+        Ok(profile)
+    }
+}
+
+/// Resolve the effective config for a profile. If it's a sub-account,
+/// LLM provider fields are inherited from the parent.
+pub fn resolve_effective_profile(
+    store: &ProfileStore,
+    profile: &UserProfile,
+) -> Result<UserProfile> {
+    let parent_id = match &profile.parent_id {
+        Some(id) => id,
+        None => return Ok(profile.clone()),
+    };
+
+    let parent = store
+        .get(parent_id)?
+        .ok_or_else(|| eyre::eyre!("parent profile '{parent_id}' not found"))?;
+
+    let mut effective = profile.clone();
+    let pc = &parent.config;
+    let ec = &mut effective.config;
+
+    // Inherit LLM provider config from parent
+    ec.provider = pc.provider.clone();
+    ec.model = pc.model.clone();
+    ec.base_url = pc.base_url.clone();
+    ec.api_key_env = pc.api_key_env.clone();
+    ec.api_type = pc.api_type.clone();
+    ec.fallback_models = pc.fallback_models.clone();
+
+    // Inherit email config if sub-account doesn't have its own
+    if ec.email.is_none() {
+        ec.email = pc.email.clone();
+    }
+
+    // Merge env_vars: parent as base, sub-account overrides win
+    let mut merged_env = pc.env_vars.clone();
+    merged_env.extend(ec.env_vars.clone());
+    ec.env_vars = merged_env;
+
+    Ok(effective)
+}
+
+/// Convert a name to a slug (lowercase, non-alphanumeric chars replaced with hyphens).
+fn slugify(s: &str) -> String {
+    let slug: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    slug.trim_matches('-').to_string()
 }
 
 /// Return a copy of the profile with secret values in `env_vars` masked.
@@ -472,7 +594,7 @@ pub(crate) fn config_from_profile(
         tool_policy: None,
         tool_policy_by_provider: Default::default(),
         embedding: None,
-        hooks: vec![],
+        hooks: profile.config.hooks.clone(),
         context_filter: vec![],
         sub_providers: vec![],
         email: profile
@@ -494,6 +616,8 @@ pub(crate) fn config_from_profile(
         adaptive_routing: None,
         #[cfg(feature = "api")]
         dashboard_auth: None,
+        #[cfg(feature = "admin-bot")]
+        admin_bot: None,
     }
 }
 
@@ -606,6 +730,11 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     let oc = &old.config;
     let nc = &new.config;
 
+    // Restart-required: parent_id change
+    if old.parent_id != new.parent_id {
+        restart_fields.push("parent_id".into());
+    }
+
     // Restart-required fields
     if oc.provider != nc.provider {
         restart_fields.push("provider".into());
@@ -630,6 +759,9 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     }
     if oc.email != nc.email {
         restart_fields.push("email".into());
+    }
+    if oc.hooks != nc.hooks {
+        restart_fields.push("hooks".into());
     }
 
     if !restart_fields.is_empty() {
@@ -691,6 +823,7 @@ mod tests {
             name: "Test Bot".into(),
             enabled: true,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig {
                 provider: Some("anthropic".into()),
                 model: Some("claude-sonnet-4-20250514".into()),
@@ -729,6 +862,7 @@ mod tests {
             name: "Config Gen".into(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 model: Some("gpt-4o".into()),
@@ -769,6 +903,7 @@ mod tests {
             name: "Moonshot".into(),
             enabled: true,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig {
                 provider: Some("moonshot".into()),
                 model: Some("kimi-k2.5".into()),
@@ -792,6 +927,7 @@ mod tests {
             name: "WA Test".into(),
             enabled: true,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig {
                 provider: Some("anthropic".into()),
                 model: Some("claude-sonnet-4-20250514".into()),
@@ -825,6 +961,7 @@ mod tests {
             name: "Alice".into(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -852,6 +989,7 @@ mod tests {
             name: "Test".into(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig {
                 env_vars: [
                     ("API_KEY".into(), "sk-1234567890abcdef".into()),
@@ -878,6 +1016,7 @@ mod tests {
             name: "Perms".into(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -903,6 +1042,7 @@ mod tests {
             name: "Merge".into(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig {
                 env_vars: [
                     ("API_KEY".into(), "sk-real-secret-key".into()),
@@ -922,6 +1062,7 @@ mod tests {
             name: "Merge".into(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig {
                 env_vars: [
                     ("API_KEY".into(), "sk-r***key".into()), // masked — should keep original
@@ -949,6 +1090,7 @@ mod tests {
             name: "Diff".into(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 model: Some("gpt-4o".into()),
@@ -976,6 +1118,7 @@ mod tests {
             name: "Diff".into(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 gateway: GatewaySettings {
@@ -1004,6 +1147,7 @@ mod tests {
             name: "Diff".into(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: ProfileConfig::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1017,6 +1161,180 @@ mod tests {
             diff_profiles(&base, &changed),
             ProfileChange::Unchanged
         ));
+    }
+
+    #[test]
+    fn test_create_sub_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        // Create parent with LLM config
+        let parent = UserProfile {
+            id: "parent".into(),
+            name: "Parent Bot".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                provider: Some("openai".into()),
+                model: Some("gpt-4o".into()),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                env_vars: [("OPENAI_API_KEY".into(), "sk-test-key".into())].into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&parent).unwrap();
+
+        // Create sub-account
+        let sub = store
+            .create_sub_account(
+                "parent",
+                "work bot",
+                vec![ChannelCredentials::Telegram {
+                    token_env: "WORK_TG_TOKEN".into(),
+                    allowed_senders: String::new(),
+                }],
+                GatewaySettings::default(),
+            )
+            .unwrap();
+
+        assert_eq!(sub.id, "parent--work-bot");
+        assert_eq!(sub.parent_id, Some("parent".into()));
+        assert!(sub.config.provider.is_none()); // Not set — inherited at runtime
+        assert_eq!(sub.config.channels.len(), 1);
+
+        // List sub-accounts
+        let subs = store.list_sub_accounts("parent").unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id, "parent--work-bot");
+
+        // No sub-accounts for non-existent parent
+        let empty = store.list_sub_accounts("nonexistent").unwrap();
+        assert!(empty.is_empty());
+
+        // Duplicate should fail
+        assert!(
+            store
+                .create_sub_account("parent", "work bot", vec![], GatewaySettings::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_resolve_effective_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        // Create parent
+        let parent = UserProfile {
+            id: "parent".into(),
+            name: "Parent".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                provider: Some("openai".into()),
+                model: Some("gpt-4o".into()),
+                base_url: Some("https://custom.api.com/v1".into()),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                env_vars: [
+                    ("OPENAI_API_KEY".into(), "sk-parent-key".into()),
+                    ("SHARED_VAR".into(), "parent-value".into()),
+                ]
+                .into(),
+                fallback_models: vec![FallbackModelConfig {
+                    provider: "anthropic".into(),
+                    model: Some("claude-sonnet-4-20250514".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&parent).unwrap();
+
+        // Create sub-account with own channel and env var
+        let sub = UserProfile {
+            id: "parent--work".into(),
+            name: "Work".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: Some("parent".into()),
+            config: ProfileConfig {
+                channels: vec![ChannelCredentials::Telegram {
+                    token_env: "WORK_TG".into(),
+                    allowed_senders: String::new(),
+                }],
+                env_vars: [
+                    ("WORK_TG".into(), "work-token".into()),
+                    ("SHARED_VAR".into(), "sub-override".into()), // overrides parent
+                ]
+                .into(),
+                gateway: GatewaySettings {
+                    system_prompt: Some("You are a work assistant.".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&sub).unwrap();
+
+        let effective = resolve_effective_profile(&store, &sub).unwrap();
+
+        // Inherited from parent
+        assert_eq!(effective.config.provider.as_deref(), Some("openai"));
+        assert_eq!(effective.config.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            effective.config.base_url.as_deref(),
+            Some("https://custom.api.com/v1")
+        );
+        assert_eq!(effective.config.fallback_models.len(), 1);
+
+        // Sub-account's own settings preserved
+        assert_eq!(effective.config.channels.len(), 1);
+        assert_eq!(
+            effective.config.gateway.system_prompt.as_deref(),
+            Some("You are a work assistant.")
+        );
+
+        // Env vars merged: parent base + sub overrides
+        assert_eq!(effective.config.env_vars["OPENAI_API_KEY"], "sk-parent-key");
+        assert_eq!(effective.config.env_vars["WORK_TG"], "work-token");
+        assert_eq!(effective.config.env_vars["SHARED_VAR"], "sub-override"); // sub wins
+
+        // Top-level profile returns as-is
+        let effective_parent = resolve_effective_profile(&store, &parent).unwrap();
+        assert_eq!(effective_parent.id, "parent");
+        assert_eq!(effective_parent.config.provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn test_diff_profiles_parent_id_change() {
+        let base = UserProfile {
+            id: "sub".into(),
+            name: "Sub".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: Some("parent-a".into()),
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut changed = base.clone();
+        changed.parent_id = Some("parent-b".into());
+
+        match diff_profiles(&base, &changed) {
+            ProfileChange::RestartRequired(fields) => {
+                assert!(fields.contains(&"parent_id".into()));
+            }
+            other => panic!("expected RestartRequired, got {:?}", other),
+        }
     }
 
     #[test]

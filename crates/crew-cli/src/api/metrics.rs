@@ -35,3 +35,40 @@ pub fn record_llm_tokens(direction: &str, count: u32) {
     counter!("crew_llm_tokens_total", "direction" => direction.to_string())
         .increment(u64::from(count));
 }
+
+/// Decorator that records Prometheus metrics for progress events,
+/// then delegates to an inner reporter.
+pub struct MetricsReporter {
+    inner: Arc<dyn crew_agent::ProgressReporter>,
+}
+
+impl MetricsReporter {
+    pub fn new(inner: Arc<dyn crew_agent::ProgressReporter>) -> Self {
+        Self { inner }
+    }
+}
+
+impl crew_agent::ProgressReporter for MetricsReporter {
+    fn report(&self, event: crew_agent::ProgressEvent) {
+        match &event {
+            crew_agent::ProgressEvent::ToolCompleted {
+                name,
+                success,
+                duration,
+                ..
+            } => {
+                record_tool_call(name, *success, duration.as_secs_f64());
+            }
+            crew_agent::ProgressEvent::CostUpdate {
+                session_input_tokens,
+                session_output_tokens,
+                ..
+            } => {
+                record_llm_tokens("input", *session_input_tokens);
+                record_llm_tokens("output", *session_output_tokens);
+            }
+            _ => {}
+        }
+        self.inner.report(event);
+    }
+}

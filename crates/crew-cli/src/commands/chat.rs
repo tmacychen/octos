@@ -191,19 +191,6 @@ impl ChatCommand {
             spawn_tx,
         ));
 
-        // Register deep research tool with background notification channel
-        let (research_tx, mut research_rx) =
-            tokio::sync::mpsc::channel::<crew_agent::ResearchNotification>(8);
-        tools.register(
-            crew_agent::DeepResearchTool::new(
-                llm.clone(),
-                memory.clone(),
-                data_dir.clone(),
-                research_tx,
-            )
-            .with_config(tool_config.clone()),
-        );
-
         // Register research synthesis tool (map-reduce over deep_search source files)
         tools.register(crew_agent::SynthesizeResearchTool::new(
             llm.clone(),
@@ -244,6 +231,25 @@ impl ChatCommand {
                 eprintln!("Warning: plugin loading failed: {e}");
             }
         }
+
+        // Deep research pipeline (parallel multi-angle search + map-reduce synthesis)
+        tools.register(crew_agent::DeepResearchTool::new(
+            llm.clone(),
+            cwd.clone(),
+            data_dir.clone(),
+            plugin_dirs.clone(),
+        ));
+
+        // Pipeline tool (DOT-based multi-step workflows, with plugin access)
+        let pipeline_tool = crew_pipeline::RunPipelineTool::new(
+            llm.clone(),
+            memory.clone(),
+            cwd.clone(),
+            data_dir.clone(),
+        )
+        .with_provider_policy(tools.provider_policy().cloned())
+        .with_plugin_dirs(plugin_dirs);
+        tools.register(pipeline_tool);
 
         // Apply tool policy from config
         if let Some(ref policy) = config.tool_policy {
@@ -333,12 +339,7 @@ impl ChatCommand {
         // Conversation history
         let mut history: Vec<Message> = Vec::new();
 
-        // Interactive loop using tokio::select! to handle both user input
-        // and background research notifications concurrently.
-        //
-        // readline is blocking, so we run it on a blocking thread and receive
-        // the result via a oneshot channel. This lets us print notifications
-        // even while waiting for user input.
+        // Interactive loop — readline is blocking so we run it on a separate thread.
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;
@@ -353,39 +354,10 @@ impl ChatCommand {
                 rl_moved
             });
 
-            // Wait for either user input or background notification
-            let readline_result;
-            let mut line_rx = line_rx;
-            loop {
-                tokio::select! {
-                    result = &mut line_rx => {
-                        readline_result = result.unwrap_or(Err(
-                            rustyline::error::ReadlineError::Eof
-                        ));
-                        break;
-                    }
-                    Some(notif) = research_rx.recv() => {
-                        // Print notification while user is at the prompt
-                        println!();
-                        if notif.success {
-                            println!(
-                                "{} Research complete: {}",
-                                "✓".green().bold(),
-                                notif.question
-                            );
-                            println!("  Report saved to: {}", notif.report_path.display());
-                        } else {
-                            println!(
-                                "{} Research failed: {}",
-                                "✗".red().bold(),
-                                notif.summary
-                            );
-                        }
-                        println!();
-                        // Continue waiting for user input
-                    }
-                }
-            }
+            // Wait for user input
+            let readline_result = line_rx
+                .await
+                .unwrap_or(Err(rustyline::error::ReadlineError::Eof));
 
             // Recover the Editor from the blocking thread
             rl = readline_handle.await.unwrap_or_else(|_| {
@@ -425,23 +397,8 @@ impl ChatCommand {
                 continue;
             }
 
-            // Process message (may return quickly for background research)
+            // Process message
             let response = agent.process_message(input, &history, vec![]).await?;
-
-            // Drain any notifications that arrived during processing
-            while let Ok(notif) = research_rx.try_recv() {
-                println!();
-                if notif.success {
-                    println!(
-                        "{} Research complete: {}",
-                        "✓".green().bold(),
-                        notif.question
-                    );
-                    println!("  Report saved to: {}", notif.report_path.display());
-                } else {
-                    println!("{} Research failed: {}", "✗".red().bold(), notif.summary);
-                }
-            }
 
             // Append to history
             history.push(Message {

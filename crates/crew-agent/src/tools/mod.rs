@@ -223,8 +223,8 @@ pub use policy::ToolPolicy;
 pub mod ssrf;
 
 // Built-in tools
-pub mod deep_research;
-pub(crate) mod deep_search;
+pub mod deep_research_pipeline;
+pub mod deep_search;
 pub mod diff_edit;
 pub mod edit_file;
 pub mod glob_tool;
@@ -233,6 +233,7 @@ pub mod list_dir;
 pub mod message;
 pub mod read_file;
 pub mod recall_memory;
+pub mod research_utils;
 pub mod save_memory;
 pub mod send_file;
 pub mod shell;
@@ -253,7 +254,8 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
-pub use deep_research::{DeepResearchTool, ResearchNotification};
+pub use deep_research_pipeline::DeepResearchTool;
+pub use deep_search::DeepSearchTool;
 pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;

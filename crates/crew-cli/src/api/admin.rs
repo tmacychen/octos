@@ -195,6 +195,7 @@ pub async fn create_profile(
         name: req.name,
         enabled: req.enabled,
         data_dir: req.data_dir,
+        parent_id: None,
         config: req.config,
         created_at: now,
         updated_at: now,
@@ -276,6 +277,14 @@ pub async fn delete_profile(
     // Stop the gateway if running
     let _ = pm.stop(&id).await;
 
+    // Cascade: stop and delete all sub-accounts
+    if let Ok(subs) = store.list_sub_accounts(&id) {
+        for sub in &subs {
+            let _ = pm.stop(&sub.id).await;
+            let _ = store.delete(&sub.id);
+        }
+    }
+
     let deleted = store
         .delete(&id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -309,8 +318,10 @@ pub async fn start_gateway(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
 
-    // Validate LLM provider is configured
-    if profile.config.provider.is_none() && profile.config.model.is_none() {
+    // Validate LLM provider is configured (resolve inheritance for sub-accounts)
+    let effective = crate::profiles::resolve_effective_profile(store, &profile)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if effective.config.provider.is_none() && effective.config.model.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             "Cannot start: LLM provider must be configured first".into(),
@@ -854,4 +865,89 @@ pub async fn stop_all(
 
     let count = pm.stop_all().await;
     Ok(Json(BulkActionResponse { ok: true, count }))
+}
+
+// ── Sub-account endpoints ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CreateSubAccountRequest {
+    pub name: String,
+    #[serde(default)]
+    pub channels: Vec<crate::profiles::ChannelCredentials>,
+    #[serde(default)]
+    pub gateway: Option<crate::profiles::GatewaySettings>,
+    #[serde(default)]
+    pub env_vars: std::collections::HashMap<String, String>,
+}
+
+/// GET /api/admin/profiles/:id/accounts — List sub-accounts for a profile.
+pub async fn list_sub_accounts(
+    State(state): State<Arc<AppState>>,
+    Path(parent_id): Path<String>,
+) -> Result<Json<Vec<ProfileResponse>>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+
+    let subs = store
+        .list_sub_accounts(&parent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut items = Vec::with_capacity(subs.len());
+    for s in subs {
+        let status = pm.status(&s.id).await;
+        items.push(ProfileResponse {
+            profile: mask_secrets(&s),
+            status,
+        });
+    }
+    Ok(Json(items))
+}
+
+/// POST /api/admin/profiles/:id/accounts — Create a sub-account.
+pub async fn create_sub_account(
+    State(state): State<Arc<AppState>>,
+    Path(parent_id): Path<String>,
+    Json(req): Json<CreateSubAccountRequest>,
+) -> Result<(StatusCode, Json<ProfileResponse>), (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+
+    let mut sub = store
+        .create_sub_account(
+            &parent_id,
+            &req.name,
+            req.channels,
+            req.gateway.unwrap_or_default(),
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // Set channel-specific env vars if provided
+    if !req.env_vars.is_empty() {
+        sub.config.env_vars = req.env_vars;
+        sub.updated_at = Utc::now();
+        store
+            .save(&sub)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    let status = pm.status(&sub.id).await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ProfileResponse {
+            profile: mask_secrets(&sub),
+            status,
+        }),
+    ))
 }

@@ -15,28 +15,50 @@ struct Assets;
 
 /// Fallback handler: serves embedded static files, falls back to admin/index.html for SPA routing.
 /// The admin dashboard SPA handles all UI routes (login, profiles, users, etc.).
+///
+/// The React SPA uses `basename="/admin"`, so all UI paths must start with `/admin/`.
+/// Non-admin paths that don't match a real asset are redirected to `/admin/` so that
+/// React Router can handle them properly.
 pub async fn static_handler(State(_state): State<Arc<AppState>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() {
-        "admin/index.html"
-    } else {
-        path
-    };
 
-    // Try the exact path first, then under admin/ prefix (dashboard assets)
+    // Root "/" → redirect to /admin/
+    if path.is_empty() {
+        return (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(header::LOCATION, "/admin/")],
+            "",
+        )
+            .into_response();
+    }
+
+    // Serve exact embedded asset (e.g. admin/assets/index-xxx.js)
     if let Some(file) = Assets::get(path) {
         return serve_file(path, &file.data);
     }
+
+    // Try under admin/ prefix (e.g. /assets/foo.js → admin/assets/foo.js)
     let admin_path = format!("admin/{path}");
     if let Some(file) = Assets::get(&admin_path) {
         return serve_file(&admin_path, &file.data);
     }
 
-    // SPA fallback: serve admin/index.html for client-side routing
-    match Assets::get("admin/index.html") {
-        Some(file) => serve_file("admin/index.html", &file.data),
-        None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
+    // SPA fallback: only serve index.html for paths under /admin/
+    // Non-admin paths redirect to /admin/ so React Router (basename="/admin") can handle them.
+    if path.starts_with("admin") {
+        if let Some(file) = Assets::get("admin/index.html") {
+            return serve_file("admin/index.html", &file.data);
+        }
     }
+
+    // Redirect unknown paths to /admin/ (e.g. /login → /admin/login won't help since
+    // the React Router handles its own routing; just send to /admin/)
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [(header::LOCATION, "/admin/")],
+        "",
+    )
+        .into_response()
 }
 
 fn serve_file(path: &str, data: &[u8]) -> Response {

@@ -3,6 +3,7 @@
 //! Feature-gated behind `api`. Start with `crew serve [--port 8080]`.
 
 pub mod admin;
+pub mod admin_bot_api;
 pub mod auth_handlers;
 mod handlers;
 pub mod metrics;
@@ -16,6 +17,7 @@ pub use metrics::init_metrics;
 pub use router::build_router;
 pub use sse::SseBroadcaster;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::otp::AuthManager;
@@ -47,4 +49,6 @@ pub struct AppState {
     pub auth_manager: Option<Arc<AuthManager>>,
     /// Shared HTTP client for webhook proxying.
     pub http_client: reqwest::Client,
+    /// Path to the global config.json file (for admin bot config editing).
+    pub config_path: Option<PathBuf>,
 }

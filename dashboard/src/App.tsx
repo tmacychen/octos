@@ -9,6 +9,7 @@ import Dashboard from './pages/Dashboard'
 import NewProfile from './pages/NewProfile'
 import LoginPage from './pages/LoginPage'
 import UsersPage from './pages/UsersPage'
+import AdminBotPage from './pages/AdminBotPage'
 import { HomePage, LlmPage, MessagingPage, ToolsPage, SystemPage } from './pages/profile'
 
 export default function App() {
@@ -21,6 +22,7 @@ export default function App() {
             {/* Global admin pages */}
             <Route index element={<Dashboard />} />
             <Route path="users" element={<AdminGuard><UsersPage /></AdminGuard>} />
+            <Route path="admin-bot" element={<AdminGuard><AdminBotPage /></AdminGuard>} />
             <Route path="profiles/new" element={<AdminGuard><NewProfile /></AdminGuard>} />
 
             {/* Admin managing specific profile */}

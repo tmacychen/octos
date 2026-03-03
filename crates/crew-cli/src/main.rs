@@ -3,6 +3,8 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
 
+#[cfg(feature = "admin-bot")]
+pub mod admin_bot;
 #[cfg(feature = "api")]
 pub mod api;
 pub mod auth;

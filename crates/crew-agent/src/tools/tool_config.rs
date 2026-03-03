@@ -93,7 +93,6 @@ pub fn configurable_fields(tool_name: &str) -> Option<&'static [ConfigField]> {
     match tool_name {
         "news_digest" => Some(&NEWS_DIGEST_FIELDS),
         "deep_crawl" => Some(&DEEP_CRAWL_FIELDS),
-        "deep_research" => Some(&DEEP_RESEARCH_FIELDS),
         "web_search" => Some(&WEB_SEARCH_FIELDS),
         "web_fetch" => Some(&WEB_FETCH_FIELDS),
         "browser" => Some(&BROWSER_FIELDS),
@@ -105,7 +104,6 @@ pub fn configurable_fields(tool_name: &str) -> Option<&'static [ConfigField]> {
 const CONFIGURABLE_TOOLS: &[&str] = &[
     "news_digest",
     "deep_crawl",
-    "deep_research",
     "web_search",
     "web_fetch",
     "browser",
@@ -176,29 +174,6 @@ static DEEP_CRAWL_FIELDS: [ConfigField; 2] = [
             max: 200000,
         },
         default_display: "50000",
-    },
-];
-
-static DEEP_RESEARCH_FIELDS: [ConfigField; 3] = [
-    ConfigField {
-        key: "max_iterations",
-        description: "Per-agent iteration budget",
-        value_type: ConfigValueType::Integer { min: 5, max: 50 },
-        default_display: "25",
-    },
-    ConfigField {
-        key: "parallel",
-        description: "Multi-agent mode",
-        value_type: ConfigValueType::Boolean,
-        default_display: "true",
-    },
-    ConfigField {
-        key: "mode",
-        description: "Execution mode",
-        value_type: ConfigValueType::String {
-            allowed: Some(&["background", "sync"]),
-        },
-        default_display: "background",
     },
 ];
 
@@ -1098,15 +1073,6 @@ mod tests {
             .unwrap();
         assert_eq!(store.get_u64("web_search", "count").await, Some(10));
         assert_eq!(store.get_usize("web_search", "count").await, Some(10));
-
-        store
-            .set("deep_research", "parallel", Value::Bool(false))
-            .await
-            .unwrap();
-        assert_eq!(
-            store.get_bool("deep_research", "parallel").await,
-            Some(false)
-        );
     }
 
     #[tokio::test]

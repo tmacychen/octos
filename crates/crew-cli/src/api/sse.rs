@@ -23,27 +23,6 @@ impl SseBroadcaster {
 
 impl ProgressReporter for SseBroadcaster {
     fn report(&self, event: ProgressEvent) {
-        // Record Prometheus metrics for relevant events
-        match &event {
-            ProgressEvent::ToolCompleted {
-                name,
-                success,
-                duration,
-                ..
-            } => {
-                super::metrics::record_tool_call(name, *success, duration.as_secs_f64());
-            }
-            ProgressEvent::CostUpdate {
-                session_input_tokens,
-                session_output_tokens,
-                ..
-            } => {
-                super::metrics::record_llm_tokens("input", *session_input_tokens);
-                super::metrics::record_llm_tokens("output", *session_output_tokens);
-            }
-            _ => {}
-        }
-
         let json = match serde_json::to_string(&event_to_json(&event)) {
             Ok(j) => j,
             Err(_) => return,

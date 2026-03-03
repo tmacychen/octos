@@ -39,6 +39,11 @@ impl StatusIndicator {
         }
     }
 
+    /// Get a shared handle to the status words (for pipeline status bridge).
+    pub fn status_words_handle(&self) -> Arc<std::sync::RwLock<Vec<String>>> {
+        Arc::clone(&self.status_words)
+    }
+
     /// Start showing status for a chat session. Returns a handle to stop it.
     ///
     /// `message_text` is the inbound user message — used to detect language

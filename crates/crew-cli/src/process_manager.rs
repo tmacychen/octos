@@ -15,6 +15,8 @@ use eyre::{Result, bail};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+#[cfg(feature = "admin-bot")]
+use tokio::sync::mpsc;
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
 use crate::profiles::{ChannelCredentials, ProfileStore, UserProfile};
@@ -33,6 +35,9 @@ pub struct ProcessManager {
     profile_store: Arc<ProfileStore>,
     /// Path to bridge.js. If None, managed bridges are disabled.
     bridge_js_path: Option<PathBuf>,
+    /// Optional channel for sending admin alerts when gateways exit.
+    #[cfg(feature = "admin-bot")]
+    alert_tx: std::sync::Mutex<Option<mpsc::Sender<crate::admin_bot::monitor::AdminAlert>>>,
 }
 
 struct GatewayProcess {
@@ -102,7 +107,15 @@ impl ProcessManager {
             bridges: Arc::new(RwLock::new(HashMap::new())),
             profile_store,
             bridge_js_path: None,
+            #[cfg(feature = "admin-bot")]
+            alert_tx: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Set the alert sender for admin bot notifications.
+    #[cfg(feature = "admin-bot")]
+    pub fn set_alert_sender(&self, tx: mpsc::Sender<crate::admin_bot::monitor::AdminAlert>) {
+        *self.alert_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
     /// Set the path to bridge.js for managed WhatsApp bridges.
@@ -176,6 +189,31 @@ impl ProcessManager {
             cmd.arg("--feishu-port").arg(port.to_string());
         }
 
+        // Pass crew home dir so gateway can open ProfileStore for /account commands
+        cmd.arg("--crew-home")
+            .arg(self.profile_store.crew_home_dir());
+
+        // Sub-account: pass parent profile path and merge parent env vars
+        if let Some(ref parent_id) = profile.parent_id {
+            let parent_path = self.profile_store.profile_path(parent_id);
+            cmd.arg("--parent-profile").arg(&parent_path);
+
+            // Merge parent env_vars (API keys) into child process
+            if let Ok(Some(parent)) = self.profile_store.get(parent_id) {
+                for (key, value) in &parent.config.env_vars {
+                    // Sub-account's own env_vars take priority
+                    if !profile.config.env_vars.contains_key(key) {
+                        if !BLOCKED_ENV_VARS
+                            .iter()
+                            .any(|blocked| key.eq_ignore_ascii_case(blocked))
+                        {
+                            cmd.env(key, value);
+                        }
+                    }
+                }
+            }
+        }
+
         // Pass env vars from profile config, filtering out dangerous ones.
         for (key, value) in &profile.config.env_vars {
             if BLOCKED_ENV_VARS
@@ -237,15 +275,36 @@ impl ProcessManager {
         // Spawn task to wait for process exit or stop signal.
         let profile_id = profile.id.clone();
         let processes = Arc::clone(&self.processes);
+        #[cfg(feature = "admin-bot")]
+        let alert_tx = self
+            .alert_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         tokio::spawn(async move {
             let mut stop_rx = stop_rx;
             tokio::select! {
                 status = child.wait() => {
                     processes.write().await.remove(&profile_id);
-                    match status {
-                        Ok(s) => tracing::info!(profile = %profile_id, exit = %s, "gateway exited"),
-                        Err(e) => tracing::error!(profile = %profile_id, error = %e, "gateway error"),
+                    let exit_code = match &status {
+                        Ok(s) => {
+                            tracing::info!(profile = %profile_id, exit = %s, "gateway exited");
+                            s.code()
+                        }
+                        Err(e) => {
+                            tracing::error!(profile = %profile_id, error = %e, "gateway error");
+                            None
+                        }
+                    };
+                    #[cfg(feature = "admin-bot")]
+                    if let Some(ref tx) = alert_tx {
+                        let _ = tx.try_send(crate::admin_bot::monitor::AdminAlert::GatewayExited {
+                            profile_id: profile_id.clone(),
+                            exit_code,
+                            timestamp: Utc::now(),
+                        });
                     }
+                    let _ = exit_code; // suppress unused warning without admin-bot
                 }
                 _ = stop_rx.changed() => {
                     let _ = child.kill().await;

@@ -95,6 +95,7 @@ pub async fn create_user(
             name: user.name.clone(),
             enabled: false,
             data_dir: None,
+            parent_id: None,
             config: crate::profiles::ProfileConfig::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

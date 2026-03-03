@@ -333,7 +333,11 @@ impl AdaptiveRouter {
                 metrics: s.metrics.snapshot(),
             })
             .collect();
-        providers.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        providers.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         SharedMetrics {
             updated_at: chrono::Utc::now().to_rfc3339(),

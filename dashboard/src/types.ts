@@ -191,3 +191,21 @@ export interface SharedMetrics {
   policy: SharedPolicy
   providers: SharedProviderMetrics[]
 }
+
+// ── Admin Bot Config ─────────────────────────────────────────────────
+
+export interface AdminBotConfig {
+  telegram_token_env?: string | null
+  feishu_app_id_env?: string | null
+  feishu_app_secret_env?: string | null
+  admin_chat_ids: number[]
+  admin_feishu_ids: string[]
+  provider?: string | null
+  model?: string | null
+  base_url?: string | null
+  api_key_env?: string | null
+  alerts_enabled: boolean
+  watchdog_enabled: boolean
+  health_check_interval_secs: number
+  max_restart_attempts: number
+}

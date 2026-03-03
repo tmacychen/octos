@@ -148,9 +148,17 @@ async fn main() {
         _ => Duration::from_secs(300),
     };
 
-    let result = tokio::time::timeout(timeout, run_deep_search(
-        &client, &input.query, max_results, depth, input.search_engine.as_deref(),
-    )).await;
+    let result = tokio::time::timeout(
+        timeout,
+        run_deep_search(
+            &client,
+            &input.query,
+            max_results,
+            depth,
+            input.search_engine.as_deref(),
+        ),
+    )
+    .await;
 
     match result {
         Ok(output) => print_output(&output),
@@ -202,7 +210,10 @@ async fn run_deep_search(
 
     let r1 = web_search(client, query, max_results, engine).await;
     if !r1.success {
-        return Output { output: r1.output, success: false };
+        return Output {
+            output: r1.output,
+            success: false,
+        };
     }
 
     all_search_output.push_str(&r1.output);
@@ -223,7 +234,11 @@ async fn run_deep_search(
         let follow_ups = generate_follow_up_queries(query, &r1.output, depth);
         let rounds_left = max_rounds - 1;
 
-        for (i, fq) in follow_ups.into_iter().take(rounds_left as usize).enumerate() {
+        for (i, fq) in follow_ups
+            .into_iter()
+            .take(rounds_left as usize)
+            .enumerate()
+        {
             let round = i + 2;
             progress(round, max_rounds as usize, &format!("Searching: \"{fq}\""));
             search_queries.push(fq.clone());
@@ -266,6 +281,9 @@ async fn run_deep_search(
     // -----------------------------------------------------------------------
     // Reference chasing (depth >= 2)
     // -----------------------------------------------------------------------
+    let mut all_crawled_pages: Vec<&CrawledPage> = crawled_pages.iter().collect();
+    let mut chased_pages: Vec<CrawledPage> = Vec::new();
+
     if depth >= 2 {
         let mut link_counts: HashMap<String, u32> = HashMap::new();
         for page in &crawled_pages {
@@ -284,17 +302,108 @@ async fn run_deep_search(
         };
         let mut ranked: Vec<(String, u32)> = link_counts.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1));
-        let chase_urls: Vec<String> = ranked.into_iter()
+        let chase_urls: Vec<String> = ranked
+            .into_iter()
             .take(chase_limit)
             .filter(|(_, count)| *count >= 2) // Only chase links referenced by 2+ pages
             .map(|(url, _)| url)
             .collect();
 
         if !chase_urls.is_empty() {
-            progress_simple(&format!("Chasing {} most-referenced sources...", chase_urls.len()));
-            let chased = fetch_pages_parallel(client, &chase_urls, 20_000).await;
+            progress_simple(&format!(
+                "Chasing {} most-referenced sources...",
+                chase_urls.len()
+            ));
+            // Mark chased URLs as seen
+            for url in &chase_urls {
+                seen_urls.insert(normalize_url(url));
+            }
+            chased_pages = fetch_pages_parallel(client, &chase_urls, 20_000).await;
             let offset = saved_files.len();
-            for (i, page) in chased.iter().enumerate() {
+            for (i, page) in chased_pages.iter().enumerate() {
+                let filename = format!("{:02}_{}.md", offset + i + 1, host_slug(&page.url));
+                let page_content = format!("---\nurl: {}\n---\n\n{}", page.url, page.content);
+                let _ = fs::write(dir.join(&filename), &page_content);
+                let preview = truncate_utf8(&page.content, 2000, "\n... (truncated)");
+                saved_files.push((filename, page.url.clone(), preview));
+            }
+        }
+    }
+
+    // Combine all crawled pages for site crawl link extraction
+    all_crawled_pages.extend(chased_pages.iter());
+
+    // -----------------------------------------------------------------------
+    // Site crawl: follow internal links on high-value domains (depth >= 2)
+    // -----------------------------------------------------------------------
+    if depth >= 2 {
+        let mut domain_links: HashMap<String, Vec<String>> = HashMap::new();
+
+        for page in &all_crawled_pages {
+            let internal = same_origin_links(&page.url, &page.outbound_links, &seen_urls);
+            if internal.is_empty() {
+                continue;
+            }
+            let origin = url::Url::parse(&page.url)
+                .ok()
+                .map(|u| u.origin().ascii_serialization())
+                .unwrap_or_default();
+            if !origin.is_empty() {
+                domain_links.entry(origin).or_default().extend(internal);
+            }
+        }
+
+        // Deduplicate links within each domain
+        for links in domain_links.values_mut() {
+            let mut dedup_set = HashSet::new();
+            links.retain(|l| {
+                let norm = normalize_url(l);
+                dedup_set.insert(norm)
+            });
+        }
+
+        // Rank domains by internal link count, pick top N
+        let crawl_domains: usize = match depth {
+            2 => 3,
+            _ => 5,
+        };
+        let pages_per_domain: usize = match depth {
+            2 => 3,
+            _ => 5,
+        };
+
+        let mut ranked_domains: Vec<(String, Vec<String>)> = domain_links.into_iter().collect();
+        ranked_domains.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+        let to_crawl: Vec<String> = ranked_domains
+            .into_iter()
+            .take(crawl_domains)
+            .flat_map(|(domain, links)| {
+                let take = links.len().min(pages_per_domain);
+                progress_simple(&format!(
+                    "Site crawl: {} ({} internal links, fetching {})",
+                    domain,
+                    links.len(),
+                    take
+                ));
+                links.into_iter().take(pages_per_domain)
+            })
+            .collect();
+
+        if !to_crawl.is_empty() {
+            progress_simple(&format!(
+                "Site crawl: fetching {} additional pages from top domains...",
+                to_crawl.len()
+            ));
+
+            // Mark as seen
+            for url in &to_crawl {
+                seen_urls.insert(normalize_url(url));
+            }
+
+            let site_pages = fetch_pages_parallel(client, &to_crawl, 20_000).await;
+            let offset = saved_files.len();
+            for (i, page) in site_pages.iter().enumerate() {
                 let filename = format!("{:02}_{}.md", offset + i + 1, host_slug(&page.url));
                 let page_content = format!("---\nurl: {}\n---\n\n{}", page.url, page.content);
                 let _ = fs::write(dir.join(&filename), &page_content);
@@ -318,10 +427,17 @@ async fn run_deep_search(
     report.push_str("\n\n");
 
     // Source details with inline previews
-    report.push_str(&format!("## Sources ({} pages crawled)\n\n", saved_files.len()));
+    report.push_str(&format!(
+        "## Sources ({} pages crawled)\n\n",
+        saved_files.len()
+    ));
     for (i, (filename, url, preview)) in saved_files.iter().enumerate() {
         report.push_str(&format!("### Source [{}]: {}\n", i + 1, url));
-        report.push_str(&format!("_Full content: {}/{}_\n\n", dir.display(), filename));
+        report.push_str(&format!(
+            "_Full content: {}/{}_\n\n",
+            dir.display(),
+            filename
+        ));
         report.push_str(preview);
         report.push_str("\n\n---\n\n");
     }
@@ -450,7 +566,12 @@ fn build_client() -> reqwest::Client {
 // Web search (multi-provider, async)
 // ---------------------------------------------------------------------------
 
-async fn web_search(client: &reqwest::Client, query: &str, count: u8, engine: Option<&str>) -> SearchResult {
+async fn web_search(
+    client: &reqwest::Client,
+    query: &str,
+    count: u8,
+    engine: Option<&str>,
+) -> SearchResult {
     if let Some(eng) = engine {
         match eng {
             "brave" => {
@@ -523,21 +644,35 @@ async fn ddg_search(client: &reqwest::Client, query: &str, count: u8) -> SearchR
     let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoded(query));
     let response = match client.get(&url).send().await {
         Ok(r) => r,
-        Err(e) => return SearchResult { output: format!("DuckDuckGo error: {e}"), success: false },
+        Err(e) => {
+            return SearchResult {
+                output: format!("DuckDuckGo error: {e}"),
+                success: false,
+            }
+        }
     };
     if !response.status().is_success() {
-        return SearchResult { output: format!("DuckDuckGo HTTP {}", response.status()), success: false };
+        return SearchResult {
+            output: format!("DuckDuckGo HTTP {}", response.status()),
+            success: false,
+        };
     }
     let html = response.text().await.unwrap_or_default();
     let results = parse_ddg_results(&html, count as usize);
     if results.is_empty() {
-        return SearchResult { output: format!("No results found for: {query}"), success: true };
+        return SearchResult {
+            output: format!("No results found for: {query}"),
+            success: true,
+        };
     }
     let mut output = format!("Results for: {query}\n\n");
     for (i, (title, url, snippet)) in results.iter().enumerate() {
         output.push_str(&format!("{}. {title}\n   {url}\n   {snippet}\n\n", i + 1));
     }
-    SearchResult { output, success: true }
+    SearchResult {
+        output,
+        success: true,
+    }
 }
 
 fn parse_ddg_results(html: &str, max: usize) -> Vec<(String, String, String)> {
@@ -609,63 +744,116 @@ fn decode_ddg_url(raw: &str) -> String {
 // Brave Search
 // ---------------------------------------------------------------------------
 
-async fn brave_search(client: &reqwest::Client, query: &str, count: u8, api_key: &str) -> SearchResult {
+async fn brave_search(
+    client: &reqwest::Client,
+    query: &str,
+    count: u8,
+    api_key: &str,
+) -> SearchResult {
     let response = match client
         .get("https://api.search.brave.com/res/v1/web/search")
         .header("X-Subscription-Token", api_key)
         .header("Accept", "application/json")
         .query(&[("q", query), ("count", &count.to_string())])
-        .send().await
+        .send()
+        .await
     {
         Ok(r) => r,
-        Err(e) => return SearchResult { output: format!("Brave error: {e}"), success: false },
+        Err(e) => {
+            return SearchResult {
+                output: format!("Brave error: {e}"),
+                success: false,
+            }
+        }
     };
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return SearchResult { output: format!("Brave ({status}): {body}"), success: false };
+        return SearchResult {
+            output: format!("Brave ({status}): {body}"),
+            success: false,
+        };
     }
     let brave: BraveResponse = match response.json().await {
         Ok(v) => v,
-        Err(e) => return SearchResult { output: format!("Brave parse error: {e}"), success: false },
+        Err(e) => {
+            return SearchResult {
+                output: format!("Brave parse error: {e}"),
+                success: false,
+            }
+        }
     };
     let results = brave.web.map(|w| w.results).unwrap_or_default();
     if results.is_empty() {
-        return SearchResult { output: format!("No results found for: {query}"), success: true };
+        return SearchResult {
+            output: format!("No results found for: {query}"),
+            success: true,
+        };
     }
     let mut output = format!("Results for: {query}\n\n");
     for (i, r) in results.iter().enumerate() {
-        output.push_str(&format!("{}. {}\n   {}\n   {}\n\n", i + 1, r.title, r.url, r.description));
+        output.push_str(&format!(
+            "{}. {}\n   {}\n   {}\n\n",
+            i + 1,
+            r.title,
+            r.url,
+            r.description
+        ));
     }
-    SearchResult { output, success: true }
+    SearchResult {
+        output,
+        success: true,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // You.com Search
 // ---------------------------------------------------------------------------
 
-async fn you_search(client: &reqwest::Client, query: &str, count: u8, api_key: &str) -> SearchResult {
+async fn you_search(
+    client: &reqwest::Client,
+    query: &str,
+    count: u8,
+    api_key: &str,
+) -> SearchResult {
     let response = match client
         .get("https://ydc-index.io/v1/search")
         .header("X-API-Key", api_key)
         .query(&[("query", query), ("count", &count.to_string())])
-        .send().await
+        .send()
+        .await
     {
         Ok(r) => r,
-        Err(e) => return SearchResult { output: format!("You.com error: {e}"), success: false },
+        Err(e) => {
+            return SearchResult {
+                output: format!("You.com error: {e}"),
+                success: false,
+            }
+        }
     };
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return SearchResult { output: format!("You.com ({status}): {body}"), success: false };
+        return SearchResult {
+            output: format!("You.com ({status}): {body}"),
+            success: false,
+        };
     }
     let you: YouResponse = match response.json().await {
         Ok(v) => v,
-        Err(e) => return SearchResult { output: format!("You.com parse error: {e}"), success: false },
+        Err(e) => {
+            return SearchResult {
+                output: format!("You.com parse error: {e}"),
+                success: false,
+            }
+        }
     };
     let results = you.results.and_then(|r| r.web).unwrap_or_default();
     if results.is_empty() {
-        return SearchResult { output: format!("No results found for: {query}"), success: true };
+        return SearchResult {
+            output: format!("No results found for: {query}"),
+            success: true,
+        };
     }
     let mut output = format!("Results for: {query}\n\n");
     for (i, r) in results.iter().enumerate() {
@@ -678,7 +866,10 @@ async fn you_search(client: &reqwest::Client, query: &str, count: u8, api_key: &
         }
         output.push('\n');
     }
-    SearchResult { output, success: true }
+    SearchResult {
+        output,
+        success: true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -696,27 +887,45 @@ async fn perplexity_search(client: &reqwest::Client, query: &str, api_key: &str)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .json(&body)
-        .send().await
+        .send()
+        .await
     {
         Ok(r) => r,
-        Err(e) => return SearchResult { output: format!("Perplexity error: {e}"), success: false },
+        Err(e) => {
+            return SearchResult {
+                output: format!("Perplexity error: {e}"),
+                success: false,
+            }
+        }
     };
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return SearchResult { output: format!("Perplexity ({status}): {body}"), success: false };
+        return SearchResult {
+            output: format!("Perplexity ({status}): {body}"),
+            success: false,
+        };
     }
     let pplx: PerplexityResponse = match response.json().await {
         Ok(v) => v,
-        Err(e) => return SearchResult { output: format!("Perplexity parse error: {e}"), success: false },
+        Err(e) => {
+            return SearchResult {
+                output: format!("Perplexity parse error: {e}"),
+                success: false,
+            }
+        }
     };
-    let answer = pplx.choices
+    let answer = pplx
+        .choices
         .and_then(|c| c.into_iter().next())
         .and_then(|c| c.message)
         .and_then(|m| m.content)
         .unwrap_or_default();
     if answer.is_empty() {
-        return SearchResult { output: format!("No results found for: {query}"), success: true };
+        return SearchResult {
+            output: format!("No results found for: {query}"),
+            success: true,
+        };
     }
     let mut output = format!("Search: {query}\n\n{answer}");
     if !pplx.citations.is_empty() {
@@ -725,7 +934,10 @@ async fn perplexity_search(client: &reqwest::Client, query: &str, api_key: &str)
             output.push_str(&format!("  [{}] {}\n", i + 1, url));
         }
     }
-    SearchResult { output, success: true }
+    SearchResult {
+        output,
+        success: true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -846,10 +1058,26 @@ fn html_to_text(html: &str) -> String {
                     }
                     let is_block = matches!(
                         tag,
-                        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                            | "li" | "tr" | "br" | "hr" | "blockquote" | "pre"
-                            | "section" | "article" | "header" | "footer"
-                            | "nav" | "main" | "aside"
+                        "p" | "div"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "li"
+                            | "tr"
+                            | "br"
+                            | "hr"
+                            | "blockquote"
+                            | "pre"
+                            | "section"
+                            | "article"
+                            | "header"
+                            | "footer"
+                            | "nav"
+                            | "main"
+                            | "aside"
                     );
                     if is_block {
                         parts.push("\n".to_string());
@@ -872,11 +1100,15 @@ fn html_to_text(html: &str) -> String {
     let mut prev_space = false;
     for ch in raw.chars() {
         if ch == '\n' {
-            if !prev_newline { result.push('\n'); }
+            if !prev_newline {
+                result.push('\n');
+            }
             prev_newline = true;
             prev_space = false;
         } else if ch.is_whitespace() {
-            if !prev_space && !prev_newline { result.push(' '); }
+            if !prev_space && !prev_newline {
+                result.push(' ');
+            }
             prev_space = true;
         } else {
             prev_newline = false;
@@ -892,8 +1124,12 @@ fn html_to_text(html: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn is_private_host(host: &str) -> bool {
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0"
-        || host.ends_with(".local") || host.ends_with(".internal")
+    if host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
     {
         return true;
     }
@@ -906,12 +1142,16 @@ fn is_private_host(host: &str) -> bool {
 fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local()
-                || v4.is_broadcast() || v4.is_unspecified()
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
         }
         std::net::IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unspecified()
+            v6.is_loopback()
+                || v6.is_unspecified()
                 || (v6.octets()[0] & 0xfe) == 0xfc
                 || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80)
         }
@@ -927,6 +1167,53 @@ fn is_private_url(url: &str) -> bool {
     false
 }
 
+/// Extract same-origin internal links from a page, filtering out already-seen URLs.
+fn same_origin_links(
+    page_url: &str,
+    outbound_links: &[String],
+    seen_urls: &HashSet<String>,
+) -> Vec<String> {
+    let origin = match url::Url::parse(page_url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return vec![],
+    };
+
+    outbound_links
+        .iter()
+        .filter(|link| {
+            url::Url::parse(link)
+                .ok()
+                .map(|u| u.origin().ascii_serialization() == origin)
+                .unwrap_or(false)
+        })
+        .filter(|link| !seen_urls.contains(&normalize_url(link)))
+        .filter(|link| !is_non_content_url(link))
+        .cloned()
+        .collect()
+}
+
+/// Filter out URLs unlikely to have useful text content.
+fn is_non_content_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.ends_with(".pdf")
+        || lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".zip")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".mp4")
+        || lower.ends_with(".mp3")
+        || lower.contains("/login")
+        || lower.contains("/signup")
+        || lower.contains("/register")
+        || lower.contains("/auth/")
+        || lower.contains("/api/")
+        || lower.contains("/cdn-cgi/")
+}
+
 // ---------------------------------------------------------------------------
 // URL helpers
 // ---------------------------------------------------------------------------
@@ -935,7 +1222,9 @@ fn urlencoded(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b' ' => out.push('+'),
             _ => {
                 out.push('%');
@@ -1056,7 +1345,10 @@ fn slugify(s: &str) -> String {
 fn host_slug(raw_url: &str) -> String {
     url::Url::parse(raw_url)
         .ok()
-        .and_then(|u| u.host_str().map(|h| h.strip_prefix("www.").unwrap_or(h).replace('.', "-")))
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.strip_prefix("www.").unwrap_or(h).replace('.', "-"))
+        })
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -1182,9 +1474,50 @@ mod tests {
 
     #[test]
     fn test_input_deserialization_full() {
-        let json = r#"{"query": "test", "max_results": 3, "depth": 3, "search_engine": "perplexity"}"#;
+        let json =
+            r#"{"query": "test", "max_results": 3, "depth": 3, "search_engine": "perplexity"}"#;
         let input: Input = serde_json::from_str(json).unwrap();
         assert_eq!(input.depth, 3);
         assert_eq!(input.search_engine.as_deref(), Some("perplexity"));
+    }
+
+    #[test]
+    fn test_same_origin_links() {
+        let seen: HashSet<String> = HashSet::new();
+        let outbound = vec![
+            "https://example.com/page2".to_string(),
+            "https://example.com/page3".to_string(),
+            "https://other.com/external".to_string(),
+            "https://example.com/login".to_string(), // filtered: /login
+            "https://example.com/image.png".to_string(), // filtered: .png
+        ];
+        let result = same_origin_links("https://example.com/page1", &outbound, &seen);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"https://example.com/page2".to_string()));
+        assert!(result.contains(&"https://example.com/page3".to_string()));
+    }
+
+    #[test]
+    fn test_same_origin_links_respects_seen() {
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert("https://example.com/page2".to_string());
+        let outbound = vec![
+            "https://example.com/page2".to_string(),
+            "https://example.com/page3".to_string(),
+        ];
+        let result = same_origin_links("https://example.com/page1", &outbound, &seen);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "https://example.com/page3");
+    }
+
+    #[test]
+    fn test_is_non_content_url() {
+        assert!(is_non_content_url("https://example.com/image.png"));
+        assert!(is_non_content_url("https://example.com/file.zip"));
+        assert!(is_non_content_url("https://example.com/login"));
+        assert!(is_non_content_url("https://example.com/auth/callback"));
+        assert!(is_non_content_url("https://example.com/api/v1/data"));
+        assert!(!is_non_content_url("https://example.com/docs/guide"));
+        assert!(!is_non_content_url("https://example.com/blog/post-1"));
     }
 }

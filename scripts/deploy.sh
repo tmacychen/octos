@@ -10,11 +10,11 @@ SSH="sshpass -p $REMOTE_PW ssh -o PubkeyAuthentication=no $REMOTE"
 REMOTE_BIN="/Users/cloud/.cargo/bin"
 PLIST="io.ominix.crew-serve"
 
-BINARIES=(crew news_fetch deep-search deep_crawl send_email)
+BINARIES=(crew news_fetch deep-search deep_crawl send_email account_manager)
 
 echo "==> Building release binaries..."
 cargo build --release -p crew-cli --features telegram,whatsapp,feishu,twilio,api
-cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email
+cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager
 
 echo "==> Signing binaries locally..."
 for bin in "${BINARIES[@]}"; do
@@ -39,7 +39,7 @@ for bin in "${BINARIES[@]}"; do
 done
 
 echo "==> Cleaning stale skill dirs (bootstrap recreates them)..."
-for skill in news deep-search deep-crawl send-email; do
+for skill in news deep-search deep-crawl send-email account-manager; do
     $SSH "rm -rf /Users/cloud/.crew/skills/${skill}" 2>/dev/null || true
 done
 

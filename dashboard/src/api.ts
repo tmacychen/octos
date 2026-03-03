@@ -10,6 +10,7 @@ import type {
   MeResponse,
   User,
   SharedMetrics,
+  AdminBotConfig,
 } from './types'
 
 const BASE = '/api/admin'
@@ -128,6 +129,15 @@ export const api = {
 
   deleteUser: (id: string) =>
     request<ActionResponse>(`/users/${id}`, { method: 'DELETE' }),
+
+  // Admin bot config
+  getAdminBot: () => request<AdminBotConfig>('/admin-bot'),
+
+  updateAdminBot: (data: AdminBotConfig) =>
+    request<AdminBotConfig>('/admin-bot', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
 }
 
 // ── Auth API (public) ───────────────────────────────────────────────

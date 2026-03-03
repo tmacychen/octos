@@ -104,6 +104,11 @@ pub struct Config {
     #[cfg(feature = "api")]
     #[serde(default)]
     pub dashboard_auth: Option<crate::otp::DashboardAuthConfig>,
+
+    /// Admin bot configuration for in-process LLM-powered admin via Telegram/Feishu.
+    #[cfg(feature = "admin-bot")]
+    #[serde(default)]
+    pub admin_bot: Option<AdminBotConfig>,
 }
 
 /// A fallback model for the provider failover chain.
@@ -280,6 +285,64 @@ fn default_probe_interval_secs() -> u64 {
     60
 }
 fn default_failure_threshold() -> u32 {
+    3
+}
+
+/// Admin bot configuration for in-process LLM-powered admin via Telegram/Feishu.
+#[cfg(feature = "admin-bot")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdminBotConfig {
+    /// Env var name for admin bot Telegram token (default: "ADMIN_BOT_TOKEN").
+    #[serde(default)]
+    pub telegram_token_env: Option<String>,
+    /// Env var name for Feishu app ID.
+    #[serde(default)]
+    pub feishu_app_id_env: Option<String>,
+    /// Env var name for Feishu app secret.
+    #[serde(default)]
+    pub feishu_app_secret_env: Option<String>,
+    /// Telegram chat IDs authorized for admin access.
+    #[serde(default)]
+    pub admin_chat_ids: Vec<i64>,
+    /// Feishu user IDs authorized for admin access.
+    #[serde(default)]
+    pub admin_feishu_ids: Vec<String>,
+    /// LLM provider name (e.g. "openai").
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model name.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Custom base URL for the LLM API.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Env var name for the LLM API key.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Enable proactive alerts (default: true).
+    #[serde(default = "default_true")]
+    pub alerts_enabled: bool,
+    /// Enable watchdog auto-restart (default: true).
+    #[serde(default = "default_true")]
+    pub watchdog_enabled: bool,
+    /// Health check interval in seconds (default: 60).
+    #[serde(default = "default_health_interval")]
+    pub health_check_interval_secs: u64,
+    /// Max auto-restart attempts before giving up (default: 3).
+    #[serde(default = "default_max_restart")]
+    pub max_restart_attempts: u32,
+}
+
+#[cfg(feature = "admin-bot")]
+fn default_true() -> bool {
+    true
+}
+#[cfg(feature = "admin-bot")]
+fn default_health_interval() -> u64 {
+    60
+}
+#[cfg(feature = "admin-bot")]
+fn default_max_restart() -> u32 {
     3
 }
 

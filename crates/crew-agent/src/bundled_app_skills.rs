@@ -30,4 +30,10 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
         include_str!("../../app-skills/send-email/SKILL.md"),
         include_str!("../../app-skills/send-email/manifest.json"),
     ),
+    (
+        "account-manager",
+        "account_manager",
+        include_str!("../../app-skills/account-manager/SKILL.md"),
+        include_str!("../../app-skills/account-manager/manifest.json"),
+    ),
 ];

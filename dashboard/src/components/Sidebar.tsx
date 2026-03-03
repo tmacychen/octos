@@ -51,6 +51,7 @@ export default function Sidebar() {
                 <div className="border-t border-gray-700/30 my-3" />
                 <SidebarLink to="/" end icon={<GridIcon />} label="All Profiles" />
                 <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
+                <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
               </>
             )}
           </>
@@ -62,6 +63,7 @@ export default function Sidebar() {
                 <SidebarLink to="/" end icon={<GridIcon />} label="Dashboard" />
                 <SidebarLink to="/my" icon={<UserIcon />} label="My Profile" />
                 <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
+                <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
               </>
             )}
             {!isAdmin && (
@@ -186,6 +188,14 @@ function UsersIcon() {
   return (
     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+    </svg>
+  )
+}
+
+function BotIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714a2.25 2.25 0 00.659 1.591L19 14.5M14.25 3.104c.251.023.501.05.75.082M19 14.5l-1.5 4.5H6.5L5 14.5m14 0H5" />
     </svg>
   )
 }

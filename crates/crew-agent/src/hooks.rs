@@ -13,6 +13,14 @@ use tracing::warn;
 
 use crate::sandbox::BLOCKED_ENV_VARS;
 
+/// Session-level context injected into hook payloads.
+/// Set by the caller (gateway/chat) before the agent loop starts.
+#[derive(Debug, Clone, Default)]
+pub struct HookContext {
+    pub session_id: Option<String>,
+    pub profile_id: Option<String>,
+}
+
 /// Lifecycle events that can trigger hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,21 +80,51 @@ pub struct HookPayload {
     pub input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+
+    // Session context (all events)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
+    // Cumulative tracking (after_llm)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cumulative_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cumulative_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_cost: Option<f64>,
+
+    // Provider info (after_llm)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
 }
 
 impl HookPayload {
     /// Payload for a before-LLM-call hook.
-    pub fn before_llm(model: &str, message_count: usize, iteration: u32) -> Self {
-        Self {
+    pub fn before_llm(
+        model: &str,
+        message_count: usize,
+        iteration: u32,
+        ctx: Option<&HookContext>,
+    ) -> Self {
+        let mut p = Self {
             event: HookEvent::BeforeLlmCall,
             message_count: Some(message_count),
             model: Some(model.to_string()),
             iteration: Some(iteration),
             ..Self::empty(HookEvent::BeforeLlmCall)
-        }
+        };
+        p.apply_context(ctx);
+        p
     }
 
     /// Payload for an after-LLM-call hook.
+    #[allow(clippy::too_many_arguments)]
     pub fn after_llm(
         model: &str,
         iteration: u32,
@@ -94,8 +132,15 @@ impl HookPayload {
         has_tool_calls: bool,
         input_tokens: u32,
         output_tokens: u32,
+        provider_name: &str,
+        latency_ms: u64,
+        cumulative_input_tokens: u32,
+        cumulative_output_tokens: u32,
+        session_cost: Option<f64>,
+        response_cost: Option<f64>,
+        ctx: Option<&HookContext>,
     ) -> Self {
-        Self {
+        let mut p = Self {
             event: HookEvent::AfterLlmCall,
             model: Some(model.to_string()),
             iteration: Some(iteration),
@@ -103,19 +148,34 @@ impl HookPayload {
             has_tool_calls: Some(has_tool_calls),
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
+            provider_name: Some(provider_name.to_string()),
+            latency_ms: Some(latency_ms),
+            cumulative_input_tokens: Some(cumulative_input_tokens),
+            cumulative_output_tokens: Some(cumulative_output_tokens),
+            session_cost,
+            response_cost,
             ..Self::empty(HookEvent::AfterLlmCall)
-        }
+        };
+        p.apply_context(ctx);
+        p
     }
 
     /// Payload for a before-tool-call hook.
-    pub fn before_tool(name: &str, arguments: serde_json::Value, tool_id: &str) -> Self {
-        Self {
+    pub fn before_tool(
+        name: &str,
+        arguments: serde_json::Value,
+        tool_id: &str,
+        ctx: Option<&HookContext>,
+    ) -> Self {
+        let mut p = Self {
             event: HookEvent::BeforeToolCall,
             tool_name: Some(name.to_string()),
             arguments: Some(arguments),
             tool_id: Some(tool_id.to_string()),
             ..Self::empty(HookEvent::BeforeToolCall)
-        }
+        };
+        p.apply_context(ctx);
+        p
     }
 
     /// Payload for an after-tool-call hook.
@@ -125,8 +185,9 @@ impl HookPayload {
         result: String,
         success: bool,
         duration_ms: u64,
+        ctx: Option<&HookContext>,
     ) -> Self {
-        Self {
+        let mut p = Self {
             event: HookEvent::AfterToolCall,
             tool_name: Some(name.to_string()),
             tool_id: Some(tool_id.to_string()),
@@ -134,6 +195,15 @@ impl HookPayload {
             success: Some(success),
             duration_ms: Some(duration_ms),
             ..Self::empty(HookEvent::AfterToolCall)
+        };
+        p.apply_context(ctx);
+        p
+    }
+
+    fn apply_context(&mut self, ctx: Option<&HookContext>) {
+        if let Some(ctx) = ctx {
+            self.session_id.clone_from(&ctx.session_id);
+            self.profile_id.clone_from(&ctx.profile_id);
         }
     }
 
@@ -153,6 +223,14 @@ impl HookPayload {
             has_tool_calls: None,
             input_tokens: None,
             output_tokens: None,
+            session_id: None,
+            profile_id: None,
+            cumulative_input_tokens: None,
+            cumulative_output_tokens: None,
+            session_cost: None,
+            response_cost: None,
+            provider_name: None,
+            latency_ms: None,
         }
     }
 }
@@ -294,11 +372,12 @@ impl HookExecutor {
             .split_first()
             .ok_or_else(|| eyre::eyre!("empty hook command"))?;
 
-        // Expand ~ to home directory
+        // Expand ~ to home directory in program and all arguments
         let program = expand_tilde(program);
+        let expanded_args: Vec<String> = args.iter().map(|a| expand_tilde(a)).collect();
 
         let mut cmd = tokio::process::Command::new(&program);
-        cmd.args(args);
+        cmd.args(&expanded_args);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::null());
@@ -398,33 +477,104 @@ mod tests {
 
     #[test]
     fn test_payload_serialization() {
-        let payload =
-            HookPayload::before_tool("shell", serde_json::json!({"command": "ls"}), "call_1");
+        let payload = HookPayload::before_tool(
+            "shell",
+            serde_json::json!({"command": "ls"}),
+            "call_1",
+            None,
+        );
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("\"event\":\"before_tool_call\""));
         assert!(json.contains("\"tool_name\":\"shell\""));
         assert!(!json.contains("\"result\""));
         assert!(!json.contains("\"success\""));
+        // No context — session_id/profile_id should be absent
+        assert!(!json.contains("\"session_id\""));
+        assert!(!json.contains("\"profile_id\""));
     }
 
     #[test]
     fn test_payload_constructors() {
-        let before_llm = HookPayload::before_llm("gpt-4", 10, 3);
+        let before_llm = HookPayload::before_llm("gpt-4", 10, 3, None);
         assert_eq!(before_llm.event, HookEvent::BeforeLlmCall);
         assert_eq!(before_llm.model.as_deref(), Some("gpt-4"));
         assert_eq!(before_llm.message_count, Some(10));
         assert_eq!(before_llm.iteration, Some(3));
         assert!(before_llm.tool_name.is_none());
+        assert!(before_llm.session_id.is_none());
 
-        let after_llm = HookPayload::after_llm("gpt-4", 3, "EndTurn", false, 100, 50);
+        let after_llm = HookPayload::after_llm(
+            "gpt-4",
+            3,
+            "EndTurn",
+            false,
+            100,
+            50,
+            "openai",
+            1234,
+            500,
+            200,
+            Some(0.05),
+            Some(0.01),
+            None,
+        );
         assert_eq!(after_llm.event, HookEvent::AfterLlmCall);
         assert_eq!(after_llm.input_tokens, Some(100));
         assert_eq!(after_llm.has_tool_calls, Some(false));
+        assert_eq!(after_llm.provider_name.as_deref(), Some("openai"));
+        assert_eq!(after_llm.latency_ms, Some(1234));
+        assert_eq!(after_llm.cumulative_input_tokens, Some(500));
+        assert_eq!(after_llm.cumulative_output_tokens, Some(200));
+        assert_eq!(after_llm.session_cost, Some(0.05));
+        assert_eq!(after_llm.response_cost, Some(0.01));
 
-        let after_tool = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 42);
+        let after_tool = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 42, None);
         assert_eq!(after_tool.event, HookEvent::AfterToolCall);
         assert_eq!(after_tool.success, Some(true));
         assert_eq!(after_tool.duration_ms, Some(42));
+    }
+
+    #[test]
+    fn test_payload_with_hook_context() {
+        let ctx = HookContext {
+            session_id: Some("sess-123".into()),
+            profile_id: Some("prof-abc".into()),
+        };
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", Some(&ctx));
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"session_id\":\"sess-123\""));
+        assert!(json.contains("\"profile_id\":\"prof-abc\""));
+    }
+
+    #[test]
+    fn test_after_llm_enriched_payload() {
+        let ctx = HookContext {
+            session_id: Some("s1".into()),
+            profile_id: Some("p1".into()),
+        };
+        let payload = HookPayload::after_llm(
+            "kimi-2.5",
+            5,
+            "ToolUse",
+            true,
+            200,
+            80,
+            "moonshot",
+            3456,
+            1000,
+            400,
+            Some(0.12),
+            Some(0.03),
+            Some(&ctx),
+        );
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"provider_name\":\"moonshot\""));
+        assert!(json.contains("\"latency_ms\":3456"));
+        assert!(json.contains("\"cumulative_input_tokens\":1000"));
+        assert!(json.contains("\"cumulative_output_tokens\":400"));
+        assert!(json.contains("\"session_cost\":0.12"));
+        assert!(json.contains("\"response_cost\":0.03"));
+        assert!(json.contains("\"session_id\":\"s1\""));
     }
 
     #[test]
@@ -474,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn test_executor_no_hooks() {
         let executor = HookExecutor::new(vec![]);
-        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1");
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert_eq!(result, HookResult::Allow);
     }
@@ -487,7 +637,7 @@ mod tests {
             timeout_ms: 5000,
             tool_filter: vec![],
         }]);
-        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1");
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert_eq!(result, HookResult::Allow);
     }
@@ -501,7 +651,7 @@ mod tests {
             timeout_ms: 5000,
             tool_filter: vec![],
         }]);
-        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1");
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert!(matches!(result, HookResult::Deny(_)));
     }
@@ -514,7 +664,7 @@ mod tests {
             timeout_ms: 5000,
             tool_filter: vec!["write_file".into()],
         }]);
-        let payload = HookPayload::before_tool("read_file", serde_json::json!({}), "tc1");
+        let payload = HookPayload::before_tool("read_file", serde_json::json!({}), "tc1", None);
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert_eq!(result, HookResult::Allow);
     }
@@ -527,7 +677,7 @@ mod tests {
             timeout_ms: 5000,
             tool_filter: vec![],
         }]);
-        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1");
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert_eq!(result, HookResult::Allow);
     }
@@ -544,7 +694,7 @@ mod tests {
             }],
             3,
         );
-        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10);
+        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None);
 
         // First two failures: hook still runs (returns Error, not Allow)
         let r1 = executor.run(HookEvent::AfterToolCall, &payload).await;
@@ -565,7 +715,7 @@ mod tests {
             }],
             3,
         );
-        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10);
+        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None);
 
         // Trigger 3 failures to hit threshold
         for _ in 0..3 {
@@ -593,7 +743,7 @@ mod tests {
         executor.failures[0].store(2, Ordering::Relaxed);
 
         // Success resets counter
-        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10);
+        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None);
         let r = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert_eq!(r, HookResult::Allow);
         assert_eq!(executor.failures[0].load(Ordering::Relaxed), 0);

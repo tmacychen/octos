@@ -11,6 +11,7 @@ use tower_http::cors::CorsLayer;
 
 use super::AppState;
 use super::admin;
+use super::admin_bot_api;
 use super::auth_handlers;
 use super::handlers;
 use super::metrics;
@@ -121,10 +122,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/test-provider", post(admin::test_provider))
         .route("/api/admin/start-all", post(admin::start_all))
         .route("/api/admin/stop-all", post(admin::stop_all))
+        // Sub-account management
+        .route(
+            "/api/admin/profiles/{id}/accounts",
+            get(admin::list_sub_accounts),
+        )
+        .route(
+            "/api/admin/profiles/{id}/accounts",
+            post(admin::create_sub_account),
+        )
         // User management
         .route("/api/admin/users", get(user_admin::list_users))
         .route("/api/admin/users", post(user_admin::create_user))
-        .route("/api/admin/users/{id}", delete(user_admin::delete_user));
+        .route("/api/admin/users/{id}", delete(user_admin::delete_user))
+        // Admin bot config
+        .route("/api/admin/admin-bot", get(admin_bot_api::get_config))
+        .route("/api/admin/admin-bot", put(admin_bot_api::update_config));
 
     // Determine whether auth middleware is needed
     let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();

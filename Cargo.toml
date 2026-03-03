@@ -11,6 +11,8 @@ members = [
     "crates/app-skills/deep-search",
     "crates/app-skills/deep-crawl",
     "crates/app-skills/send-email",
+    "crates/app-skills/account-manager",
+    "crates/crew-pipeline",
 ]
 
 [workspace.package]
@@ -31,6 +33,7 @@ crew-memory = { path = "crates/crew-memory" }
 crew-llm = { path = "crates/crew-llm" }
 crew-agent = { path = "crates/crew-agent" }
 crew-bus = { path = "crates/crew-bus" }
+crew-pipeline = { path = "crates/crew-pipeline" }
 
 # codex-rs crates (reused)
 codex-execpolicy = { git = "https://github.com/openai/codex", path = "codex-rs/execpolicy" }

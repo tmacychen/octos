@@ -1,8 +1,9 @@
 //! CLI commands for crew-rs.
 
+mod account;
 mod auth;
 mod channels;
-mod chat;
+pub(crate) mod chat;
 mod clean;
 mod completions;
 mod cron;
@@ -20,6 +21,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use eyre::Result;
 
+pub use account::AccountCommand;
 pub use auth::AuthCommand;
 pub use channels::ChannelsCommand;
 pub use chat::ChatCommand;
@@ -47,6 +49,8 @@ pub struct Args {
 /// Available commands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Manage sub-accounts under profiles.
+    Account(AccountCommand),
     /// Manage authentication for LLM providers.
     Auth(AuthCommand),
     /// Manage messaging channels.
@@ -118,6 +122,7 @@ pub(crate) fn load_bootstrap_files(data_dir: &std::path::Path) -> String {
 impl Executable for Command {
     fn execute(self) -> Result<()> {
         match self {
+            Self::Account(cmd) => cmd.execute(),
             Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
