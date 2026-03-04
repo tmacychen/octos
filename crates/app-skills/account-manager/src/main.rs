@@ -83,6 +83,16 @@ struct Input {
     #[serde(default)]
     telegram_token: Option<String>,
     #[serde(default)]
+    telegram_senders: Option<String>,
+    #[serde(default)]
+    whatsapp: Option<bool>,
+    #[serde(default)]
+    feishu_app_id: Option<String>,
+    #[serde(default)]
+    feishu_app_secret: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
     enable: Option<bool>,
 }
 
@@ -137,10 +147,14 @@ fn main() {
     match input.action.as_str() {
         "list" => action_list(&profiles_dir, &profile_id),
         "create" => action_create(&profiles_dir, &profile_id, &input),
+        "update" => action_update(&profiles_dir, &profile_id, &input),
         "delete" => action_delete(&profiles_dir, &profile_id, &input),
         "info" => action_info(&profiles_dir, &profile_id, &input),
+        "start" | "enable" => action_set_enabled(&profiles_dir, &profile_id, &input, true),
+        "stop" | "disable" => action_set_enabled(&profiles_dir, &profile_id, &input, false),
+        "restart" => action_restart(&profiles_dir, &profile_id, &input),
         other => output_error(&format!(
-            "Unknown action: '{other}'. Valid actions: list, create, delete, info"
+            "Unknown action: '{other}'. Valid actions: list, create, update, delete, info, start, stop, restart"
         )),
     }
 }
@@ -397,6 +411,288 @@ fn action_info(profiles_dir: &Path, parent_id: &str, input: &Input) {
         created = profile.created_at.format("%Y-%m-%d %H:%M UTC"),
     );
     output_ok(&msg);
+}
+
+fn action_update(profiles_dir: &Path, parent_id: &str, input: &Input) {
+    let sub_id = match &input.sub_account_id {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => {
+            // Try to guess from name
+            if let Some(ref name) = input.name {
+                let guessed = format!("{parent_id}--{}", slugify(name));
+                if load_profile(profiles_dir, &guessed)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    return action_update_by_id(profiles_dir, parent_id, &guessed, input);
+                }
+            }
+            output_error("'sub_account_id' is required for the 'update' action.");
+            return;
+        }
+    };
+    action_update_by_id(profiles_dir, parent_id, sub_id, input);
+}
+
+fn action_update_by_id(profiles_dir: &Path, parent_id: &str, sub_id: &str, input: &Input) {
+    let mut profile = match load_profile(profiles_dir, sub_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            output_error(&format!("Sub-account '{sub_id}' not found."));
+            return;
+        }
+        Err(e) => {
+            output_error(&format!("Failed to read sub-account: {e}"));
+            return;
+        }
+    };
+
+    if profile.parent_id.as_deref() != Some(parent_id) {
+        output_error(&format!(
+            "'{sub_id}' is not a sub-account of the current profile."
+        ));
+        return;
+    }
+
+    let mut changed = Vec::new();
+
+    // Update Telegram channel
+    if let Some(ref token) = input.telegram_token {
+        let env_name = format!(
+            "TELEGRAM_BOT_TOKEN_{}",
+            slugify(&profile.name).to_uppercase().replace('-', "_")
+        );
+        // Remove existing Telegram channel
+        profile
+            .config
+            .channels
+            .retain(|ch| ch.get("type").and_then(|t| t.as_str()) != Some("telegram"));
+        let senders = input.telegram_senders.clone().unwrap_or_default();
+        profile.config.channels.push(json!({
+            "type": "telegram",
+            "token_env": &env_name,
+            "allowed_senders": senders
+        }));
+        profile.config.env_vars.insert(env_name, token.clone());
+        changed.push("telegram channel");
+    } else if let Some(ref senders) = input.telegram_senders {
+        // Update allowed_senders on existing Telegram channel
+        let mut found = false;
+        for ch in &mut profile.config.channels {
+            if ch.get("type").and_then(|t| t.as_str()) == Some("telegram") {
+                ch.as_object_mut()
+                    .unwrap()
+                    .insert("allowed_senders".to_string(), json!(senders));
+                found = true;
+            }
+        }
+        if found {
+            changed.push("telegram allowed senders");
+        } else {
+            output_error(
+                "No Telegram channel to update senders on. Set telegram_token first.",
+            );
+            return;
+        }
+    }
+
+    // Update WhatsApp
+    if let Some(enable_wa) = input.whatsapp {
+        profile
+            .config
+            .channels
+            .retain(|ch| ch.get("type").and_then(|t| t.as_str()) != Some("whatsapp"));
+        if enable_wa {
+            profile.config.channels.push(json!({
+                "type": "whatsapp",
+                "bridge_url": ""
+            }));
+            changed.push("whatsapp enabled");
+        } else {
+            changed.push("whatsapp disabled");
+        }
+    }
+
+    // Update Feishu
+    if input.feishu_app_id.is_some() || input.feishu_app_secret.is_some() {
+        let slug = slugify(&profile.name).to_uppercase().replace('-', "_");
+        let id_env = format!("LARK_APP_ID_{slug}");
+        let secret_env = format!("LARK_APP_SECRET_{slug}");
+
+        if let Some(ref app_id) = input.feishu_app_id {
+            profile
+                .config
+                .env_vars
+                .insert(id_env.clone(), app_id.clone());
+        }
+        if let Some(ref app_secret) = input.feishu_app_secret {
+            profile
+                .config
+                .env_vars
+                .insert(secret_env.clone(), app_secret.clone());
+        }
+
+        // Ensure Feishu channel exists
+        let has_feishu = profile
+            .config
+            .channels
+            .iter()
+            .any(|ch| ch.get("type").and_then(|t| t.as_str()) == Some("feishu"));
+        if !has_feishu {
+            profile.config.channels.push(json!({
+                "type": "feishu",
+                "app_id_env": id_env,
+                "app_secret_env": secret_env,
+                "mode": "webhook",
+                "region": "",
+                "webhook_port": null,
+                "verification_token_env": "",
+                "encrypt_key_env": ""
+            }));
+        }
+        changed.push("feishu channel");
+    }
+
+    // Update system prompt
+    if let Some(ref prompt) = input.system_prompt {
+        profile.config.gateway.system_prompt = if prompt.is_empty() {
+            None
+        } else {
+            Some(prompt.clone())
+        };
+        changed.push("system prompt");
+    }
+
+    // Update enabled state
+    if let Some(en) = input.enabled {
+        profile.enabled = en;
+        changed.push(if en { "enabled" } else { "disabled" });
+    }
+
+    if changed.is_empty() {
+        output_error("Nothing to update. Provide at least one field to change (telegram_token, telegram_senders, whatsapp, feishu_app_id, feishu_app_secret, system_prompt, enabled).");
+        return;
+    }
+
+    profile.updated_at = Utc::now();
+    match save_profile(profiles_dir, &profile) {
+        Ok(()) => {
+            let mut msg = format!("Updated sub-account '{sub_id}':");
+            for c in &changed {
+                msg.push_str(&format!("\n  - {c}"));
+            }
+            msg.push_str("\nThe gateway will auto-restart to pick up changes.");
+            output_ok(&msg);
+        }
+        Err(e) => output_error(&format!("Failed to save sub-account: {e}")),
+    }
+}
+
+fn action_set_enabled(profiles_dir: &Path, parent_id: &str, input: &Input, enable: bool) {
+    let sub_id = match resolve_sub_id(profiles_dir, parent_id, input) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let mut profile = match load_profile(profiles_dir, &sub_id) {
+        Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
+        Ok(Some(_)) => {
+            output_error(&format!(
+                "'{sub_id}' is not a sub-account of the current profile."
+            ));
+            return;
+        }
+        Ok(None) => {
+            output_error(&format!("Sub-account '{sub_id}' not found."));
+            return;
+        }
+        Err(e) => {
+            output_error(&format!("Failed to read sub-account: {e}"));
+            return;
+        }
+    };
+
+    if profile.enabled == enable {
+        let state = if enable { "enabled" } else { "disabled" };
+        output_ok(&format!("Sub-account '{sub_id}' is already {state}."));
+        return;
+    }
+
+    profile.enabled = enable;
+    profile.updated_at = Utc::now();
+    match save_profile(profiles_dir, &profile) {
+        Ok(()) => {
+            let action = if enable { "Enabled" } else { "Disabled" };
+            output_ok(&format!(
+                "{action} sub-account '{sub_id}'. The gateway will {} within ~5 seconds.",
+                if enable { "start" } else { "stop" }
+            ));
+        }
+        Err(e) => output_error(&format!("Failed to save sub-account: {e}")),
+    }
+}
+
+fn action_restart(profiles_dir: &Path, parent_id: &str, input: &Input) {
+    let sub_id = match resolve_sub_id(profiles_dir, parent_id, input) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let mut profile = match load_profile(profiles_dir, &sub_id) {
+        Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
+        Ok(Some(_)) => {
+            output_error(&format!(
+                "'{sub_id}' is not a sub-account of the current profile."
+            ));
+            return;
+        }
+        Ok(None) => {
+            output_error(&format!("Sub-account '{sub_id}' not found."));
+            return;
+        }
+        Err(e) => {
+            output_error(&format!("Failed to read sub-account: {e}"));
+            return;
+        }
+    };
+
+    if !profile.enabled {
+        output_error(&format!(
+            "Sub-account '{sub_id}' is disabled. Enable it first with action 'start'."
+        ));
+        return;
+    }
+
+    // Touch updated_at to trigger file watcher restart
+    profile.updated_at = Utc::now();
+    match save_profile(profiles_dir, &profile) {
+        Ok(()) => output_ok(&format!(
+            "Restarting sub-account '{sub_id}'. The gateway will restart within ~5 seconds."
+        )),
+        Err(e) => output_error(&format!("Failed to save sub-account: {e}")),
+    }
+}
+
+fn resolve_sub_id(profiles_dir: &Path, parent_id: &str, input: &Input) -> Option<String> {
+    if let Some(ref id) = input.sub_account_id {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(ref name) = input.name {
+        let guessed = format!("{parent_id}--{}", slugify(name));
+        if load_profile(profiles_dir, &guessed)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Some(guessed);
+        }
+    }
+    output_error("'sub_account_id' is required. You can get the ID from the 'list' action.");
+    None
 }
 
 // ── Profile I/O helpers ──────────────────────────────────────────────

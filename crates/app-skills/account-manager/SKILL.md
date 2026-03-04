@@ -1,6 +1,6 @@
 # Account Manager Skill
 
-version: 1.0.0
+version: 1.1.0
 author: hagency
 
 ## Overview
@@ -12,6 +12,9 @@ This skill provides the `manage_account` tool for managing sub-accounts under th
 Use this tool when the user asks to:
 - List their sub-accounts ("show my sub-accounts", "what accounts do I have")
 - Create a new sub-account ("create a work bot", "set up a new assistant called X")
+- Update a sub-account's config ("add telegram token to X", "set allowed users for X", "change the system prompt")
+- Enable/start or disable/stop a sub-account ("start the work bot", "stop nocodingbot")
+- Restart a sub-account ("restart the work bot")
 - Delete a sub-account ("remove the work bot", "delete sub-account X")
 - Check sub-account details ("show info about work bot", "what's the status of X")
 
@@ -36,6 +39,35 @@ Use this tool when the user asks to:
 ```
 
 Only `name` is required. Other fields are optional.
+
+### Update a sub-account
+
+Incrementally update config — only provide the fields you want to change:
+
+```json
+{
+  "action": "update",
+  "sub_account_id": "parent-id--work-bot",
+  "telegram_token": "123456:ABC-DEF...",
+  "telegram_senders": "5460262597,123456789",
+  "system_prompt": "You are a coding assistant."
+}
+```
+
+Supported fields: `telegram_token`, `telegram_senders`, `whatsapp` (bool), `feishu_app_id`, `feishu_app_secret`, `system_prompt`, `enabled` (bool).
+
+### Start/stop a sub-account
+
+```json
+{ "action": "start", "sub_account_id": "parent-id--work-bot" }
+{ "action": "stop", "sub_account_id": "parent-id--work-bot" }
+```
+
+### Restart a sub-account
+
+```json
+{ "action": "restart", "sub_account_id": "parent-id--work-bot" }
+```
 
 ### Delete a sub-account
 
