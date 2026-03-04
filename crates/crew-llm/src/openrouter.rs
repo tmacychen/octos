@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use crew_core::{Message, MessageRole};
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +29,10 @@ impl OpenRouterProvider {
     /// Create a new OpenRouter provider.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::provider::build_http_client(
+                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+                crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+            ),
             api_key: SecretString::from(api_key.into()),
             model: model.into(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
@@ -45,6 +49,12 @@ impl OpenRouterProvider {
     /// Set a custom base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Replace the HTTP client with one using custom timeouts (in seconds).
+    pub fn with_http_timeout(mut self, timeout_secs: u64, connect_timeout_secs: u64) -> Self {
+        self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
         self
     }
 }

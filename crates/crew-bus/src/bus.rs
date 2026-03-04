@@ -52,6 +52,18 @@ impl BusPublisher {
     pub async fn recv_outbound(&mut self) -> Option<OutboundMessage> {
         self.out_rx.recv().await
     }
+
+    /// Decompose into parts. Allows dropping the publisher's own `in_tx`
+    /// so channels are the sole senders, enabling clean shutdown when all
+    /// channels stop.
+    pub fn into_parts(
+        self,
+    ) -> (
+        mpsc::Sender<InboundMessage>,
+        mpsc::Receiver<OutboundMessage>,
+    ) {
+        (self.in_tx, self.out_rx)
+    }
 }
 
 /// Creates a linked pair of bus handles.

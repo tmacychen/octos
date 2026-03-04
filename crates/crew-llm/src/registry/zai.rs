@@ -23,6 +23,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
 };
 
 fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
+    let http_timeout = p.http_timeout();
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("ZAI_API_KEY not set"))?;
@@ -30,6 +31,9 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let url = p
         .base_url
         .unwrap_or_else(|| "https://api.z.ai/api/anthropic".into());
-    let provider = AnthropicProvider::new(&key, &model).with_base_url(&url);
+    let mut provider = AnthropicProvider::new(&key, &model).with_base_url(&url);
+    if let Some((t, c)) = http_timeout {
+        provider = provider.with_http_timeout(t, c);
+    }
     Ok(Arc::new(provider))
 }

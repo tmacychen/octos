@@ -24,7 +24,23 @@ impl MessageTool {
         }
     }
 
+    /// Create a new MessageTool with context pre-set (for per-session instances).
+    pub fn with_context(
+        out_tx: mpsc::Sender<OutboundMessage>,
+        channel: impl Into<String>,
+        chat_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            out_tx,
+            default_channel: std::sync::Mutex::new(channel.into()),
+            default_chat_id: std::sync::Mutex::new(chat_id.into()),
+        }
+    }
+
     /// Update the default channel/chat_id context (called per inbound message).
+    /// WARNING: This mutates shared state. When using a shared Arc<MessageTool> across
+    /// concurrent sessions, a race condition exists between set_context() and tool
+    /// execution. Prefer with_context() for per-session instances when possible.
     pub fn set_context(&self, channel: &str, chat_id: &str) {
         *self
             .default_channel

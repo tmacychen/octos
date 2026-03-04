@@ -75,3 +75,21 @@ pub(crate) fn truncate_error_body(body: &str) -> String {
         format!("{}... ({} bytes total)", &body[..200], body.len())
     }
 }
+
+/// Default LLM request timeout in seconds.
+pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 120;
+/// Default LLM connect timeout in seconds.
+pub const DEFAULT_LLM_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Default embedding request timeout in seconds.
+pub const DEFAULT_EMBEDDING_TIMEOUT_SECS: u64 = 60;
+/// Default embedding connect timeout in seconds.
+pub const DEFAULT_EMBEDDING_CONNECT_TIMEOUT_SECS: u64 = 15;
+
+/// Build a `reqwest::Client` with the given timeout values (in seconds).
+pub fn build_http_client(timeout_secs: u64, connect_timeout_secs: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .build()
+        .expect("failed to build HTTP client")
+}

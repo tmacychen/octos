@@ -184,12 +184,11 @@ impl ChatCommand {
         // Register spawn tool for sync sub-agent support in chat mode.
         // Background mode won't deliver results (dummy channel), but sync mode works fine.
         let (spawn_tx, _spawn_rx) = tokio::sync::mpsc::channel(1);
-        tools.register(crew_agent::SpawnTool::new(
-            llm.clone(),
-            memory.clone(),
-            cwd.clone(),
-            spawn_tx,
-        ));
+        let worker_prompt = super::load_prompt("worker", crew_agent::DEFAULT_WORKER_PROMPT);
+        tools.register(
+            crew_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
+                .with_worker_prompt(worker_prompt),
+        );
 
         // Register research synthesis tool (map-reduce over deep_search source files)
         tools.register(crew_agent::SynthesizeResearchTool::new(
@@ -341,7 +340,7 @@ impl ChatCommand {
 
         // Interactive loop — readline is blocking so we run it on a separate thread.
         loop {
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.load(Ordering::Acquire) {
                 break;
             }
 
@@ -551,6 +550,13 @@ pub(crate) fn create_provider_with_api_type(
         eyre::bail!("{} provider requires --base-url to be specified", name);
     }
 
+    // Extract timeout overrides from gateway config (if any).
+    let llm_timeout_secs = config.gateway.as_ref().and_then(|g| g.llm_timeout_secs);
+    let llm_connect_timeout_secs = config
+        .gateway
+        .as_ref()
+        .and_then(|g| g.llm_connect_timeout_secs);
+
     // If api_type is "anthropic", bypass registry and use AnthropicProvider directly.
     // This allows any provider to use the Anthropic Messages API protocol.
     if api_type == Some("anthropic") {
@@ -567,7 +573,13 @@ pub(crate) fn create_provider_with_api_type(
                 .unwrap_or("https://api.anthropic.com")
                 .into()
         });
-        let provider = crew_llm::anthropic::AnthropicProvider::new(&key, &m).with_base_url(&url);
+        let mut provider =
+            crew_llm::anthropic::AnthropicProvider::new(&key, &m).with_base_url(&url);
+        if let Some(t) = llm_timeout_secs {
+            let c = llm_connect_timeout_secs
+                .unwrap_or(crew_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
+            provider = provider.with_http_timeout(t, c);
+        }
         println!(
             "{}: {} (anthropic api)",
             "Model".green(),
@@ -581,6 +593,8 @@ pub(crate) fn create_provider_with_api_type(
         model,
         base_url,
         model_hints: config.model_hints.clone(),
+        llm_timeout_secs,
+        llm_connect_timeout_secs,
     };
 
     let provider = (entry.create)(params)?;

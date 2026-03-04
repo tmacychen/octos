@@ -22,6 +22,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
 };
 
 fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
+    let http_timeout = p.http_timeout();
     let key = p.api_key.unwrap_or_else(|| "token".into());
     let model = p
         .model
@@ -32,6 +33,9 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let mut provider = OpenAIProvider::new(&key, &model).with_base_url(&url);
     if let Some(hints) = p.model_hints {
         provider = provider.with_hints(hints);
+    }
+    if let Some((t, c)) = http_timeout {
+        provider = provider.with_http_timeout(t, c);
     }
     Ok(Arc::new(provider))
 }

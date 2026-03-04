@@ -113,6 +113,7 @@ impl GatewayCommand {
         };
 
         let mut profile_id: Option<String> = None;
+        let mut admin_mode = false;
         let config = if let Some(ref profile_path) = self.profile {
             // Load config from profile JSON (single source of truth)
             let content = std::fs::read_to_string(profile_path)
@@ -120,6 +121,7 @@ impl GatewayCommand {
             let mut profile: crate::profiles::UserProfile = serde_json::from_str(&content)
                 .wrap_err_with(|| format!("failed to parse profile: {}", profile_path.display()))?;
             profile_id = Some(profile.id.clone());
+            admin_mode = profile.config.admin_mode;
 
             // Sub-account: merge LLM provider config from parent profile
             if let Some(ref parent_path) = self.parent_profile {
@@ -174,11 +176,7 @@ impl GatewayCommand {
                     settings: serde_json::json!({}),
                 }],
                 max_history: 50,
-                system_prompt: None,
-                queue_mode: QueueMode::default(),
-                max_sessions: 1000,
-                max_concurrent_sessions: 10,
-                browser_timeout_secs: None,
+                ..Default::default()
             });
 
         println!("{}: {}", "Provider".green(), provider_name);
@@ -333,188 +331,245 @@ impl GatewayCommand {
         ));
         heartbeat_service.start();
 
-        // Build tool registry (with sandbox if configured)
-        let sandbox = crew_agent::create_sandbox(&config.sandbox);
-        let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
-
-        // Open tool config store for user-customizable tool defaults
+        // Build tool registry — admin mode gets only admin API tools + messaging
         let tool_config = Arc::new(
             crew_agent::ToolConfigStore::open(&data_dir)
                 .await
                 .wrap_err("failed to open tool config store")?,
         );
-        tools.inject_tool_config(tool_config.clone());
 
-        // Override browser tool with configured timeout (replaces default 300s)
-        if let Some(secs) = gw_config.browser_timeout_secs {
-            tools.register(
-                crew_agent::BrowserTool::with_timeout(std::time::Duration::from_secs(secs))
-                    .with_config(tool_config.clone()),
-            );
-        }
-
-        // Register MCP tools
-        if !config.mcp_servers.is_empty() {
-            match crew_agent::McpClient::start(&config.mcp_servers).await {
-                Ok(client) => client.register_tools(&mut tools),
-                Err(e) => warn!("MCP initialization failed: {e}"),
-            }
-        }
-
-        // Load plugins
-        let plugin_dirs = crate::config::Config::plugin_dirs(&cwd);
-        if !plugin_dirs.is_empty() {
-            if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs) {
-                warn!("plugin loading failed: {e}");
-            }
-        }
-
-        // Apply tool policy from config
-        if let Some(ref policy) = config.tool_policy {
-            tools.apply_policy(policy);
-        }
-
-        // Apply context-based tag filter
-        if !config.context_filter.is_empty() {
-            tools.set_context_filter(config.context_filter.clone());
-        }
-
-        // Apply provider-specific tool policy
-        if let Some(policy) = resolve_provider_policy(&config, &provider_name, &model_id) {
-            tools.set_provider_policy(policy);
-        }
-
-        let cron_tool = Arc::new(CronTool::new(cron_service.clone()));
-        tools.register_arc(cron_tool.clone() as Arc<dyn crew_agent::Tool>);
-
-        // Message tool (cross-channel messaging)
+        // Create messaging tools before the if/else (needed in both modes)
         let message_tool = Arc::new(MessageTool::new(out_tx.clone()));
-        tools.register_arc(message_tool.clone() as Arc<dyn crew_agent::Tool>);
-
-        // Send file tool (document attachments)
         let send_file_tool = Arc::new(SendFileTool::new(out_tx.clone()));
-        tools.register_arc(send_file_tool.clone() as Arc<dyn crew_agent::Tool>);
-
-        // Take photo tool (camera capture + send) — disabled for now
-        // let take_photo_tool = Arc::new(TakePhotoTool::new(out_tx));
-        // tools.register_arc(take_photo_tool.clone() as Arc<dyn crew_agent::Tool>);
         drop(out_tx);
 
-        // Build sub-provider router from config
-        let provider_router = if !config.sub_providers.is_empty() {
-            let router = Arc::new(ProviderRouter::new());
-            for sp in &config.sub_providers {
-                // Clone config and override api_key_env if the sub-provider specifies one
-                let sp_config = if sp.api_key_env.is_some() {
-                    let mut c = config.clone();
-                    c.api_key_env = sp.api_key_env.clone();
-                    c
-                } else {
-                    config.clone()
-                };
-                match super::chat::create_provider_with_api_type(
-                    &sp.provider,
-                    &sp_config,
-                    sp.model.clone(),
-                    sp.base_url.clone(),
-                    sp.api_type.as_deref(),
-                ) {
-                    Ok(p) => {
-                        router.register_with_meta(
-                            &sp.key,
-                            Arc::new(RetryProvider::new(p)),
-                            sp.description.clone(),
-                            sp.default_context_window,
-                        );
-                        println!(
-                            "  {}: {}/{}",
-                            "Sub-provider".green(),
-                            sp.key,
-                            sp.model.as_deref().unwrap_or("default")
-                        );
-                    }
-                    Err(e) => {
-                        warn!(key = %sp.key, provider = %sp.provider, error = %e, "skipping sub-provider");
-                    }
+        // Optional tools (only exist in normal mode)
+        let mut spawn_tool: Option<Arc<SpawnTool>> = None;
+        let mut cron_tool_arc: Option<Arc<CronTool>> = None;
+        let mut pipeline_tool: Option<Arc<crew_pipeline::RunPipelineTool>> = None;
+
+        let mut tools;
+        if admin_mode {
+            // Admin mode: register only admin API tools
+            tools = ToolRegistry::new();
+
+            // Register admin API tools (calls REST API on crew serve)
+            let serve_url = std::env::var("CREW_SERVE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+            let admin_token =
+                std::env::var("CREW_ADMIN_TOKEN").unwrap_or_default();
+            let admin_ctx = Arc::new(crew_agent::AdminApiContext {
+                http: reqwest::Client::new(),
+                serve_url,
+                admin_token,
+            });
+            crew_agent::register_admin_api_tools(&mut tools, admin_ctx);
+
+            // Cron tool (scheduled tasks, reminders)
+            let ct = Arc::new(CronTool::new(cron_service.clone()));
+            tools.register_arc(ct.clone() as Arc<dyn crew_agent::Tool>);
+            cron_tool_arc = Some(ct);
+
+            // Register messaging tools
+            tools.register_arc(message_tool.clone() as Arc<dyn crew_agent::Tool>);
+            tools.register_arc(send_file_tool.clone() as Arc<dyn crew_agent::Tool>);
+
+            // App-skill tools (send_email, news, etc.) via plugin loader
+            let plugin_dirs = crate::config::Config::plugin_dirs(&cwd);
+            if !plugin_dirs.is_empty() {
+                if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs) {
+                    warn!("plugin loading failed: {e}");
                 }
             }
-            Some(router)
+
+            // Memory bank tools
+            tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
+            tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
+
+            info!("admin mode: registered admin API + cron + skills tools");
         } else {
-            None
-        };
+            // Normal mode: full tool registration
+            let sandbox = crew_agent::create_sandbox(&config.sandbox);
+            tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+            tools.inject_tool_config(tool_config.clone());
 
-        // Spawn tool (background subagents, inherits provider policy + router)
-        let mut spawn = SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_inbound_tx)
-            .with_provider_policy(tools.provider_policy().cloned());
-        if let Some(ref router) = provider_router {
-            spawn = spawn.with_provider_router(router.clone());
+            // Override browser tool with configured timeout (replaces default 300s)
+            if let Some(secs) = gw_config.browser_timeout_secs {
+                tools.register(
+                    crew_agent::BrowserTool::with_timeout(std::time::Duration::from_secs(secs))
+                        .with_config(tool_config.clone()),
+                );
+            }
+
+            // Register MCP tools
+            if !config.mcp_servers.is_empty() {
+                match crew_agent::McpClient::start(&config.mcp_servers).await {
+                    Ok(client) => client.register_tools(&mut tools),
+                    Err(e) => warn!("MCP initialization failed: {e}"),
+                }
+            }
+
+            // Load plugins
+            let plugin_dirs = crate::config::Config::plugin_dirs(&cwd);
+            if !plugin_dirs.is_empty() {
+                if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs) {
+                    warn!("plugin loading failed: {e}");
+                }
+            }
+
+            // Apply tool policy from config
+            if let Some(ref policy) = config.tool_policy {
+                tools.apply_policy(policy);
+            }
+
+            // Apply context-based tag filter
+            if !config.context_filter.is_empty() {
+                tools.set_context_filter(config.context_filter.clone());
+            }
+
+            // Apply provider-specific tool policy
+            if let Some(policy) = resolve_provider_policy(&config, &provider_name, &model_id) {
+                tools.set_provider_policy(policy);
+            }
+
+            let ct = Arc::new(CronTool::new(cron_service.clone()));
+            tools.register_arc(ct.clone() as Arc<dyn crew_agent::Tool>);
+            cron_tool_arc = Some(ct);
+
+            // Register messaging tools
+            tools.register_arc(message_tool.clone() as Arc<dyn crew_agent::Tool>);
+            tools.register_arc(send_file_tool.clone() as Arc<dyn crew_agent::Tool>);
+
+            // Build sub-provider router from config
+            let provider_router = if !config.sub_providers.is_empty() {
+                let router = Arc::new(ProviderRouter::new());
+                for sp in &config.sub_providers {
+                    let sp_config = if sp.api_key_env.is_some() {
+                        let mut c = config.clone();
+                        c.api_key_env = sp.api_key_env.clone();
+                        c
+                    } else {
+                        config.clone()
+                    };
+                    match super::chat::create_provider_with_api_type(
+                        &sp.provider,
+                        &sp_config,
+                        sp.model.clone(),
+                        sp.base_url.clone(),
+                        sp.api_type.as_deref(),
+                    ) {
+                        Ok(p) => {
+                            router.register_with_meta(
+                                &sp.key,
+                                Arc::new(RetryProvider::new(p)),
+                                sp.description.clone(),
+                                sp.default_context_window,
+                            );
+                            println!(
+                                "  {}: {}/{}",
+                                "Sub-provider".green(),
+                                sp.key,
+                                sp.model.as_deref().unwrap_or("default")
+                            );
+                        }
+                        Err(e) => {
+                            warn!(key = %sp.key, provider = %sp.provider, error = %e, "skipping sub-provider");
+                        }
+                    }
+                }
+                Some(router)
+            } else {
+                None
+            };
+
+            // Spawn tool (background subagents)
+            let worker_prompt = super::load_prompt("worker", crew_agent::DEFAULT_WORKER_PROMPT);
+            let mut spawn = SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_inbound_tx)
+                .with_provider_policy(tools.provider_policy().cloned())
+                .with_worker_prompt(worker_prompt);
+            if let Some(ref router) = provider_router {
+                spawn = spawn.with_provider_router(router.clone());
+            }
+            let st = Arc::new(spawn);
+            tools.register_arc(st.clone() as Arc<dyn crew_agent::Tool>);
+            spawn_tool = Some(st);
+
+            // Research synthesis tool
+            tools.register(crew_agent::SynthesizeResearchTool::new(
+                llm.clone(),
+                data_dir.clone(),
+            ));
+
+            // Deep research pipeline
+            tools.register(crew_agent::DeepResearchTool::new(
+                llm.clone(),
+                cwd.clone(),
+                data_dir.clone(),
+                plugin_dirs.clone(),
+            ));
+
+            // Pipeline tool
+            let mut pt = crew_pipeline::RunPipelineTool::new(
+                llm.clone(),
+                memory.clone(),
+                cwd.clone(),
+                data_dir.clone(),
+            )
+            .with_provider_policy(tools.provider_policy().cloned())
+            .with_plugin_dirs(plugin_dirs.clone());
+            if let Some(ref router) = provider_router {
+                pt = pt.with_provider_router(router.clone());
+            }
+            let pt = Arc::new(pt);
+            tools.register_arc(pt.clone() as Arc<dyn crew_agent::Tool>);
+            pipeline_tool = Some(pt);
+
+            // Memory bank tools
+            tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
+            tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
         }
-        let spawn_tool = Arc::new(spawn);
-        tools.register_arc(spawn_tool.clone() as Arc<dyn crew_agent::Tool>);
-
-        // Research synthesis tool (map-reduce over deep_search source files)
-        tools.register(crew_agent::SynthesizeResearchTool::new(
-            llm.clone(),
-            data_dir.clone(),
-        ));
-
-        // Deep research pipeline (parallel multi-angle search + map-reduce synthesis)
-        tools.register(crew_agent::DeepResearchTool::new(
-            llm.clone(),
-            cwd.clone(),
-            data_dir.clone(),
-            plugin_dirs.clone(),
-        ));
-
-        // Pipeline tool (DOT-based multi-step workflows)
-        let mut pipeline_tool = crew_pipeline::RunPipelineTool::new(
-            llm.clone(),
-            memory.clone(),
-            cwd.clone(),
-            data_dir.clone(),
-        )
-        .with_provider_policy(tools.provider_policy().cloned())
-        .with_plugin_dirs(plugin_dirs.clone());
-        if let Some(ref router) = provider_router {
-            pipeline_tool = pipeline_tool.with_provider_router(router.clone());
-        }
-        let pipeline_tool = Arc::new(pipeline_tool);
-        tools.register_arc(pipeline_tool.clone() as Arc<dyn crew_agent::Tool>);
-
-        // Memory bank tools (recall/save entity pages)
-        tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
-        tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
 
         // Note: send_email tool is now provided by the system-skills package
 
-        // Build enhanced system prompt
-        let system_prompt = build_system_prompt(
-            gw_config.system_prompt.as_deref(),
-            &data_dir,
-            &project_dir,
-            &memory_store,
-            &skills_loader,
-            &tool_config,
-        )
-        .await;
+        // Build system prompt — admin mode uses a built-in admin prompt
+        let system_prompt = if admin_mode {
+            let custom = gw_config.system_prompt.as_deref();
+            if let Some(custom_prompt) = custom {
+                custom_prompt.to_string()
+            } else {
+                let compiled = include_str!("../prompts/admin_default.txt");
+                super::load_prompt("admin", compiled)
+            }
+        } else {
+            build_system_prompt(
+                gw_config.system_prompt.as_deref(),
+                &data_dir,
+                &project_dir,
+                &memory_store,
+                &skills_loader,
+                &tool_config,
+            )
+            .await
+        };
 
         // Build the agent
         let max_iterations = self.max_iterations.or(config.max_iterations).unwrap_or(50);
         let agent_config = AgentConfig {
             max_iterations,
             save_episodes: false,
+            tool_timeout_secs: gw_config
+                .tool_timeout_secs
+                .unwrap_or(crew_agent::DEFAULT_TOOL_TIMEOUT_SECS),
             ..Default::default()
         };
+        let session_timeout_secs = gw_config
+            .session_timeout_secs
+            .unwrap_or(crew_agent::DEFAULT_SESSION_TIMEOUT_SECS);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
         let llm_for_compaction = llm.clone();
-        tracing::info!(
-            "SYSTEM_PROMPT_DEBUG len={} first200={:?}",
-            system_prompt.len(),
-            &system_prompt[..system_prompt.len().min(200)]
-        );
         let mut agent = Agent::new(AgentId::new("gateway"), llm, tools, memory)
             .with_config(agent_config)
             .with_reporter(Arc::new(SilentReporter))
@@ -901,7 +956,7 @@ impl GatewayCommand {
 
         // Main loop: dispatch inbound messages to concurrent tasks
         while let Some(mut inbound) = agent_handle.recv_inbound().await {
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.load(Ordering::Acquire) {
                 break;
             }
 
@@ -918,7 +973,7 @@ impl GatewayCommand {
                                 info!("System prompt updated via hot-reload");
                             }
                             if let Some(new_max) = new_max {
-                                max_history.store(new_max, Ordering::Relaxed);
+                                max_history.store(new_max, Ordering::Release);
                                 info!("Max history updated to {new_max} via hot-reload");
                             }
                         }
@@ -1066,7 +1121,7 @@ impl GatewayCommand {
             let send_file_tool = send_file_tool.clone();
             // let take_photo_tool = take_photo_tool.clone();
             let spawn_tool = spawn_tool.clone();
-            let cron_tool = cron_tool.clone();
+            let cron_tool_arc = cron_tool_arc.clone();
             let pipeline_tool = pipeline_tool.clone();
             let llm_for_compaction = llm_for_compaction.clone();
             let out_tx = agent_handle.outbound_sender();
@@ -1090,7 +1145,7 @@ impl GatewayCommand {
                     Err(_) => return, // semaphore closed
                 };
 
-                if shutdown.load(Ordering::Relaxed) {
+                if shutdown.load(Ordering::Acquire) {
                     return;
                 }
 
@@ -1106,28 +1161,50 @@ impl GatewayCommand {
                 // Serialize processing within the same session
                 let _session_guard = session_lock.lock().await;
 
-                process_session_message(
-                    &agent,
-                    &session_mgr,
-                    &message_tool,
-                    &send_file_tool,
-                    // &take_photo_tool,
-                    &spawn_tool,
-                    &cron_tool,
-                    &pipeline_tool,
-                    &llm_for_compaction,
-                    &out_tx,
-                    &inbound,
-                    &session_key,
-                    &reply_channel,
-                    &reply_chat_id,
-                    image_media,
-                    max_history.load(Ordering::Relaxed),
-                    &queue_mode,
-                    &collect_inbound_tx,
-                    status_indicator.as_deref(),
+                let session_timeout = std::time::Duration::from_secs(session_timeout_secs);
+                let result = tokio::time::timeout(
+                    session_timeout,
+                    process_session_message(
+                        &agent,
+                        &session_mgr,
+                        &message_tool,
+                        &send_file_tool,
+                        // &take_photo_tool,
+                        spawn_tool.as_deref(),
+                        cron_tool_arc.as_deref(),
+                        pipeline_tool.as_deref(),
+                        &llm_for_compaction,
+                        &out_tx,
+                        &inbound,
+                        &session_key,
+                        &reply_channel,
+                        &reply_chat_id,
+                        image_media,
+                        max_history.load(Ordering::Acquire),
+                        &queue_mode,
+                        &collect_inbound_tx,
+                        status_indicator.as_deref(),
+                    ),
                 )
                 .await;
+
+                if result.is_err() {
+                    tracing::error!(
+                        session = %session_key,
+                        timeout_secs = session_timeout_secs,
+                        "session processing timed out"
+                    );
+                    if out_tx.send(OutboundMessage {
+                        channel: reply_channel.to_string(),
+                        chat_id: reply_chat_id.to_string(),
+                        content: "Processing timed out. Please try again.".to_string(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    }).await.is_err() {
+                        tracing::error!(session = %session_key, "outbound channel closed (timeout msg)");
+                    }
+                }
             });
 
             // Monitor spawned task for panics; prune session lock after completion
@@ -1179,9 +1256,9 @@ async fn process_session_message(
     message_tool: &MessageTool,
     send_file_tool: &SendFileTool,
     // take_photo_tool: &TakePhotoTool,
-    spawn_tool: &SpawnTool,
-    cron_tool: &CronTool,
-    pipeline_tool: &crew_pipeline::RunPipelineTool,
+    spawn_tool: Option<&SpawnTool>,
+    cron_tool: Option<&CronTool>,
+    pipeline_tool: Option<&crew_pipeline::RunPipelineTool>,
     llm: &Arc<dyn LlmProvider>,
     out_tx: &tokio::sync::mpsc::Sender<OutboundMessage>,
     inbound: &crew_core::InboundMessage,
@@ -1195,11 +1272,20 @@ async fn process_session_message(
     status_indicator: Option<&StatusIndicator>,
 ) {
     // Set tool context for this session's reply routing
+    // TODO: Race condition — these tools are shared Arc across all sessions.
+    // If two sessions run concurrently, set_context() calls can interleave,
+    // causing messages to be sent to the wrong chat. Fix requires per-session
+    // ToolRegistry or Agent instances. Use MessageTool::with_context() /
+    // SendFileTool::with_context() when per-session tool support is added.
     message_tool.set_context(reply_channel, reply_chat_id);
     send_file_tool.set_context(reply_channel, reply_chat_id);
     // take_photo_tool.set_context(reply_channel, reply_chat_id);
-    spawn_tool.set_context(reply_channel, reply_chat_id);
-    cron_tool.set_context(reply_channel, reply_chat_id);
+    if let Some(st) = spawn_tool {
+        st.set_context(reply_channel, reply_chat_id); // TODO: same race condition
+    }
+    if let Some(ct) = cron_tool {
+        ct.set_context(reply_channel, reply_chat_id); // TODO: same race condition
+    }
 
     // Get conversation history (hold session_mgr lock briefly)
     let history: Vec<Message> = {
@@ -1214,11 +1300,13 @@ async fn process_session_message(
     // Start dynamic status indicator (typing + rotating status message + token counts)
     let status_handle = status_indicator.map(|si| {
         // Set up pipeline status bridge so pipeline nodes update the status words
-        let bridge = crew_pipeline::PipelineStatusBridge::new(
-            si.status_words_handle(),
-            Arc::clone(&token_tracker),
-        );
-        pipeline_tool.set_status_bridge(bridge);
+        if let Some(pt) = pipeline_tool {
+            let bridge = crew_pipeline::PipelineStatusBridge::new(
+                si.status_words_handle(),
+                Arc::clone(&token_tracker),
+            );
+            pt.set_status_bridge(bridge);
+        }
 
         si.start(
             reply_chat_id.to_string(),
@@ -1254,7 +1342,9 @@ async fn process_session_message(
                     reasoning_content: None,
                     timestamp: Utc::now(),
                 };
-                let _ = mgr.add_message(session_key, user_msg).await;
+                if let Err(e) = mgr.add_message(session_key, user_msg).await {
+                    warn!(session = %session_key, error = %e, "failed to persist user message");
+                }
 
                 // Only save non-empty assistant messages to session history
                 if !conv_response.content.is_empty() {
@@ -1267,7 +1357,9 @@ async fn process_session_message(
                         reasoning_content: None,
                         timestamp: Utc::now(),
                     };
-                    let _ = mgr.add_message(session_key, assistant_msg).await;
+                    if let Err(e) = mgr.add_message(session_key, assistant_msg).await {
+                        warn!(session = %session_key, error = %e, "failed to persist assistant message");
+                    }
                 }
 
                 // Compact session if it's grown too large
@@ -1306,7 +1398,9 @@ async fn process_session_message(
                     media: vec![],
                     metadata: serde_json::json!({}),
                 };
-                let _ = out_tx.send(outbound).await;
+                if out_tx.send(outbound).await.is_err() {
+                    tracing::error!(session = %session_key, "outbound channel closed");
+                }
             }
 
             // Collect mode: not applicable in concurrent processing
@@ -1314,6 +1408,7 @@ async fn process_session_message(
             let _ = (queue_mode, collect_tx);
         }
         Err(e) => {
+            tracing::error!(session = %session_key, error = %e, "agent processing failed");
             let error_msg = OutboundMessage {
                 channel: reply_channel.to_string(),
                 chat_id: reply_chat_id.to_string(),
@@ -1322,7 +1417,9 @@ async fn process_session_message(
                 media: vec![],
                 metadata: serde_json::json!({}),
             };
-            let _ = out_tx.send(error_msg).await;
+            if out_tx.send(error_msg).await.is_err() {
+                tracing::error!(session = %session_key, "outbound channel closed (error msg)");
+            }
         }
     }
 }
@@ -1351,44 +1448,9 @@ async fn build_system_prompt(
     skills_loader: &SkillsLoader,
     tool_config: &crew_agent::ToolConfigStore,
 ) -> String {
-    let default_prompt = "You are Crew, an AI assistant. \
-        Reply directly — never say \"Thinking\" or narrate your reasoning process.\
-        \n\n## Research & Search Rules\
-        \n\nWhen the user asks you to research, investigate, search, or look into a topic, \
-        FIRST confirm which approach:\
-        \n\n1. 🔍 Quick search — fast web lookup (`web_search`)\
-        \n2. 📚 Deep research — comprehensive multi-angle parallel search + synthesis, 5-15 min (`deep_research`)\
-        \n3. 🌐 Deep crawl — crawl a specific website URL in depth (`deep_crawl`)\
-        \n\nMatch the user's language (Chinese question → Chinese options).\
-        \n\nSKIP confirmation and act directly ONLY when:\
-        \n- User explicitly names the method: \"深度调查/深度研究/深度搜索\" → deep_research, \"爬取这个网站\" → deep_crawl\
-        \n- User replies with a choice (1/2/3) → execute immediately\
-        \n\nFor ALL other search/lookup requests (including \"查一下\", \"搜一下\", \"帮我查\", \"search for\"), \
-        ALWAYS ask the user to pick 1/2/3 first. Do NOT assume web_search is enough.\
-        \n\nAfter choosing, you MUST actually call the tool. NEVER just reply with text like \
-        \"I'm starting research\" — invoke the tool.\
-        \n\n`deep_research` is the preferred tool for comprehensive research. It automatically:\
-        \n- Generates 4 search angles from the query\
-        \n- Runs parallel deep_search processes (one per angle)\
-        \n- Deduplicates sources across all angles\
-        \n- Extracts findings via map-reduce (parallel per batch)\
-        \n- Synthesizes a final comprehensive report with citations\
-        \n- Saves the report to disk\
-        \n\nFor simpler single-angle searches, use `deep_search` + `synthesize_research` manually.\
-        \n\n## Grounding Rules\
-        \n\nFor real-time data (weather, time, location, stock prices, sports scores, exchange rates, \
-        news, current events, flight status, package tracking), ALWAYS use `web_search` or `web_fetch`. \
-        NEVER fabricate or guess real-time information — if you cannot fetch it, say so.\
-        \n\n## Pipelines\
-        \n\nFor complex multi-step workflows, use `run_pipeline` instead of manual tool chaining.\
-        \n- `deep_research`: comprehensive research workflow (search → analyze → synthesize)\
-        \n- Custom pipelines from .crew/pipelines/*.dot\
-        \n\nPipelines run specialized agents at each step with their own prompts and models.\
-        \n\n## Other Rules\
-        \n\nOnly use the `message` tool to send an early heads-up when you need to run slow tools \
-        (deep_research, deep_search, deep_crawl, spawn, run_pipeline, take_photo) — NOT for simple questions. \
-        Save important user preferences with `save_memory`.";
-    let mut prompt = base.unwrap_or(default_prompt).to_string();
+    let compiled = include_str!("../prompts/gateway_default.txt");
+    let runtime = super::load_prompt("gateway", compiled);
+    let mut prompt = base.unwrap_or(&runtime).to_string();
 
     // Inject current date so the model knows "今年" = which year
     let today = chrono::Local::now().format("%Y-%m-%d");

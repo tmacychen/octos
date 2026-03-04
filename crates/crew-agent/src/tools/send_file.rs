@@ -26,7 +26,21 @@ impl SendFileTool {
         }
     }
 
+    /// Create a new SendFileTool with context pre-set (for per-session instances).
+    pub fn with_context(
+        out_tx: mpsc::Sender<OutboundMessage>,
+        channel: impl Into<String>,
+        chat_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            out_tx,
+            default_channel: std::sync::Mutex::new(channel.into()),
+            default_chat_id: std::sync::Mutex::new(chat_id.into()),
+        }
+    }
+
     /// Update the default channel/chat_id context (called per inbound message).
+    /// WARNING: This mutates shared state. See MessageTool::set_context() for details.
     pub fn set_context(&self, channel: &str, chat_id: &str) {
         *self
             .default_channel

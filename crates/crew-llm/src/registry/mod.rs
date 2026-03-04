@@ -39,6 +39,22 @@ pub struct CreateParams {
     pub base_url: Option<String>,
     /// Config-level hint overrides (`None` → auto-detect from model name).
     pub model_hints: Option<ModelHints>,
+    /// HTTP request timeout in seconds (`None` → provider default).
+    pub llm_timeout_secs: Option<u64>,
+    /// HTTP connect timeout in seconds (`None` → provider default).
+    pub llm_connect_timeout_secs: Option<u64>,
+}
+
+impl CreateParams {
+    /// Returns `(timeout_secs, connect_timeout_secs)` if either is overridden.
+    pub fn http_timeout(&self) -> Option<(u64, u64)> {
+        match (self.llm_timeout_secs, self.llm_connect_timeout_secs) {
+            (Some(t), Some(c)) => Some((t, c)),
+            (Some(t), None) => Some((t, crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS)),
+            (None, Some(c)) => Some((crate::provider::DEFAULT_LLM_TIMEOUT_SECS, c)),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Static metadata + factory for one LLM provider.

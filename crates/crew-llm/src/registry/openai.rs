@@ -21,6 +21,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
 };
 
 fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
+    let http_timeout = p.http_timeout();
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("OPENAI_API_KEY not set"))?;
@@ -31,6 +32,9 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     }
     if let Some(hints) = p.model_hints {
         provider = provider.with_hints(hints);
+    }
+    if let Some((t, c)) = http_timeout {
+        provider = provider.with_http_timeout(t, c);
     }
     Ok(Arc::new(provider))
 }

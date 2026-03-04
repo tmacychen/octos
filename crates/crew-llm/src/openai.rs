@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use crew_core::{Message, MessageRole};
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -100,7 +101,10 @@ impl OpenAIProvider {
         let model = model.into();
         let hints = ModelHints::detect(&model);
         Self {
-            client: Client::new(),
+            client: crate::provider::build_http_client(
+                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+                crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+            ),
             api_key: SecretString::from(api_key.into()),
             hints,
             model,
@@ -124,6 +128,12 @@ impl OpenAIProvider {
     /// Override the auto-detected model hints.
     pub fn with_hints(mut self, hints: ModelHints) -> Self {
         self.hints = hints;
+        self
+    }
+
+    /// Replace the HTTP client with one using custom timeouts (in seconds).
+    pub fn with_http_timeout(mut self, timeout_secs: u64, connect_timeout_secs: u64) -> Self {
+        self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
         self
     }
 

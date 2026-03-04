@@ -11,6 +11,7 @@
 //! gives the best answers (AI-synthesized with citations).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -29,6 +30,8 @@ impl WebSearchTool {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
                 .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
                 .build()
                 .unwrap_or_else(|_| Client::new()),

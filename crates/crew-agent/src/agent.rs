@@ -19,6 +19,9 @@ use crate::hooks::{HookContext, HookEvent, HookExecutor, HookPayload, HookResult
 use crate::progress::{ProgressEvent, ProgressReporter, SilentReporter};
 use crate::tools::ToolRegistry;
 
+/// Compiled-in default worker prompt (from `prompts/worker.txt`).
+pub const DEFAULT_WORKER_PROMPT: &str = include_str!("prompts/worker.txt");
+
 /// Configuration for agent execution.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -30,7 +33,17 @@ pub struct AgentConfig {
     pub max_timeout: Option<Duration>,
     /// Whether to save episodes to memory.
     pub save_episodes: bool,
+    /// Optional worker system prompt override (used by Agent::new as the default prompt).
+    /// When None, falls back to the compiled-in prompts/worker.txt.
+    pub worker_prompt: Option<String>,
+    /// Maximum seconds for all parallel tool calls to complete. Default: 300.
+    pub tool_timeout_secs: u64,
 }
+
+/// Default tool execution timeout in seconds.
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 300;
+/// Default session processing timeout in seconds.
+pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 600;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -39,6 +52,8 @@ impl Default for AgentConfig {
             max_tokens: None,
             max_timeout: Some(Duration::from_secs(600)),
             save_episodes: true,
+            worker_prompt: None,
+            tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
         }
     }
 }
@@ -149,6 +164,10 @@ impl Agent {
 
     /// Set the agent configuration.
     pub fn with_config(mut self, config: AgentConfig) -> Self {
+        // Apply worker_prompt override if provided
+        if let Some(ref wp) = config.worker_prompt {
+            *self.system_prompt.write().unwrap_or_else(|e| e.into_inner()) = wp.clone();
+        }
         self.config = config;
         self
     }
@@ -832,7 +851,33 @@ impl Agent {
             })
             .collect();
 
-        let results = futures::future::join_all(futures).await;
+        let tool_timeout_secs = self.config.tool_timeout_secs;
+        let tool_timeout = Duration::from_secs(tool_timeout_secs);
+        let results = match tokio::time::timeout(tool_timeout, futures::future::join_all(futures)).await {
+            Ok(results) => results,
+            Err(_) => {
+                tracing::error!(
+                    timeout_secs = tool_timeout_secs,
+                    tool_count = response.tool_calls.len(),
+                    tools = %tool_names.join(", "),
+                    "tool execution timed out — returning error for all pending tools"
+                );
+                // Return timeout error messages for each tool call
+                let mut messages = Vec::with_capacity(response.tool_calls.len());
+                for tc in &response.tool_calls {
+                    messages.push(Message {
+                        role: MessageRole::Tool,
+                        content: format!("Tool '{}' timed out after {} seconds", tc.name, tool_timeout_secs),
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                        reasoning_content: None,
+                        timestamp: chrono::Utc::now(),
+                    });
+                }
+                return Ok((messages, vec![], TokenUsage::default()));
+            }
+        };
 
         // Log completion of all parallel tools
         let result_sizes: Vec<usize> = results.iter().map(|(m, _, _)| m.content.len()).collect();

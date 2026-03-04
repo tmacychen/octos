@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crew_core::{InboundMessage, OutboundMessage};
 use eyre::Result;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::bus::BusPublisher;
 use crate::coalesce::{ChunkConfig, split_message};
@@ -92,16 +92,21 @@ impl ChannelManager {
 
     /// Start all channels and the outbound dispatcher.
     /// Consumes the BusPublisher to own the outbound receiver.
-    pub async fn start_all(&self, mut publisher: BusPublisher) -> Result<()> {
+    pub async fn start_all(&self, publisher: BusPublisher) -> Result<()> {
+        // Decompose publisher: drop its in_tx so channels are the sole senders
         let inbound_tx = publisher.inbound_sender();
+        let (publisher_in_tx, mut out_rx) = publisher.into_parts();
+        drop(publisher_in_tx); // Drop publisher's own in_tx to prevent leak
 
         // Spawn each channel's listener
         for channel in self.channels.values() {
             let ch = Arc::clone(channel);
             let tx = inbound_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = ch.start(tx).await {
-                    error!(channel = ch.name(), "Channel stopped with error: {e}");
+                let name = ch.name().to_string();
+                match ch.start(tx).await {
+                    Ok(()) => warn!(channel = %name, "Channel listener exited cleanly (may need restart)"),
+                    Err(e) => error!(channel = %name, "Channel stopped with error: {e}"),
                 }
             });
         }
@@ -111,8 +116,8 @@ impl ChannelManager {
 
         // Outbound dispatcher — routes messages to the correct channel
         let channels = self.channels.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = publisher.recv_outbound().await {
+        let dispatcher_handle = tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
                 if let Some(channel) = channels.get(&msg.channel) {
                     if !msg.media.is_empty() {
                         // File attachments: send directly without chunking
@@ -153,6 +158,13 @@ impl ChannelManager {
             info!("Outbound dispatcher stopped");
         });
 
+        // Monitor dispatcher for panics
+        tokio::spawn(async move {
+            if let Err(e) = dispatcher_handle.await {
+                error!("CRITICAL: outbound dispatcher panicked: {e}");
+            }
+        });
+
         Ok(())
     }
 
@@ -162,10 +174,17 @@ impl ChannelManager {
     }
 
     pub async fn stop_all(&self) -> Result<()> {
+        let mut errors = Vec::new();
         for channel in self.channels.values() {
-            channel.stop().await?;
+            if let Err(e) = channel.stop().await {
+                errors.push(format!("{}: {e}", channel.name()));
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(eyre::eyre!("failed to stop channels: {}", errors.join(", ")))
+        }
     }
 }
 

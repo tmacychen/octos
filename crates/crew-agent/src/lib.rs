@@ -23,7 +23,10 @@ mod sanitize;
 pub mod skills;
 pub mod tools;
 
-pub use agent::{Agent, AgentConfig, ConversationResponse, TokenTracker};
+pub use agent::{
+    Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
+    DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, TokenTracker,
+};
 pub use hooks::{HookConfig, HookContext, HookEvent, HookExecutor};
 pub use mcp::{McpClient, McpServerConfig};
 pub use plugins::PluginLoader;
@@ -36,6 +39,7 @@ pub use tools::{
     SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
     ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
     WriteFileTool,
+    admin_api::{AdminApiContext, register_admin_api_tools},
 };
 
 #[cfg(test)]

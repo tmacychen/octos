@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +33,10 @@ impl OpenAIEmbedder {
     /// Default model: text-embedding-3-small (1536 dimensions).
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::provider::build_http_client(
+                crate::provider::DEFAULT_EMBEDDING_TIMEOUT_SECS,
+                crate::provider::DEFAULT_EMBEDDING_CONNECT_TIMEOUT_SECS,
+            ),
             api_key: SecretString::from(api_key.into()),
             model: "text-embedding-3-small".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),

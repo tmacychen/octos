@@ -520,6 +520,8 @@ pub async fn test_provider(
             model: Some(req.model.clone()),
             base_url: req.base_url.clone(),
             model_hints: None,
+            llm_timeout_secs: None,
+            llm_connect_timeout_secs: None,
         };
         match crew_llm::registry::lookup(&req.provider) {
             Some(entry) => (entry.create)(params)
@@ -953,5 +955,139 @@ pub async fn create_sub_account(
             profile: mask_secrets(&sub),
             status,
         }),
+    ))
+}
+
+// ── System metrics endpoint ──────────────────────────────────────────
+
+/// GET /api/admin/system/metrics — return system resource metrics (CPU, memory, disk).
+pub async fn system_metrics(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sysinfo::{Disks, System};
+
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    // CPU info
+    let cpu_count = sys.cpus().len();
+    let cpu_usage: f32 = if cpu_count > 0 {
+        sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / cpu_count as f32
+    } else {
+        0.0
+    };
+    let cpu_brand = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().to_string())
+        .unwrap_or_default();
+
+    // Memory
+    let total_memory = sys.total_memory();
+    let used_memory = sys.used_memory();
+    let available_memory = sys.available_memory();
+    let total_swap = sys.total_swap();
+    let used_swap = sys.used_swap();
+
+    // Disks
+    let disks = Disks::new_with_refreshed_list();
+    let disk_info: Vec<serde_json::Value> = disks
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d.name().to_string_lossy(),
+                "mount_point": d.mount_point().to_string_lossy(),
+                "total_bytes": d.total_space(),
+                "available_bytes": d.available_space(),
+                "used_bytes": d.total_space().saturating_sub(d.available_space()),
+                "file_system": String::from_utf8_lossy(d.file_system().as_encoded_bytes()),
+            })
+        })
+        .collect();
+
+    // Platform
+    let hostname = System::host_name().unwrap_or_default();
+    let os_name = System::name().unwrap_or_default();
+    let os_version = System::os_version().unwrap_or_default();
+    let uptime = System::uptime();
+
+    Ok(Json(serde_json::json!({
+        "cpu": {
+            "usage_percent": (cpu_usage * 10.0).round() / 10.0,
+            "core_count": cpu_count,
+            "brand": cpu_brand,
+        },
+        "memory": {
+            "total_bytes": total_memory,
+            "used_bytes": used_memory,
+            "available_bytes": available_memory,
+        },
+        "swap": {
+            "total_bytes": total_swap,
+            "used_bytes": used_swap,
+        },
+        "disks": disk_info,
+        "platform": {
+            "hostname": hostname,
+            "os": os_name,
+            "os_version": os_version,
+            "uptime_secs": uptime,
+        },
+    })))
+}
+
+// ── Monitor control endpoints ────────────────────────────────────────
+
+/// GET /api/admin/monitor/status — returns watchdog/alerts status.
+pub async fn monitor_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let watchdog = state
+        .watchdog_enabled
+        .as_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
+    let alerts = state
+        .alerts_enabled
+        .as_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
+
+    Ok(Json(serde_json::json!({
+        "watchdog_enabled": watchdog,
+        "alerts_enabled": alerts,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct MonitorToggleRequest {
+    pub enabled: bool,
+}
+
+/// POST /api/admin/monitor/watchdog — toggle watchdog.
+pub async fn toggle_watchdog(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MonitorToggleRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(ref flag) = state.watchdog_enabled {
+        flag.store(req.enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+    let status = if req.enabled { "enabled" } else { "disabled" };
+    Ok(Json(
+        serde_json::json!({ "ok": true, "message": format!("Watchdog {status}") }),
+    ))
+}
+
+/// POST /api/admin/monitor/alerts — toggle alerts.
+pub async fn toggle_alerts(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MonitorToggleRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(ref flag) = state.alerts_enabled {
+        flag.store(req.enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+    let status = if req.enabled { "enabled" } else { "disabled" };
+    Ok(Json(
+        serde_json::json!({ "ok": true, "message": format!("Alerts {status}") }),
     ))
 }

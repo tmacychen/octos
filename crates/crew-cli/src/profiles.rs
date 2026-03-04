@@ -76,6 +76,10 @@ pub struct ProfileConfig {
     /// Lifecycle hooks for agent events (per-profile).
     #[serde(default)]
     pub hooks: Vec<crew_agent::HookConfig>,
+    /// Admin mode: when true, gateway registers only admin management tools
+    /// (no shell, file, web, browser tools). Used for the admin bot profile.
+    #[serde(default)]
+    pub admin_mode: bool,
 }
 
 /// Email sending tool configuration for a profile.
@@ -599,10 +603,9 @@ pub(crate) fn config_from_profile(
             channels,
             max_history: profile.config.gateway.max_history.unwrap_or(50),
             system_prompt: profile.config.gateway.system_prompt.clone(),
-            queue_mode: QueueMode::default(),
-            max_sessions: 1000,
             max_concurrent_sessions: profile.config.gateway.max_concurrent_sessions.unwrap_or(10),
             browser_timeout_secs: profile.config.gateway.browser_timeout_secs,
+            ..Default::default()
         }),
         fallback_models,
         // Fields not configured through profiles — use defaults
@@ -635,8 +638,8 @@ pub(crate) fn config_from_profile(
         adaptive_routing: None,
         #[cfg(feature = "api")]
         dashboard_auth: None,
-        #[cfg(feature = "admin-bot")]
-        admin_bot: None,
+        #[cfg(feature = "api")]
+        monitor: None,
     }
 }
 
