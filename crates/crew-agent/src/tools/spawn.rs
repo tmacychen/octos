@@ -27,6 +27,8 @@ pub struct SpawnTool {
     provider_policy: Option<ToolPolicy>,
     /// Optional router for resolving prefixed model IDs to sub-providers.
     provider_router: Option<Arc<ProviderRouter>>,
+    /// Default worker prompt for sub-agents (overrides compiled-in worker.txt).
+    worker_prompt: Option<String>,
 }
 
 impl SpawnTool {
@@ -45,6 +47,7 @@ impl SpawnTool {
             worker_count: AtomicU32::new(0),
             provider_policy: None,
             provider_router: None,
+            worker_prompt: None,
         }
     }
 
@@ -57,6 +60,12 @@ impl SpawnTool {
     /// Set a provider router for multi-model sub-agent support.
     pub fn with_provider_router(mut self, router: Arc<ProviderRouter>) -> Self {
         self.provider_router = Some(router);
+        self
+    }
+
+    /// Set a default worker prompt for sub-agents (overrides compiled-in worker.txt).
+    pub fn with_worker_prompt(mut self, prompt: String) -> Self {
+        self.worker_prompt = Some(prompt);
         self
     }
 
@@ -279,6 +288,8 @@ impl Tool for SpawnTool {
             let mut worker = Agent::new(worker_id, sub_llm, tools, self.memory.clone());
             if let Some(ref sp) = input.system_prompt {
                 worker = worker.with_system_prompt(sp.clone());
+            } else if let Some(ref wp) = self.worker_prompt {
+                worker = worker.with_system_prompt(wp.clone());
             }
 
             let subtask = Task::new(
@@ -320,6 +331,7 @@ impl Tool for SpawnTool {
             let wid = worker_id.clone();
             let provider_policy = self.provider_policy.clone();
             let custom_system_prompt = input.system_prompt;
+            let default_worker_prompt = self.worker_prompt.clone();
 
             tokio::spawn(async move {
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
@@ -335,6 +347,8 @@ impl Tool for SpawnTool {
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory);
                 if let Some(sp) = custom_system_prompt {
                     worker = worker.with_system_prompt(sp);
+                } else if let Some(wp) = default_worker_prompt {
+                    worker = worker.with_system_prompt(wp);
                 }
 
                 let subtask = Task::new(
@@ -410,6 +424,7 @@ mod tests {
             worker_count: AtomicU32::new(0),
             provider_policy: None,
             provider_router: None,
+            worker_prompt: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);

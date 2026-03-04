@@ -40,10 +40,25 @@ pub use status::StatusCommand;
 /// crew-rs: Rust-native coding agent orchestration.
 #[derive(Debug, Parser)]
 #[command(name = "crew")]
-#[command(author, version, about, long_about = None)]
+#[command(author, about, long_about = None)]
+#[command(version = version_string())]
 pub struct Args {
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Build a version string like "0.1.0 (abc1234 2026-03-02)".
+fn version_string() -> &'static str {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    const GIT_HASH: &str = env!("CREW_GIT_HASH");
+    const BUILD_DATE: &str = env!("CREW_BUILD_DATE");
+
+    // Leak a formatted string so we get a &'static str for clap
+    if GIT_HASH.is_empty() {
+        VERSION
+    } else {
+        Box::leak(format!("{VERSION} ({GIT_HASH} {BUILD_DATE})").into_boxed_str())
+    }
 }
 
 /// Available commands.
@@ -100,6 +115,21 @@ pub(crate) fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<Pa
     };
     std::fs::create_dir_all(&dir).ok();
     Ok(dir)
+}
+
+/// Load a prompt from `~/.crew/prompts/{name}.md` at runtime.
+/// Falls back to `compiled_default` if the file doesn't exist or is empty.
+pub(crate) fn load_prompt(name: &str, compiled_default: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".crew/prompts").join(format!("{name}.md"));
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    compiled_default.to_string()
 }
 
 /// Load optional bootstrap/personality files from the .crew/ directory.
