@@ -50,8 +50,14 @@ pub struct Args {
 /// Build a version string like "0.1.0 (abc1234 2026-03-02)".
 fn version_string() -> &'static str {
     const VERSION: &str = env!("CARGO_PKG_VERSION");
-    const GIT_HASH: &str = env!("CREW_GIT_HASH");
-    const BUILD_DATE: &str = env!("CREW_BUILD_DATE");
+    const GIT_HASH: &str = match option_env!("CREW_GIT_HASH") {
+        Some(v) => v,
+        None => "",
+    };
+    const BUILD_DATE: &str = match option_env!("CREW_BUILD_DATE") {
+        Some(v) => v,
+        None => "",
+    };
 
     // Leak a formatted string so we get a &'static str for clap
     if GIT_HASH.is_empty() {

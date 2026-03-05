@@ -195,6 +195,8 @@ impl ServeCommand {
             auth_manager,
             http_client: reqwest::Client::new(),
             config_path: resolved_config_path,
+            watchdog_enabled: None,
+            alerts_enabled: None,
         });
 
         // Auto-start enabled profiles
