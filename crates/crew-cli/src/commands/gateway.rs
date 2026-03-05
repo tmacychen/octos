@@ -104,6 +104,9 @@ impl Executable for GatewayCommand {
 
 impl GatewayCommand {
     async fn run_async(self) -> Result<()> {
+        // Use eprintln! for the startup banner so it reaches the server's stderr
+        // reader immediately (stderr is unbuffered, unlike piped stdout).
+        eprintln!("[gateway] starting");
         println!("{}", "crew gateway".cyan().bold());
         println!();
 
@@ -113,6 +116,7 @@ impl GatewayCommand {
         };
 
         let mut profile_id: Option<String> = None;
+        eprintln!("[gateway] loading config (profile={:?})", self.profile.as_deref().map(|p| p.display().to_string()));
         let mut admin_mode = false;
         let config = if let Some(ref profile_path) = self.profile {
             // Load config from profile JSON (single source of truth)
@@ -179,11 +183,13 @@ impl GatewayCommand {
                 ..Default::default()
             });
 
+        eprintln!("[gateway] provider={provider_name}");
         println!("{}: {}", "Provider".green(), provider_name);
 
         // Create LLM provider (reuses the shared create_provider from chat.rs)
         use super::chat::create_provider;
         let base_provider = create_provider(&provider_name, &config, model, base_url)?;
+        eprintln!("[gateway] LLM provider created, model={}", base_provider.model_id());
 
         let model_id = base_provider.model_id().to_string();
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
@@ -280,18 +286,22 @@ impl GatewayCommand {
             GroqTranscriber::new(key)
         });
 
+        eprintln!("[gateway] opening episode store at {}", data_dir.display());
         let memory = Arc::new(
             EpisodeStore::open(&data_dir)
                 .await
                 .wrap_err("failed to open episode store")?,
         );
+        eprintln!("[gateway] episode store opened");
 
         // Initialize memory store
+        eprintln!("[gateway] opening memory store");
         let memory_store = Arc::new(
             MemoryStore::open(&data_dir)
                 .await
                 .wrap_err("failed to open memory store")?,
         );
+        eprintln!("[gateway] memory store opened");
 
         // Initialize skills loader (project-level, from cwd/.crew/)
         let project_dir = cwd.join(".crew");
@@ -857,7 +867,9 @@ impl GatewayCommand {
             .unwrap_or_default();
 
         // Start channels and dispatcher
+        eprintln!("[gateway] starting channels");
         channel_mgr.start_all(publisher).await?;
+        eprintln!("[gateway] channels started");
 
         // Set up Ctrl+C handler
         tokio::spawn(async move {
@@ -875,6 +887,7 @@ impl GatewayCommand {
             gw_config.max_concurrent_sessions
         );
         println!();
+        eprintln!("[gateway] ready");
         println!(
             "{}",
             "Gateway ready. Type a message or /quit to exit.".dimmed()

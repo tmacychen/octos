@@ -50,10 +50,11 @@ metrics-exporter-prometheus = { workspace = true, optional = true }
 lettre = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
+sysinfo = { version = "0.34", optional = true }
 
 [features]
 default = []
-api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand"]
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo"]
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["crew-bus/telegram"]
 discord = ["crew-bus/discord"]

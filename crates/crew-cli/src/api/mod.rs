@@ -51,4 +51,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Path to the global config.json file (for admin bot config editing).
     pub config_path: Option<PathBuf>,
+    /// Whether the watchdog monitor is enabled.
+    pub watchdog_enabled: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Whether alerts are enabled.
+    pub alerts_enabled: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
