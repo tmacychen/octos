@@ -1812,8 +1812,8 @@ async fn process_session_message(
             // is empty or starts with [SILENT] (allows conditional-notify jobs).
             let is_cron = inbound.channel == "system" && inbound.sender_id == "cron";
             let is_silent = content.trim().is_empty()
-                || content.trim_start().starts_with("[SILENT]")
-                || content.trim_start().starts_with("[NO_CHANGE]");
+                || content.contains("[SILENT]")
+                || content.contains("[NO_CHANGE]");
 
             if is_cron && is_silent {
                 tracing::debug!("cron job response suppressed (silent/empty)");

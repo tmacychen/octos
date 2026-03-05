@@ -1599,13 +1599,13 @@ pub async fn platform_models_catalog(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid response: {e}")))?;
 
-    // Filter to only ASR + TTS models (crew platform skills don't use Image/LLM/VLM)
+    // Only expose supported Qwen3 ASR/TTS models (filter out legacy funasr/paraformer/etc.)
     if let Some(models) = body.get("models").and_then(|v| v.as_array()) {
         let filtered: Vec<&serde_json::Value> = models
             .iter()
             .filter(|m| {
-                let cat = m.get("category").and_then(|v| v.as_str()).unwrap_or("");
-                cat.eq_ignore_ascii_case("asr") || cat.eq_ignore_ascii_case("tts")
+                let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                id.starts_with("qwen3-asr") || id.starts_with("qwen3-tts")
             })
             .collect();
         Ok(Json(serde_json::json!({ "models": filtered })))

@@ -26,6 +26,8 @@ struct GeoLocation {
     country: Option<String>,
     admin1: Option<String>,
     timezone: Option<String>,
+    #[serde(default)]
+    population: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -102,31 +104,35 @@ fn geocode(client: &reqwest::blocking::Client, city: &str) -> GeoLocation {
     let encoded = urlencoded(city);
     let has_non_ascii = city.bytes().any(|b| b > 127);
 
-    // For ASCII-only input, just search without language hint
-    // For non-ASCII input, try common languages that match the script
+    // Always try without language hint first (finds well-known cities by any name),
+    // then for non-ASCII input also try language-specific hints as fallback.
     let langs: &[&str] = if has_non_ascii {
-        &["zh", "ja", "ko", "ru", "ar", "hi", ""]
+        &["", "zh", "ja", "ko", "ru", "ar", "hi"]
     } else {
         &[""]
     };
 
     for lang in langs {
         let url = if lang.is_empty() {
-            format!("https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=1")
+            format!("https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=5")
         } else {
-            format!("https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=1&language={lang}")
+            format!("https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=5&language={lang}")
         };
 
         if let Ok(r) = client.get(&url).send() {
             if let Ok(geo) = r.json::<GeoResult>() {
-                if let Some(loc) = geo.results.and_then(|r| r.into_iter().next()) {
-                    return loc;
+                if let Some(mut results) = geo.results {
+                    if !results.is_empty() {
+                        // Pick the most populated result (avoids returning tiny hamlets)
+                        results.sort_by(|a, b| b.population.unwrap_or(0).cmp(&a.population.unwrap_or(0)));
+                        return results.into_iter().next().unwrap();
+                    }
                 }
             }
         }
     }
 
-    fail(&format!("City '{}' not found. Try a different name or add country (e.g. 'Paris, France').", city));
+    fail(&format!("City '{}' not found. Please retry with the English/romanized city name (e.g. 'Saratoga' instead of '萨拉托加', 'Tokyo' instead of '東京').", city));
 }
 
 fn weather_description(code: u32) -> &'static str {
