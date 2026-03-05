@@ -1166,3 +1166,465 @@ pub async fn toggle_alerts(
         serde_json::json!({ "ok": true, "alerts_enabled": req.enabled }),
     ))
 }
+
+// ── Skill management ─────────────────────────────────────────────────
+
+/// GET /api/admin/profiles/:id/skills — list installed skills for a profile.
+pub async fn list_profile_skills(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let skills = crate::commands::skills::list_skills(&skills_dir)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "skills": skills })))
+}
+
+#[derive(Deserialize)]
+pub struct InstallSkillRequest {
+    pub repo: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default = "default_branch")]
+    pub branch: String,
+}
+
+fn default_branch() -> String {
+    "main".to_string()
+}
+
+/// POST /api/admin/profiles/:id/skills — install a skill from GitHub.
+pub async fn install_profile_skill(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<InstallSkillRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    // install_via_git is blocking (spawns git process)
+    let result = tokio::task::spawn_blocking(move || {
+        crate::commands::skills::install_skill(&skills_dir, &req.repo, req.force, &req.branch)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "installed": result.installed,
+        "skipped": result.skipped,
+        "deps_installed": result.deps_installed,
+    })))
+}
+
+/// DELETE /api/admin/profiles/:id/skills/:name — remove an installed skill.
+pub async fn remove_profile_skill(
+    State(state): State<Arc<AppState>>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    crate::commands::skills::remove_skill(&skills_dir, &name)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    Ok(Json(ActionResponse {
+        ok: true,
+        message: Some(format!("Removed skill: {name}")),
+    }))
+}
+
+// ── Platform Skills ──────────────────────────────────────────────────
+
+fn ominix_api_url() -> String {
+    std::env::var("OMINIX_API_URL")
+        .unwrap_or_else(|_| "http://localhost:8080".to_string())
+}
+
+fn models_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(
+        std::env::var("OMINIX_MODELS_DIR")
+            .unwrap_or_else(|_| {
+                // Try both common locations
+                let p1 = format!("{home}/.ominix/models");
+                let p2 = format!("{home}/.OminiX/models");
+                if std::path::Path::new(&p1).exists() { p1 } else { p2 }
+            }),
+    )
+}
+
+/// GET /api/admin/platform-skills — list platform skills and their status.
+pub async fn list_platform_skills(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let skills_dir = store.crew_home_dir().join("skills");
+
+    // List installed platform skills
+    let installed = crate::commands::skills::list_skills(&skills_dir)
+        .unwrap_or_default();
+
+    // Check ominix-api health
+    let ominix_url = ominix_api_url();
+    let health_url = format!("{}/health", ominix_url.trim_end_matches('/'));
+    let ominix_healthy = state.http_client
+        .get(&health_url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+
+    // Check launchd service status
+    let service_status = tokio::process::Command::new("launchctl")
+        .args(["list", "io.ominix.ominix-api"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // Check models
+    let mdir = models_dir();
+    let asr_models: Vec<String> = std::fs::read_dir(&mdir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_lowercase();
+                    n.contains("asr") || n.contains("whisper")
+                })
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let tts_models: Vec<String> = std::fs::read_dir(&mdir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_lowercase();
+                    n.contains("tts")
+                })
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Build platform skills list
+    let mut skills = Vec::new();
+    for &(name, _, _, _) in crew_agent::bundled_app_skills::PLATFORM_SKILLS {
+        let is_installed = installed.iter().any(|s| s.name == name);
+        skills.push(serde_json::json!({
+            "name": name,
+            "installed": is_installed,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "platform_skills": skills,
+        "skills_dir": skills_dir.display().to_string(),
+        "ominix_api": {
+            "url": ominix_url,
+            "healthy": ominix_healthy,
+            "service_registered": service_status,
+        },
+        "models": {
+            "dir": mdir.display().to_string(),
+            "asr": asr_models,
+            "tts": tts_models,
+        }
+    })))
+}
+
+/// POST /api/admin/platform-skills/:name/install — install/update a platform skill.
+pub async fn install_platform_skill(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let skills_dir = store.crew_home_dir().join("skills");
+    std::fs::create_dir_all(&skills_dir).ok();
+
+    if crew_agent::bootstrap::bootstrap_single_skill(&skills_dir, &name) {
+        Ok(Json(ActionResponse {
+            ok: true,
+            message: Some(format!("Platform skill '{name}' installed")),
+        }))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("Platform skill '{name}' not found or binary missing"),
+        ))
+    }
+}
+
+/// DELETE /api/admin/platform-skills/:name — remove a platform skill.
+pub async fn remove_platform_skill(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let skills_dir = store.crew_home_dir().join("skills");
+
+    crate::commands::skills::remove_skill(&skills_dir, &name)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    Ok(Json(ActionResponse {
+        ok: true,
+        message: Some(format!("Platform skill '{name}' removed")),
+    }))
+}
+
+/// GET /api/admin/platform-skills/:name/health — check backend health for a platform skill.
+pub async fn platform_skill_health(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match name.as_str() {
+        "asr" | "ominix-api" => {
+            let url = ominix_api_url();
+            let health_url = format!("{}/health", url.trim_end_matches('/'));
+            let result = state.http_client
+                .get(&health_url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+
+            let (status, detail) = match result {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    ("healthy", body)
+                }
+                Ok(resp) => ("error", serde_json::json!({"http_status": resp.status().as_u16()})),
+                Err(e) => ("unreachable", serde_json::json!({"error": e.to_string()})),
+            };
+
+            Ok(Json(serde_json::json!({
+                "name": name,
+                "status": status,
+                "url": url,
+                "detail": detail,
+            })))
+        }
+        _ => Err((StatusCode::NOT_FOUND, format!("Unknown platform skill: {name}"))),
+    }
+}
+
+const OMINIX_PLIST: &str = "io.ominix.ominix-api";
+
+/// POST /api/admin/platform-skills/ominix-api/start
+pub async fn platform_service_start() -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let plist_path = format!(
+        "{}/Library/LaunchAgents/{OMINIX_PLIST}.plist",
+        std::env::var("HOME").unwrap_or_default()
+    );
+    let output = tokio::process::Command::new("launchctl")
+        .args(["load", &plist_path])
+        .output()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if output.status.success() {
+        Ok(Json(ActionResponse { ok: true, message: Some("ominix-api service started".into()) }))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(Json(ActionResponse { ok: false, message: Some(format!("launchctl load failed: {stderr}")) }))
+    }
+}
+
+/// POST /api/admin/platform-skills/ominix-api/stop
+pub async fn platform_service_stop() -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let plist_path = format!(
+        "{}/Library/LaunchAgents/{OMINIX_PLIST}.plist",
+        std::env::var("HOME").unwrap_or_default()
+    );
+    let output = tokio::process::Command::new("launchctl")
+        .args(["unload", &plist_path])
+        .output()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if output.status.success() {
+        Ok(Json(ActionResponse { ok: true, message: Some("ominix-api service stopped".into()) }))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(Json(ActionResponse { ok: false, message: Some(format!("launchctl unload failed: {stderr}")) }))
+    }
+}
+
+/// POST /api/admin/platform-skills/ominix-api/restart
+pub async fn platform_service_restart() -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let plist_path = format!(
+        "{}/Library/LaunchAgents/{OMINIX_PLIST}.plist",
+        std::env::var("HOME").unwrap_or_default()
+    );
+    // Unload
+    let _ = tokio::process::Command::new("launchctl")
+        .args(["unload", &plist_path])
+        .output()
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // Load
+    let output = tokio::process::Command::new("launchctl")
+        .args(["load", &plist_path])
+        .output()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if output.status.success() {
+        Ok(Json(ActionResponse { ok: true, message: Some("ominix-api service restarted".into()) }))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(Json(ActionResponse { ok: false, message: Some(format!("Restart failed: {stderr}")) }))
+    }
+}
+
+/// GET /api/admin/platform-skills/ominix-api/logs
+pub async fn platform_service_logs(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let lines: usize = params.get("lines")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+        .min(200);
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    // Try both common log file names
+    let log_path = {
+        let p1 = format!("{home}/.ominix/api.log");
+        let p2 = format!("{home}/.ominix/ominix-api.log");
+        if std::path::Path::new(&p1).exists() { p1 } else { p2 }
+    };
+
+    let content = match tokio::fs::read_to_string(&log_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(Json(serde_json::json!({
+                "log_path": log_path,
+                "error": format!("Cannot read log file: {e}"),
+                "lines": [],
+            })));
+        }
+    };
+
+    let log_lines: Vec<&str> = content.lines().rev().take(lines).collect();
+    let log_lines: Vec<&str> = log_lines.into_iter().rev().collect();
+
+    Ok(Json(serde_json::json!({
+        "log_path": log_path,
+        "total_lines": content.lines().count(),
+        "lines": log_lines,
+    })))
+}
+
+// ── Model Management (proxy to ominix-api) ─────────────────────────
+
+/// GET /api/admin/platform-skills/ominix-api/models — list model catalog
+///
+/// Filters to only ASR + TTS models (the categories relevant to crew platform skills).
+pub async fn platform_models_catalog(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let url = format!("{}/v1/models/catalog", ominix_api_url().trim_end_matches('/'));
+    let resp = state.http_client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ominix-api unreachable: {e}")))?;
+
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid response: {e}")))?;
+
+    // Filter to only ASR + TTS models (crew platform skills don't use Image/LLM/VLM)
+    if let Some(models) = body.get("models").and_then(|v| v.as_array()) {
+        let filtered: Vec<&serde_json::Value> = models.iter()
+            .filter(|m| {
+                let cat = m.get("category").and_then(|v| v.as_str()).unwrap_or("");
+                cat.eq_ignore_ascii_case("asr") || cat.eq_ignore_ascii_case("tts")
+            })
+            .collect();
+        Ok(Json(serde_json::json!({ "models": filtered })))
+    } else {
+        Ok(Json(body))
+    }
+}
+
+/// POST /api/admin/platform-skills/ominix-api/models/download — start model download
+pub async fn platform_models_download(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let url = format!("{}/v1/models/download", ominix_api_url().trim_end_matches('/'));
+    let resp = state.http_client
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ominix-api unreachable: {e}")))?;
+
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp.json().await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid response: {e}")))?;
+
+    if status.is_success() {
+        Ok(Json(resp_body))
+    } else {
+        Err((StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+             serde_json::to_string(&resp_body).unwrap_or_default()))
+    }
+}
+
+/// POST /api/admin/platform-skills/ominix-api/models/remove — remove a downloaded model
+pub async fn platform_models_remove(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let url = format!("{}/v1/models/remove", ominix_api_url().trim_end_matches('/'));
+    let resp = state.http_client
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ominix-api unreachable: {e}")))?;
+
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp.json().await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid response: {e}")))?;
+
+    if status.is_success() {
+        Ok(Json(resp_body))
+    } else {
+        Err((StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+             serde_json::to_string(&resp_body).unwrap_or_default()))
+    }
+}
