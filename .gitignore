@@ -33,3 +33,4 @@ node_modules/
 !docs/**/*.md
 !crates/crew-agent/skills/**/SKILL.md
 !crates/app-skills/**/SKILL.md
+!crates/platform-skills/**/SKILL.md
