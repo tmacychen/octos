@@ -1,6 +1,6 @@
 # crew-rs
 
-Rust-native AI agent framework with multi-channel gateway, 12+ LLM providers, web dashboard, and coding automation tools.
+Rust-native AI agent framework with multi-channel gateway, 14 LLM providers, web dashboard, and coding automation tools.
 
 ## Table of Contents
 
@@ -25,6 +25,7 @@ Rust-native AI agent framework with multi-channel gateway, 12+ LLM providers, we
   - [Feishu / Lark](#feishu--lark)
   - [Email (IMAP/SMTP)](#email-imapsmtp)
   - [Twilio SMS](#twilio-sms)
+  - [WeCom / WeChat Work](#wecom--wechat-work)
 - [Web Dashboard](#web-dashboard)
   - [Starting the Dashboard](#starting-the-dashboard)
   - [Email OTP Authentication](#email-otp-authentication)
@@ -33,6 +34,8 @@ Rust-native AI agent framework with multi-channel gateway, 12+ LLM providers, we
   - [Dashboard API Reference](#dashboard-api-reference)
 - [Multi-User Setup](#multi-user-setup)
 - [Tools](#tools)
+- [Account Management](#account-management)
+- [Office Tools](#office-tools)
 - [Memory System](#memory-system)
 - [Skills System](#skills-system)
 - [Sandbox Isolation](#sandbox-isolation)
@@ -46,8 +49,8 @@ Rust-native AI agent framework with multi-channel gateway, 12+ LLM providers, we
 
 ## Features
 
-- **12+ LLM providers**: Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, Moonshot/Kimi, DashScope/Qwen, MiniMax, Zhipu/GLM, Z.AI, Nvidia NIM, Ollama, vLLM
-- **Multi-channel gateway**: CLI, Telegram, Discord, Slack, WhatsApp, Feishu/Lark, Email (IMAP/SMTP), Twilio SMS
+- **14 LLM providers**: Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, Moonshot/Kimi, DashScope/Qwen, MiniMax, Zhipu/GLM, Z.AI, Nvidia NIM, Ollama, vLLM
+- **Multi-channel gateway**: CLI, Telegram, Discord, Slack, WhatsApp, Feishu/Lark, Email (IMAP/SMTP), Twilio SMS, WeCom/WeChat Work
 - **Web dashboard**: Multi-user admin panel with per-user profile management, gateway controls, and live log streaming
 - **Email OTP auth**: Larksuite-style email verification code login for the dashboard
 - **OAuth login**: `crew auth login` with PKCE browser flow, device code flow, or paste-token
@@ -73,6 +76,12 @@ Rust-native AI agent framework with multi-channel gateway, 12+ LLM providers, we
 - **Built-in tools**: Shell, file ops, glob, grep, list_dir, web search/fetch, message, spawn, cron, browser (feature-gated)
 - **Plugin system**: Load custom tools from `plugins/` directories
 - **Config migration**: Versioned config with automatic migration
+- **Adaptive routing**: Metrics-driven provider selection with latency tracking and circuit breakers
+- **Self-updater**: Check and install updates via admin API
+- **Pipeline orchestration**: DOT-based multi-step workflow execution
+- **Office tools**: DOCX/PPTX/XLSX manipulation (extract, pack, validate)
+- **Prompt injection guard**: Detection and sanitization of injection attempts
+- **8 bundled app-skills**: news, deep-search, deep-crawl, send-email, weather, account-manager, clock, ASR
 - **Pure Rust TLS**: No OpenSSL dependency (uses rustls)
 
 ---
@@ -101,7 +110,7 @@ npm install -g pptxgenjs react-icons react react-dom sharp
 
 ```bash
 # Clone the repository
-git clone https://github.com/heyong4725/crew-rs.git
+git clone https://github.com/hagency-org/crew-rs.git
 cd crew-rs
 
 # Basic install (CLI + chat only)
@@ -135,7 +144,8 @@ cargo build --release
 | `twilio` | Twilio SMS channel |
 | `git` | Git integration tools |
 | `ast` | AST parsing tools (tree-sitter) |
-| `browser` | Headless Chrome automation (CDP) |
+| `wecom` | WeCom/WeChat Work channel |
+| `admin-bot` | Admin bot via Telegram (requires `api`) |
 
 ---
 
@@ -258,6 +268,33 @@ crew skills remove skill-name             # Remove a skill
 ### `crew channels status`
 
 Show configured gateway channels and their compile/config status.
+
+### `crew account`
+
+Manage sub-accounts under profiles:
+
+```bash
+crew account list --profile <id>     # List sub-accounts
+crew account create --profile <id> <name>  # Create sub-account
+crew account update <id>             # Update sub-account
+crew account delete <id>             # Delete sub-account
+crew account info <id>               # Show sub-account details
+crew account start <id>              # Start sub-account gateway
+crew account stop <id>               # Stop sub-account gateway
+```
+
+### `crew office`
+
+Office file manipulation:
+
+```bash
+crew office extract <file>           # Extract text from DOCX/PPTX/XLSX
+crew office unpack <file> <dir>      # Unpack archive to directory
+crew office pack <dir> <output>      # Pack directory into archive
+crew office clean <dir>              # Remove orphaned files from unpacked PPTX
+crew office add-slide <dir> <source> # Add slide by duplicating or from layout
+crew office validate <path>          # Validate document structure
+```
 
 ### Other Commands
 
@@ -757,6 +794,54 @@ Twilio integration requires a Twilio account, phone number, and webhook configur
 
 ---
 
+### WeCom / WeChat Work
+
+WeCom (企业微信) is Tencent's enterprise messaging platform. The channel uses a Custom App with webhook callback for receiving messages and the WeCom REST API for sending.
+
+**Build**:
+```bash
+cargo install --path crates/crew-cli --features wecom
+```
+
+**Config**:
+```json
+{
+  "gateway": {
+    "channels": [
+      {
+        "type": "wecom",
+        "settings": {
+          "corp_id_env": "WECOM_CORP_ID",
+          "agent_secret_env": "WECOM_AGENT_SECRET",
+          "agent_id": "1000002",
+          "verification_token": "your-callback-token",
+          "encoding_aes_key": "your-encoding-aes-key",
+          "webhook_port": 9322
+        }
+      }
+    ]
+  }
+}
+```
+
+**Environment variables**:
+```bash
+export WECOM_CORP_ID=your-corp-id
+export WECOM_AGENT_SECRET=your-agent-secret
+```
+
+**Setup steps**:
+1. Log in to the [WeCom Admin Console](https://work.weixin.qq.com/) and create a Custom App
+2. Copy the **Corp ID** from the admin console and the **Agent Secret** from the app's credentials
+3. Note the **Agent ID** (numeric) from the app settings
+4. Under **Receive Messages**, set the callback URL to point to your server on the configured `webhook_port` (default: 9322)
+5. Copy the **Token** and **EncodingAESKey** from the callback configuration page
+6. Set environment variables and run `crew gateway`
+
+**Features**: Text messages, image/file/voice media handling, message dedup, pure-Rust AES/SHA1 crypto (no external deps).
+
+---
+
 ## Web Dashboard
 
 The web dashboard provides a browser-based admin panel for managing multiple gateway instances, user accounts, and per-user configurations. It requires the `api` feature flag.
@@ -971,10 +1056,15 @@ When using the dashboard (`crew serve`), each user profile gets its own data dir
 | `message` | Send cross-channel messages |
 | `spawn` | Launch background subagents |
 | `cron` | Schedule recurring tasks |
-| `browser` | Headless Chrome automation (feature: `browser`) |
+| `browser` | Headless Chrome automation |
 | `deep_search` | Multi-round web research with result persistence |
 | `save_memory` | Save information to long-term memory |
 | `recall_memory` | Recall information from memory |
+| `diff_edit` | Diff-based file editing with search/replace |
+| `send_file` | Send file attachments to chat channels |
+| `switch_model` | Switch LLM model at runtime |
+| `run_pipeline` | Execute DOT-based pipeline workflows |
+| `configure_tool` | Runtime tool configuration |
 
 **Tool policies**: Control which tools are available via allow/deny lists:
 
@@ -987,7 +1077,19 @@ When using the dashboard (`crew serve`), each user profile gets its own data dir
 }
 ```
 
-Named groups: `group:fs` (file tools), `group:runtime` (shell/spawn), `group:search` (glob/grep), `group:web` (web_search/web_fetch), `group:sessions` (session tools).
+Named groups: `group:fs` (read_file/write_file/edit_file/diff_edit), `group:runtime` (shell), `group:search` (glob/grep/list_dir), `group:web` (web_search/web_fetch/browser), `group:sessions` (spawn).
+
+---
+
+## Account Management
+
+Sub-accounts inherit LLM provider config from a parent profile but have their own data directory (memory, sessions, episodes, skills) and channels. See `crew account` CLI commands above.
+
+---
+
+## Office Tools
+
+Native Rust office file manipulation for DOCX, PPTX, and XLSX files. Replaces Python scripts with `zip` + `quick-xml`. See `crew office` CLI commands above.
 
 ---
 
@@ -1125,13 +1227,16 @@ The heartbeat service runs periodic background checks independently of cron jobs
 ```
 crew-rs/
   crates/
-    crew-core/      # Types, task model, message protocols, UTF-8 utilities
-    crew-memory/    # Episodic memory (redb), memory store, hybrid BM25+vector search
-    crew-llm/       # LLM provider abstraction (4 native + 8 OpenAI-compatible)
-    crew-agent/     # Agent runtime, tool system, sandbox, MCP, compaction, hooks, plugins
-    crew-bus/       # Message bus, channels, sessions, cron, heartbeat, coalescing
-    crew-cli/       # CLI interface, API server, dashboard, profiles, user management, OTP auth
-  dashboard/        # React 19 + Vite + Tailwind CSS web dashboard
+    crew-core/         # Types, task model, message protocols, UTF-8 utilities
+    crew-memory/       # Episodic memory (redb), memory store, hybrid BM25+vector search
+    crew-llm/          # LLM provider abstraction (14 provider registry entries)
+    crew-agent/        # Agent runtime, tool system, sandbox, MCP, compaction, hooks, plugins
+    crew-bus/          # Message bus, channels, sessions, cron, heartbeat, coalescing
+    crew-cli/          # CLI interface, API server, dashboard, profiles, user management, OTP auth
+    crew-pipeline/     # DOT-based pipeline parser, executor, and tool integration
+    app-skills/        # 7 bundled app-skills (news, deep-search, deep-crawl, send-email, weather, account-manager, time)
+    platform-skills/   # Platform-specific skills (asr)
+  dashboard/           # React 19 + Vite + Tailwind CSS web dashboard
 ```
 
 **Agent loop** (`crew-agent/src/agent.rs`):
@@ -1162,6 +1267,7 @@ cargo test -p crew-cli test_name  # Run single test
 cargo clippy --workspace          # Lint
 cargo fmt --all                   # Format
 cargo fmt --all -- --check        # Check formatting
+./scripts/pre-release.sh          # Full pre-release smoke test
 ```
 
 ---

@@ -27,11 +27,13 @@ UserProfile                          Config
 │   │   ├── max_history              ├── fallback_models: Vec<FallbackModel>
 │   │   ├── max_iterations           ├── mcp_servers, sandbox, hooks
 │   │   ├── system_prompt            ├── tool_policy, embedding
-│   │   ├── max_concurrent_sessions  ├── sub_providers, email
-│   │   └── browser_timeout_secs     └── context_filter
-│   └── env_vars: HashMap<String,String>
-├── created_at
-└── updated_at
+│   │   ├── max_concurrent_sessions  ├── sub_providers: Vec<SubProviderConfig>
+│   │   └── browser_timeout_secs     ├── context_filter: Option<Vec<String>>
+│   └── env_vars: HashMap<String,String>  ├── adaptive_routing: Option<AdaptiveRoutingConfig>
+├── created_at                       ├── voice: Option<VoiceConfig>
+└── updated_at                       ├── email: Option<EmailConfig>
+                                     ├── dashboard_auth: Option<DashboardAuthConfig>  #[cfg(feature = "api")]
+                                     └── monitor: Option<MonitorConfig>               #[cfg(feature = "api")]
 ```
 
 `UserProfile` is the dashboard/API format. `Config` is the gateway runtime format. The bridge between them is `config_from_profile()`.

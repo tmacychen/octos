@@ -52,14 +52,14 @@ crew-rs is a Rust-native AI agent framework that operates in two modes:
 ### From Source
 
 ```bash
-git clone https://github.com/heyong4725/crew-rs
+git clone https://github.com/hagency-org/crew-rs
 cd crew-rs
 
 # Basic (CLI, chat, run, gateway with CLI channel)
 cargo install --path crates/crew-cli
 
 # With messaging channels
-cargo install --path crates/crew-cli --features telegram,discord,slack,whatsapp,feishu,email
+cargo install --path crates/crew-cli --features telegram,discord,slack,whatsapp,feishu,email,wecom
 
 # With browser automation (requires Chrome/Chromium)
 cargo install --path crates/crew-cli --features browser
@@ -178,7 +178,7 @@ Options:
       --model <NAME>       Model name
       --base-url <URL>     Custom API endpoint
   -m, --message <MSG>      Single message (non-interactive)
-      --max-iterations <N> Max tool iterations per message (default: 20)
+      --max-iterations <N> Max tool iterations per message (default: 50)
   -v, --verbose            Show tool outputs
       --no-retry           Disable retry
 ```
@@ -294,6 +294,27 @@ crew channels status           # Show channel compile/config status
 crew channels login            # WhatsApp QR code login
 ```
 
+### `crew office`
+
+Office file manipulation (DOCX/PPTX/XLSX). Native Rust replacements for Python scripts.
+
+```bash
+crew office extract <file>               # Extract text as Markdown
+crew office unpack <file> <output-dir>   # Unpack into pretty-printed XML
+crew office pack <input-dir> <output>    # Pack directory into Office file
+crew office clean <dir>                  # Remove orphaned files from unpacked PPTX
+```
+
+### `crew account`
+
+Manage sub-accounts under profiles. Sub-accounts inherit LLM provider config but have their own data directory (memory, sessions, skills) and channels.
+
+```bash
+crew account list --profile <id>                         # List sub-accounts
+crew account create --profile <id> <name> [OPTIONS]      # Create sub-account
+crew account update <id> [OPTIONS]                       # Update sub-account
+```
+
 ### `crew auth`
 
 OAuth login and API key management.
@@ -338,6 +359,8 @@ Fetches `SKILL.md` from the GitHub repo's main branch and installs to `.crew/ski
 | dashscope | `DASHSCOPE_API_KEY` | qwen-max | Also: `qwen` |
 | minimax | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible |
 | zhipu | `ZHIPU_API_KEY` | glm-4-plus | Also: `glm` |
+| zai | `ZAI_API_KEY` | glm-5 | Z.AI, Anthropic-compatible. Also: `z.ai` |
+| nvidia | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | NIM API. Also: `nim` |
 | ollama | (none) | llama3.2 | Local, no key needed |
 | vllm | `VLLM_API_KEY` | (required) | Requires --base-url |
 
@@ -457,11 +480,39 @@ export EMAIL_USERNAME="bot@example.com"
 export EMAIL_PASSWORD="app-specific-password"
 ```
 
-### Voice Transcription
+#### WeCom (WeChat Work)
 
-When `GROQ_API_KEY` is set, voice and audio messages from channels are automatically transcribed using Groq Whisper before being sent to the agent. The transcription is prepended as `[transcription: ...]`.
+Requires a Custom App with message callback URL. Feature-gated behind `wecom`.
 
 ```bash
+export WECOM_CORP_ID="ww..."
+export WECOM_AGENT_SECRET="..."
+```
+
+Config:
+```json
+{
+  "type": "wecom",
+  "settings": {
+    "corp_id_env": "WECOM_CORP_ID",
+    "agent_secret_env": "WECOM_AGENT_SECRET",
+    "agent_id": "1000002",
+    "verification_token": "...",
+    "encoding_aes_key": "...",
+    "webhook_port": 9322
+  }
+}
+```
+
+### Voice Transcription
+
+Voice and audio messages from channels are automatically transcribed before being sent to the agent. The system uses OminiX local ASR first (via `OMINIX_API_URL`, set automatically by `crew serve`) and falls back to Groq Whisper (cloud) when OminiX is unavailable. The transcription is prepended as `[transcription: ...]`.
+
+```bash
+# OminiX (preferred, local) — set automatically by crew serve
+export OMINIX_API_URL="http://localhost:8080"
+
+# Groq Whisper (fallback, cloud)
 export GROQ_API_KEY="gsk_..."
 ```
 
@@ -482,7 +533,7 @@ The agent can schedule recurring tasks via the `cron` tool:
 - `remove` - Delete a job by ID
 - `enable` / `disable` - Toggle job active state
 
-Cron expressions use standard syntax (e.g., `"0 0 9 * * * *"` for daily at 9am).
+Cron expressions use standard syntax (e.g., `"0 0 9 * * * *"` for daily at 9am). Jobs support an optional `timezone` field with IANA timezone names (e.g., `"America/New_York"`, `"Asia/Shanghai"`). When omitted, UTC is used.
 
 Cron jobs send messages through the bus and can deliver responses to any channel.
 
@@ -561,20 +612,32 @@ Frontmatter fields: `name`, `description`, `always` (auto-load), `requires_bins`
 
 Skills with `always: true` are included in every prompt. Others are available for the agent to read on demand.
 
-### Built-in Skills
+### Built-in System Skills
 
-crew-rs bundles 6 skills at compile time. These are available without any setup:
+crew-rs bundles 3 system skills at compile time:
 
 | Skill | Description | Requirements |
 |-------|-------------|-------------|
 | cron | Cron tool usage examples | (none, always-on) |
-| github | gh CLI patterns (PR, issue, API) | `gh` binary |
+| skill-store | Skill installation and management | (none) |
 | skill-creator | How to create custom skills | (none) |
-| summarize | URL/file summarization | `summarize` binary |
-| tmux | tmux session automation | `tmux` binary |
-| weather | Weather via wttr.in | `curl` binary |
 
 Workspace skills in `.crew/skills/` override built-in skills with the same name.
+
+### Bundled App-Skills
+
+8 app-skills are compiled as separate binaries and bootstrapped into `.crew/skills/` at gateway startup:
+
+| Skill | Binary | Description |
+|-------|--------|-------------|
+| news | `news_fetch` | News aggregation |
+| deep-search | `deep-search` | Deep web search |
+| deep-crawl | `deep_crawl` | Deep web crawling |
+| send-email | `send_email` | Email sending |
+| account-manager | `account_manager` | Sub-account management |
+| clock | `clock` | Time and timezone queries |
+| weather | `weather` | Weather information |
+| asr | `asr` | Voice transcription/synthesis (platform skill, requires OminiX) |
 
 ---
 
@@ -628,6 +691,8 @@ Control which tools are available to the agent via `tools` in config:
 - `group:web` -> web_search, web_fetch, browser
 - `group:sessions` -> spawn
 
+**Additional tools** (not in named groups): `send_file`, `switch_model`, `run_pipeline`, `configure_tool`, `cron`, `message`.
+
 **Wildcard matching**: `exec*` matches `exec`, `exec_bg`, etc.
 
 **Deny-wins semantics**: If a tool appears in both allow and deny, it is denied.
@@ -645,6 +710,17 @@ Control which tools are available to the agent via `tools` in config:
   }
 }
 ```
+
+### Additional Config Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `adaptive_routing` | object | Adaptive provider routing configuration |
+| `voice` | object | Voice ASR/TTS configuration (auto-transcription, language) |
+| `sub_providers` | array | Sub-provider configs for subagent spawning |
+| `context_filter` | array of strings | Tag-based tool filtering |
+| `llm_timeout_secs` | integer | LLM call timeout in seconds (gateway) |
+| `tool_timeout_secs` | integer | Tool execution timeout in seconds (gateway) |
 
 ### Sandbox
 
@@ -785,11 +861,12 @@ Configure an embedding provider to enable vector search:
 ```json
 {
   "embedding": {
-    "provider": "openai",
-    "model": "text-embedding-3-small"
+    "provider": "openai"
   }
 }
 ```
+
+The `EmbeddingConfig` supports three fields: `provider` (default: `"openai"`), `api_key_env` (optional override), and `base_url` (optional custom endpoint).
 
 ---
 
@@ -828,6 +905,9 @@ RUST_LOG=crew_agent=trace crew chat --message "task"
 | `DASHSCOPE_API_KEY` | DashScope API key |
 | `MINIMAX_API_KEY` | MiniMax API key |
 | `ZHIPU_API_KEY` | Zhipu API key |
+| `ZAI_API_KEY` | Z.AI API key |
+| `NVIDIA_API_KEY` | Nvidia NIM API key |
+| `OMINIX_API_URL` | OminiX local ASR/TTS API URL |
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
@@ -837,3 +917,5 @@ RUST_LOG=crew_agent=trace crew chat --message "task"
 | `FEISHU_APP_SECRET` | Feishu app secret |
 | `EMAIL_USERNAME` | Email account username |
 | `EMAIL_PASSWORD` | Email account password |
+| `WECOM_CORP_ID` | WeCom corp ID |
+| `WECOM_AGENT_SECRET` | WeCom agent secret |

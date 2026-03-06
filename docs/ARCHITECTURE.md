@@ -2,7 +2,13 @@
 
 ## Overview
 
-crew-rs is a 6-crate Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+crew-rs is a 15-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+
+**Workspace members**:
+- **6 core crates**: crew-core, crew-memory, crew-llm, crew-agent, crew-bus, crew-cli
+- **1 pipeline crate**: crew-pipeline
+- **7 app-skill crates**: news, deep-search, deep-crawl, send-email, account-manager, time, weather
+- **1 platform-skill crate**: asr
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -11,10 +17,10 @@ crew-rs is a 6-crate Rust workspace (Edition 2024, rust-version 1.85.0) providin
 ├──────────────────────────┬──────────────────────────────────┤
 │       crew-agent         │           crew-bus               │
 │  (Agent, Tools, Skills)  │  (Channels, Sessions, Cron)     │
-├──────────┬───────────────┴──────────────────────────────────┤
-│crew-memory│           crew-llm                              │
-│(Episodes) │      (LLM Providers)                            │
-├──────────┴──────────────────────────────────────────────────┤
+├──────────┬───────────────┼──────────────────────────────────┤
+│crew-memory│  crew-llm    │       crew-pipeline              │
+│(Episodes) │ (Providers)  │  (DOT-based orchestration)      │
+├──────────┴───────────────┴──────────────────────────────────┤
 │                       crew-core                             │
 │            (Types, Messages, Gateway Protocol)              │
 └─────────────────────────────────────────────────────────────┘
@@ -302,6 +308,22 @@ pub struct ProviderChain {
 
 **Retryable**: Same criteria as RetryProvider (429, 5xx, connect/timeout errors).
 
+### AdaptiveRouter (`adaptive.rs`)
+
+Metrics-driven provider selection. Tracks per-provider EMA latency, p95 latency, error rates. Includes circuit breaker with probe requests to recover failed providers.
+
+### SwappableProvider (`swappable.rs`)
+
+Runtime model switching via `RwLock`. Allows changing the underlying provider without restarting the agent.
+
+### ProviderRouter (`router.rs`)
+
+Sub-agent multi-model routing. Routes different sub-agent tasks to different providers/models.
+
+### OminixClient (`ominix.rs`)
+
+Client for local ASR/TTS via Ominix runtime.
+
 ### Token Estimation
 
 ```rust
@@ -501,12 +523,25 @@ Triggered when estimated tokens exceed 80% of context window / 1.2 safety margin
 - Assistant: `> Assistant: content` or `- Called tool_name`
 - Tool: `-> tool_name: ok|error - first 100 chars`
 
+### Bundled App Skills (`bundled_app_skills.rs`)
+
+Compile-time embedded app-skill entries. Each app-skill crate (news, deep-search, deep-crawl, etc.) is registered as a bundled skill available at runtime.
+
+### Bootstrap (`bootstrap.rs`)
+
+Bootstraps bundled skills at gateway startup. Ensures all bundled app-skills are registered and available.
+
+### Prompt Guard (`prompt_guard.rs`)
+
+Prompt injection detection. `ThreatKind` enum classifies detected threats. Scans user input before passing to the agent.
+
 ### Tool System
 
 ```rust
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn tags(&self) -> &[&str];
     fn input_schema(&self) -> serde_json::Value;
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult>;
 }
@@ -538,9 +573,9 @@ pub struct ToolResult {
 | **message** | content, channel?, chat_id? | Cross-channel messaging via OutboundMessage. **Gateway-only** |
 | **spawn** | task, label?, mode="background", allowed_tools, context? | Subagent with inherited provider policy. sync=inline, background=async. **Gateway-only** |
 | **cron** | action, message, schedule params | Schedule add/list/remove/enable/disable. **Gateway-only** |
-| **browser** | action, url?, selector?, text?, expression? | Feature-gated (`browser`). Headless Chrome via CDP. Actions: navigate (SSRF + scheme check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization, 10s JS timeout, early action validation |
+| **browser** | action, url?, selector?, text?, expression? | Headless Chrome via CDP (always compiled). Actions: navigate (SSRF + scheme check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization, 10s JS timeout, early action validation |
 
-**Registration**: 10 core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is feature-gated. Message, spawn, and cron are registered only in gateway mode (`gateway.rs`).
+**Registration**: Core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is always compiled. Message, spawn, and cron are registered only in gateway mode (`gateway.rs`).
 
 ### Tool Policies
 
@@ -681,7 +716,7 @@ pub struct SkillsLoader {
 - `get_always_skills()` — filters skills where `always: true` AND `available: true`.
 - `load_skills_for_context(names)` — loads multiple skills, joins with `\n---\n`.
 
-#### Built-in Skills (6, compile-time `include_str!()`)
+#### Built-in Skills (3, compile-time `include_str!()`)
 
 ```rust
 pub struct BuiltinSkill {
@@ -694,9 +729,8 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[...];
 | Skill | Purpose |
 |---|---|
 | cron | Task scheduling instructions |
-| github | GitHub integration (issues, PRs) |
+| skill-store | Skill store browsing and installation |
 | skill-creator | Create new skills |
-| summarize | Conversation summarization |
 | tmux | Terminal multiplexer control |
 | weather | Weather information retrieval |
 
@@ -933,10 +967,14 @@ pub trait Channel: Send + Sync {
 | **WhatsApp** | WebSocket bridge (ws://localhost:3001) | `whatsapp` | Baileys bridge | HashSet (10K cap, clear on overflow) |
 | **Feishu** | WebSocket (tokio-tungstenite) | `feishu` | App ID + Secret → tenant token (TTL 6000s) | HashSet (10K cap, clear on overflow) |
 | **Email** | IMAP poll + SMTP send | `email` | Username/password, rustls TLS | IMAP UNSEEN flag |
+| **WeCom** | WeCom/WeChat Work API | `wecom` | Corp ID + Agent Secret | message_id |
+| **Twilio** | Twilio SMS/MMS | `twilio` | Account SID + Auth Token | message SID |
 
 **Email specifics**: IMAP `async-imap` with rustls for inbound (poll unseen, mark \Seen). SMTP `lettre` for outbound (port 465=implicit TLS, other=STARTTLS). `mailparse` for RFC822 body extraction. Body truncated via `truncate_utf8(max_body_chars)`.
 
 **Feishu specifics**: Tenant access token with TTL cache (6000s). WebSocket gateway URL from `/callback/ws/endpoint`. Message type detection via `header.event_type == "im.message.receive_v1"`. Supports `oc_*` (chat_id) vs `ou_*` (open_id) routing.
+
+**Markdown to HTML**: `markdown_html.rs` converts Markdown to Telegram-compatible HTML for rich message formatting.
 
 **Media**: `download_media()` helper downloads photos/voice/audio/documents to `.crew/media/`.
 
@@ -997,6 +1035,8 @@ Periodic check of `HEARTBEAT.md` (default: 30 min interval). Sends content to ag
 | `cron list/add/remove/enable` | CLI cron job management |
 | `channels status/login` | Channel compilation status, WhatsApp bridge setup |
 | `skills list/install/remove` | Skill management, GitHub fetch |
+| `office` | Office/workspace management |
+| `account` | Account management |
 | `clean` | Remove .redb files with dry-run support |
 | `completions` | Shell completion generation (bash/zsh/fish) |
 | `docs` | Generate tool + provider documentation |
@@ -1059,6 +1099,20 @@ Triggered when message count > 40 (threshold). Keeps 10 recent messages. Summari
 
 ---
 
+## crew-pipeline — DOT-based Pipeline Orchestration
+
+DOT-based pipeline orchestration engine for defining and executing multi-step workflows.
+
+- `parser.rs` — DOT graph parser (parses Graphviz DOT format into pipeline definitions)
+- `graph.rs` — PipelineGraph with node/edge types
+- `executor.rs` — Async pipeline execution engine
+- `handler.rs` — Handler types: CodergenHandler, GateHandler, ShellHandler, NoopHandler, DynamicParallel
+- `condition.rs` — Conditional edge evaluation (branching logic)
+- `tool.rs` — RunPipelineTool integration (exposes pipeline execution as an agent tool)
+- `validate.rs` — Graph validation and lint diagnostics
+
+---
+
 ## Data Flows
 
 ### Chat Mode
@@ -1104,8 +1158,14 @@ whatsapp = ["tokio-tungstenite"]
 feishu   = ["tokio-tungstenite"]
 email    = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mailparse"]
 
-# crew-agent
-browser  = ["tokio-tungstenite", "which", "tempfile", "base64"]
+# crew-agent (browser is always compiled in, no longer feature-gated)
+git      = ["gix"]                  # git operations via gitoxide
+ast      = ["tree-sitter"]          # code_structure.rs AST analysis
+admin-bot = [...]                   # admin/ directory tools
+
+# crew-bus (additional)
+wecom    = [...]                    # WeCom/WeChat Work channel
+twilio   = [...]                    # Twilio SMS/MMS channel
 
 # crew-cli
 api      = ["axum", "tower-http", "futures"]
@@ -1115,7 +1175,8 @@ slack    = ["crew-bus/slack"]
 whatsapp = ["crew-bus/whatsapp"]
 feishu   = ["crew-bus/feishu"]
 email    = ["crew-bus/email"]
-browser  = ["crew-agent/browser"]
+wecom    = ["crew-bus/wecom"]
+twilio   = ["crew-bus/twilio"]
 ```
 
 ---
@@ -1129,6 +1190,7 @@ crates/
 ├── crew-llm/src/
 │   ├── lib.rs, provider.rs, config.rs, types.rs, retry.rs, failover.rs, sse.rs
 │   ├── embedding.rs, pricing.rs, context.rs, transcription.rs, vision.rs
+│   ├── adaptive.rs, swappable.rs, router.rs, ominix.rs
 │   ├── anthropic.rs, openai.rs, gemini.rs, openrouter.rs  (protocol impls)
 │   └── registry/ (mod.rs + 14 provider entries: anthropic, openai, gemini,
 │                   openrouter, deepseek, groq, moonshot, dashscope, minimax,
@@ -1138,22 +1200,33 @@ crates/
 ├── crew-agent/src/
 │   ├── lib.rs, agent.rs, progress.rs, policy.rs, compaction.rs, sanitize.rs, hooks.rs
 │   ├── sandbox.rs, mcp.rs, skills.rs, builtin_skills.rs
+│   ├── bundled_app_skills.rs, bootstrap.rs, prompt_guard.rs
 │   ├── plugins/ (mod.rs, loader.rs, manifest.rs, tool.rs)
-│   ├── skills/ (cron, github, skill-creator, summarize, tmux, weather SKILL.md)
+│   ├── skills/ (cron, skill-store, skill-creator SKILL.md)
 │   └── tools/ (mod, policy, shell, read_file, write_file, edit_file, diff_edit,
 │               list_dir, glob_tool, grep_tool, web_search, web_fetch,
-│               message, spawn, browser, ssrf)
+│               message, spawn, browser, ssrf, tool_config,
+│               deep_search, site_crawl, recall_memory, save_memory,
+│               send_file, take_photo, code_structure, git,
+│               deep_research_pipeline, synthesize_research, research_utils,
+│               admin/ (profiles, skills, sub_accounts, system,
+│                       platform_skills, update))
 ├── crew-bus/src/
 │   ├── lib.rs, bus.rs, channel.rs, session.rs, coalesce.rs, media.rs
 │   ├── cli_channel.rs, telegram_channel.rs, discord_channel.rs
 │   ├── slack_channel.rs, whatsapp_channel.rs, feishu_channel.rs, email_channel.rs
+│   ├── wecom_channel.rs, twilio_channel.rs, markdown_html.rs
 │   ├── cron_service.rs, cron_types.rs, heartbeat.rs
 └── crew-cli/src/
     ├── main.rs, config.rs, config_watcher.rs, cron_tool.rs, compaction.rs
     ├── auth/ (mod.rs, store.rs, oauth.rs, token.rs)
     ├── api/ (mod.rs, router.rs, handlers.rs, sse.rs, metrics.rs, static_files.rs)
     └── commands/ (mod, chat, init, status, gateway, clean,
-                   completions, cron, channels, auth, skills, docs, serve)
+                   completions, cron, channels, auth, skills, docs, serve,
+                   office, account)
+├── crew-pipeline/src/
+│   ├── lib.rs, parser.rs, graph.rs, executor.rs, handler.rs
+│   ├── condition.rs, tool.rs, validate.rs
 ```
 
 ---
