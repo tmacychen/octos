@@ -1,19 +1,44 @@
-//! Bootstrap bundled app-skill binaries into the skills directory.
+//! Bootstrap bundled app-skill and platform-skill binaries into their directories.
 //!
 //! At gateway startup, copies sibling binaries (built alongside `crew`) into
-//! `.crew/skills/<dir>/main`, plus writes the embedded SKILL.md and manifest.json.
+//! the appropriate skills directory, plus writes the embedded SKILL.md and manifest.json.
+//!
+//! ## Layered skill directories
+//!
+//! ```text
+//! ~/.crew/platform-skills/       # Layer 1: platform-wide (asr, etc.)
+//! ~/.crew/bundled-app-skills/    # Layer 2: bundled app-skills (news, send-email, etc.)
+//! ~/.crew/profiles/{id}/skills/  # Layer 3: per-profile custom installs
+//! ```
 
 use std::path::Path;
 
 use crate::bundled_app_skills::{BUNDLED_APP_SKILLS, PLATFORM_SKILLS};
 
-/// Bootstrap all bundled app-skills into `skills_dir`.
-///
-/// For each skill, if `skills_dir/<dir>/main` does not already exist, creates the
-/// directory and writes SKILL.md, manifest.json, and copies the sibling binary.
+/// Subdirectory name for bundled app-skills (layer 2).
+pub const BUNDLED_APP_SKILLS_DIR: &str = "bundled-app-skills";
+
+/// Subdirectory name for platform skills (layer 1).
+pub const PLATFORM_SKILLS_DIR: &str = "platform-skills";
+
+/// Bootstrap bundled app-skills into `crew_home/bundled-app-skills/`.
 ///
 /// Returns the number of skills bootstrapped.
-pub fn bootstrap_bundled_skills(skills_dir: &Path) -> usize {
+pub fn bootstrap_bundled_skills(crew_home: &Path) -> usize {
+    let target_dir = crew_home.join(BUNDLED_APP_SKILLS_DIR);
+    bootstrap_entries(&target_dir, BUNDLED_APP_SKILLS)
+}
+
+/// Bootstrap platform skills into `crew_home/platform-skills/`.
+///
+/// Returns the number of skills bootstrapped.
+pub fn bootstrap_platform_skills(crew_home: &Path) -> usize {
+    let target_dir = crew_home.join(PLATFORM_SKILLS_DIR);
+    bootstrap_entries(&target_dir, PLATFORM_SKILLS)
+}
+
+/// Bootstrap skill entries into the given directory.
+fn bootstrap_entries(skills_dir: &Path, entries: &[(&str, &str, &str, &str)]) -> usize {
     let exe_dir = match std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -24,9 +49,7 @@ pub fn bootstrap_bundled_skills(skills_dir: &Path) -> usize {
 
     let mut count = 0;
 
-    for &(dir_name, binary_name, skill_md, manifest_json) in
-        BUNDLED_APP_SKILLS.iter().chain(PLATFORM_SKILLS.iter())
-    {
+    for &(dir_name, binary_name, skill_md, manifest_json) in entries {
         let skill_dir = skills_dir.join(dir_name);
         let main_path = skill_dir.join("main");
 
@@ -74,13 +97,14 @@ pub fn bootstrap_bundled_skills(skills_dir: &Path) -> usize {
     count
 }
 
-/// Bootstrap a single named app-skill into `skills_dir`.
+/// Bootstrap a single named skill into the appropriate directory under `crew_home`.
 ///
-/// Unlike `bootstrap_bundled_skills`, this always overwrites existing files
-/// (used for conditional skills that may need re-bootstrap after updates).
+/// Unlike `bootstrap_bundled_skills`/`bootstrap_platform_skills`, this always
+/// overwrites existing files (used for conditional skills that may need
+/// re-bootstrap after updates).
 ///
 /// Returns `true` if the skill was successfully bootstrapped.
-pub fn bootstrap_single_skill(skills_dir: &Path, name: &str) -> bool {
+pub fn bootstrap_single_skill(crew_home: &Path, name: &str) -> bool {
     let exe_dir = match std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -89,17 +113,19 @@ pub fn bootstrap_single_skill(skills_dir: &Path, name: &str) -> bool {
         None => return false,
     };
 
-    let entry = BUNDLED_APP_SKILLS
-        .iter()
-        .chain(PLATFORM_SKILLS.iter())
-        .find(|&&(dir_name, _, _, _)| dir_name == name);
+    // Determine which list this skill belongs to and its target directory
+    let (entry, subdir) =
+        if let Some(e) = BUNDLED_APP_SKILLS.iter().find(|&&(d, _, _, _)| d == name) {
+            (e, BUNDLED_APP_SKILLS_DIR)
+        } else if let Some(e) = PLATFORM_SKILLS.iter().find(|&&(d, _, _, _)| d == name) {
+            (e, PLATFORM_SKILLS_DIR)
+        } else {
+            return false;
+        };
 
-    let &(dir_name, binary_name, skill_md, manifest_json) = match entry {
-        Some(e) => e,
-        None => return false,
-    };
+    let &(dir_name, binary_name, skill_md, manifest_json) = entry;
 
-    let skill_dir = skills_dir.join(dir_name);
+    let skill_dir = crew_home.join(subdir).join(dir_name);
     let main_path = skill_dir.join("main");
 
     let src_binary = exe_dir.join(binary_name);

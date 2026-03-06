@@ -388,13 +388,23 @@ impl Config {
     /// providers by `PluginLoader` (packages without manifest.json are skipped).
     pub fn plugin_dirs(cwd: &Path) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
-        let local_plugins = cwd.join(".crew").join("plugins");
+        let crew_dir = cwd.join(".crew");
+        let local_plugins = crew_dir.join("plugins");
         if local_plugins.exists() {
             dirs.push(local_plugins);
         }
-        let local_skills = cwd.join(".crew").join("skills");
+        let local_skills = crew_dir.join("skills");
         if local_skills.exists() {
             dirs.push(local_skills);
+        }
+        // Layered skill dirs
+        let bundled = crew_dir.join(crew_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
+        if bundled.exists() {
+            dirs.push(bundled);
+        }
+        let platform = crew_dir.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR);
+        if platform.exists() {
+            dirs.push(platform);
         }
         if let Some(home) = dirs::home_dir() {
             let global_plugins = home.join(".crew").join("plugins");

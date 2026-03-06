@@ -432,6 +432,8 @@ impl Channel for TelegramChannel {
 
             for (i, path) in msg.media.iter().enumerate() {
                 let file_path = std::path::PathBuf::from(path);
+                let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+                info!(path, size = file_size, "sending media file via Telegram");
                 let file = InputFile::file(&file_path);
                 let lower = path.to_lowercase();
 

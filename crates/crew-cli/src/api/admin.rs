@@ -1331,33 +1331,22 @@ pub async fn list_platform_skills(
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    // Check models
+    // Check models against platform allowlist
     let mdir = models_dir();
-    let asr_models: Vec<String> = std::fs::read_dir(&mdir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().to_lowercase();
-                    n.contains("asr") || n.contains("whisper")
-                })
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    let allowlist = crew_llm::ominix::PlatformModels::load_or_create(store.crew_home_dir());
+    let asr_models: Vec<String> = allowlist
+        .ids_for_role("asr")
+        .into_iter()
+        .filter(|id| mdir.join(id).exists())
+        .map(|id| id.to_string())
+        .collect();
 
-    let tts_models: Vec<String> = std::fs::read_dir(&mdir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().to_lowercase();
-                    n.contains("tts")
-                })
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    let tts_models: Vec<String> = allowlist
+        .ids_for_role("tts")
+        .into_iter()
+        .filter(|id| mdir.join(id).exists())
+        .map(|id| id.to_string())
+        .collect();
 
     // Build platform skills list
     let mut skills = Vec::new();
@@ -1394,10 +1383,9 @@ pub async fn install_platform_skill(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let skills_dir = store.crew_home_dir().join("skills");
-    std::fs::create_dir_all(&skills_dir).ok();
+    let crew_home = store.crew_home_dir();
 
-    if crew_agent::bootstrap::bootstrap_single_skill(&skills_dir, &name) {
+    if crew_agent::bootstrap::bootstrap_single_skill(&crew_home, &name) {
         Ok(Json(ActionResponse {
             ok: true,
             message: Some(format!("Platform skill '{name}' installed")),
@@ -1606,54 +1594,81 @@ pub async fn platform_service_logs(
 
 // ── Model Management (proxy to ominix-api) ─────────────────────────
 
-/// GET /api/admin/platform-skills/ominix-api/models — list model catalog
+/// GET /api/admin/platform-skills/ominix-api/models — list platform models
 ///
-/// Filters to only ASR + TTS models (the categories relevant to crew platform skills).
+/// Fetches the full catalog from ominix-api, filters to models listed in
+/// `~/.crew/platform-models.json`, and returns them with role annotations.
 pub async fn platform_models_catalog(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let url = format!(
-        "{}/v1/models/catalog",
-        ominix_api_url().trim_end_matches('/')
-    );
-    let resp = state
-        .http_client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("ominix-api unreachable: {e}"),
-            )
-        })?;
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let allowlist = crew_llm::ominix::PlatformModels::load_or_create(store.crew_home_dir());
 
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid response: {e}")))?;
-
-    // Only expose supported Qwen3 ASR/TTS models (filter out legacy funasr/paraformer/etc.)
-    if let Some(models) = body.get("models").and_then(|v| v.as_array()) {
-        let filtered: Vec<&serde_json::Value> = models
-            .iter()
-            .filter(|m| {
-                let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                id.starts_with("qwen3-asr") || id.starts_with("qwen3-tts")
+    // Try fetching live catalog from ominix-api
+    let ominix = crew_llm::ominix::OminixClient::new(&ominix_api_url());
+    let models: Vec<serde_json::Value> = match ominix.platform_catalog(&allowlist).await {
+        Ok(catalog) => catalog
+            .into_iter()
+            .map(|m| {
+                let role = allowlist.find(&m.id).map(|p| p.role.as_str()).unwrap_or("unknown");
+                let mut v = serde_json::to_value(&m).unwrap_or_default();
+                v.as_object_mut().map(|o| o.insert("role".into(), role.into()));
+                v
             })
-            .collect();
-        Ok(Json(serde_json::json!({ "models": filtered })))
-    } else {
-        Ok(Json(body))
-    }
+            .collect(),
+        Err(_) => {
+            // Offline fallback: return allowlist entries with minimal info
+            allowlist
+                .platform_models
+                .iter()
+                .map(|pm| {
+                    let local = models_dir().join(&pm.id);
+                    serde_json::json!({
+                        "id": pm.id,
+                        "role": pm.role,
+                        "status": if local.exists() { "ready" } else { "unknown" },
+                        "source": "offline (ominix-api unreachable)",
+                    })
+                })
+                .collect()
+        }
+    };
+
+    Ok(Json(serde_json::json!({ "models": models })))
 }
 
 /// POST /api/admin/platform-skills/ominix-api/models/download — start model download
+///
+/// Accepts `model_id` (e.g. "qwen3-asr-1.7b") and validates it against the
+/// platform allowlist before forwarding to ominix-api.
 pub async fn platform_models_download(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let model_id = body
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .ok_or((StatusCode::BAD_REQUEST, "missing model_id".into()))?;
+
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let allowlist = crew_llm::ominix::PlatformModels::load_or_create(store.crew_home_dir());
+    if allowlist.find(model_id).is_none() {
+        let valid: Vec<&str> = allowlist.platform_models.iter().map(|m| m.id.as_str()).collect();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Model '{model_id}' not in platform allowlist. Valid: {}", valid.join(", ")),
+        ));
+    }
+
+    // Forward model_id directly to ominix-api — it knows its own repo_ids
+    let download_body = serde_json::json!({ "model_id": model_id });
+
     let url = format!(
         "{}/v1/models/download",
         ominix_api_url().trim_end_matches('/')
@@ -1661,7 +1676,7 @@ pub async fn platform_models_download(
     let resp = state
         .http_client
         .post(&url)
-        .json(&body)
+        .json(&download_body)
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
@@ -1725,6 +1740,137 @@ pub async fn platform_models_remove(
             serde_json::to_string(&resp_body).unwrap_or_default(),
         ))
     }
+}
+
+// ── Platform Model Allowlist Management ──────────────────────────────
+
+/// GET /api/admin/platform-skills/ominix-api/models/available — list ALL ominix-api models
+///
+/// Returns the full unfiltered catalog from ominix-api so the admin can see
+/// what's available to enable for crew platform use.
+pub async fn platform_models_available(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let allowlist = crew_llm::ominix::PlatformModels::load_or_create(store.crew_home_dir());
+    let ominix = crew_llm::ominix::OminixClient::new(&ominix_api_url());
+
+    let catalog = ominix.fetch_catalog().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to fetch ominix-api catalog: {e}"),
+        )
+    })?;
+
+    let models: Vec<serde_json::Value> = catalog
+        .into_iter()
+        .map(|m| {
+            let enabled = allowlist.find(&m.id).is_some();
+            let role = allowlist.find(&m.id).map(|p| p.role.as_str()).unwrap_or("");
+            let mut v = serde_json::to_value(&m).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("enabled_for_crew".into(), enabled.into());
+                if enabled {
+                    obj.insert("role".into(), role.into());
+                }
+            }
+            v
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "models": models })))
+}
+
+/// POST /api/admin/platform-skills/ominix-api/models/enable — add model to platform allowlist
+///
+/// Body: `{ "model_id": "qwen3-asr-1.7b", "role": "asr" }`
+pub async fn platform_models_enable(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let model_id = body
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .ok_or((StatusCode::BAD_REQUEST, "missing model_id".into()))?;
+    let role = body
+        .get("role")
+        .and_then(|v| v.as_str())
+        .ok_or((StatusCode::BAD_REQUEST, "missing role (asr, tts, etc.)".into()))?;
+
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let crew_home = store.crew_home_dir();
+    let mut allowlist = crew_llm::ominix::PlatformModels::load_or_create(&crew_home);
+
+    if allowlist.find(model_id).is_some() {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "message": format!("Model '{model_id}' already in platform allowlist"),
+        })));
+    }
+
+    allowlist.platform_models.push(crew_llm::ominix::PlatformModel {
+        id: model_id.to_string(),
+        role: role.to_string(),
+    });
+    allowlist.save(&crew_home).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save allowlist: {e}"),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": format!("Model '{model_id}' added to platform allowlist with role '{role}'"),
+    })))
+}
+
+/// POST /api/admin/platform-skills/ominix-api/models/disable — remove model from platform allowlist
+///
+/// Body: `{ "model_id": "qwen3-asr-1.7b" }`
+pub async fn platform_models_disable(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let model_id = body
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .ok_or((StatusCode::BAD_REQUEST, "missing model_id".into()))?;
+
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let crew_home = store.crew_home_dir();
+    let mut allowlist = crew_llm::ominix::PlatformModels::load_or_create(&crew_home);
+
+    let before = allowlist.platform_models.len();
+    allowlist.platform_models.retain(|m| m.id != model_id);
+
+    if allowlist.platform_models.len() == before {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "message": format!("Model '{model_id}' was not in platform allowlist"),
+        })));
+    }
+
+    allowlist.save(&crew_home).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save allowlist: {e}"),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": format!("Model '{model_id}' removed from platform allowlist"),
+    })))
 }
 
 // ── System Update ────────────────────────────────────────────────────

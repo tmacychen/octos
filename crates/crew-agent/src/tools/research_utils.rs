@@ -1,7 +1,6 @@
-//! Shared utilities for research tools (deep_search synthesis, deep_research pipeline).
+//! Shared utilities for research tools (synthesis map-reduce logic).
 //!
-//! Extracted from `synthesize_research.rs` so both `SynthesizeResearchTool` and
-//! `DeepResearchTool` can reuse the same map-reduce logic.
+//! Used by `SynthesizeResearchTool` for map-reduce over crawled sources.
 
 use std::path::{Path, PathBuf};
 

@@ -9,6 +9,15 @@ use serde_json::json;
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+struct Attachment {
+    /// Absolute file path to the attachment.
+    path: String,
+    /// Optional display name (defaults to file name).
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct Input {
     to: String,
     subject: String,
@@ -17,7 +26,14 @@ struct Input {
     provider: Option<String>,
     #[serde(default)]
     html: Option<bool>,
+    /// File attachments (SMTP only).
+    #[serde(default)]
+    attachments: Vec<Attachment>,
 }
+
+/// Maximum attachment size: 20 MB (Gmail limit is 25 MB; leave headroom for
+/// base64 encoding overhead and message headers).
+const MAX_ATTACHMENT_SIZE: u64 = 20 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // SMTP sender (lettre, blocking)
@@ -25,7 +41,7 @@ struct Input {
 
 fn send_smtp(input: &Input) -> Result<(), String> {
     use lettre::message::header::ContentType;
-    use lettre::message::{MultiPart, SinglePart};
+    use lettre::message::{Attachment as LettreAttachment, MultiPart, SinglePart};
     use lettre::transport::smtp::authentication::Credentials;
     use lettre::{Message, SmtpTransport, Transport};
 
@@ -52,26 +68,100 @@ fn send_smtp(input: &Input) -> Result<(), String> {
 
     let is_html = input.html.unwrap_or(false);
 
-    let message = if is_html {
-        builder
-            .multipart(
-                MultiPart::alternative()
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_PLAIN)
-                            .body(strip_html_tags(&input.body)),
-                    )
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_HTML)
-                            .body(input.body.clone()),
-                    ),
-            )
-            .map_err(|e| format!("failed to build email: {e}"))?
+    let message = if input.attachments.is_empty() {
+        // No attachments: simple message
+        if is_html {
+            builder
+                .multipart(
+                    MultiPart::alternative()
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(ContentType::TEXT_PLAIN)
+                                .body(strip_html_tags(&input.body)),
+                        )
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(ContentType::TEXT_HTML)
+                                .body(input.body.clone()),
+                        ),
+                )
+                .map_err(|e| format!("failed to build email: {e}"))?
+        } else {
+            builder
+                .header(ContentType::TEXT_PLAIN)
+                .body(input.body.clone())
+                .map_err(|e| format!("failed to build email: {e}"))?
+        }
     } else {
+        // With attachments: mixed multipart (body + attachments)
+        let body_part = if is_html {
+            MultiPart::alternative()
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_PLAIN)
+                        .body(strip_html_tags(&input.body)),
+                )
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_HTML)
+                        .body(input.body.clone()),
+                )
+        } else {
+            MultiPart::alternative().singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_PLAIN)
+                    .body(input.body.clone()),
+            )
+        };
+
+        let mut mixed = MultiPart::mixed().multipart(body_part);
+
+        for att in &input.attachments {
+            let path = std::path::Path::new(&att.path);
+
+            // Security: only allow files under the current working directory.
+            let cwd = std::env::current_dir()
+                .map_err(|e| format!("cannot determine working directory: {e}"))?;
+            let canonical = path
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve attachment path '{}': {e}", att.path))?;
+            if !canonical.starts_with(&cwd) {
+                return Err(format!(
+                    "attachment '{}' is outside the working directory",
+                    att.path
+                ));
+            }
+
+            let meta = std::fs::metadata(&canonical)
+                .map_err(|e| format!("cannot stat attachment '{}': {e}", att.path))?;
+            if meta.len() > MAX_ATTACHMENT_SIZE {
+                return Err(format!(
+                    "attachment '{}' is too large ({} bytes, max {} bytes)",
+                    att.path,
+                    meta.len(),
+                    MAX_ATTACHMENT_SIZE
+                ));
+            }
+
+            let data = std::fs::read(&canonical)
+                .map_err(|e| format!("failed to read attachment '{}': {e}", att.path))?;
+            let filename = att
+                .name
+                .clone()
+                .or_else(|| {
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "attachment".to_string());
+            let content_type =
+                ContentType::parse(mime_from_extension(path)).unwrap_or(ContentType::TEXT_PLAIN);
+            let attachment =
+                LettreAttachment::new(filename).body(data, content_type);
+            mixed = mixed.singlepart(attachment);
+        }
+
         builder
-            .header(ContentType::TEXT_PLAIN)
-            .body(input.body.clone())
+            .multipart(mixed)
             .map_err(|e| format!("failed to build email: {e}"))?
     };
 
@@ -202,6 +292,41 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Guess MIME type from file extension.
+fn mime_from_extension(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "txt" | "log" | "md" => "text/plain",
+        "html" | "htm" => "text/html",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Very basic HTML tag stripping for the plain-text fallback part.

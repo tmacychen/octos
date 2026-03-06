@@ -222,6 +222,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_with_context_routes_correctly() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = MessageTool::with_context(tx, "telegram", "ctx-chat");
+
+        let result = tool
+            .execute(&serde_json::json!({"content": "via with_context"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.channel, "telegram");
+        assert_eq!(msg.chat_id, "ctx-chat");
+        assert_eq!(msg.content, "via with_context");
+    }
+
+    #[tokio::test]
+    async fn test_two_tools_different_context() {
+        let (tx1, mut rx1) = mpsc::channel(16);
+        let (tx2, mut rx2) = mpsc::channel(16);
+        let tool_a = MessageTool::with_context(tx1, "telegram", "alice");
+        let tool_b = MessageTool::with_context(tx2, "telegram", "bob");
+
+        tool_a
+            .execute(&serde_json::json!({"content": "for alice"}))
+            .await
+            .unwrap();
+        tool_b
+            .execute(&serde_json::json!({"content": "for bob"}))
+            .await
+            .unwrap();
+
+        let msg_a = rx1.recv().await.unwrap();
+        let msg_b = rx2.recv().await.unwrap();
+        assert_eq!(msg_a.chat_id, "alice");
+        assert_eq!(msg_b.chat_id, "bob");
+    }
+
+    #[tokio::test]
     async fn test_missing_target() {
         let (tx, _rx) = mpsc::channel(16);
         let tool = MessageTool::new(tx);

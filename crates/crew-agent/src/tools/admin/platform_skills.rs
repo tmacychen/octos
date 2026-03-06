@@ -29,6 +29,8 @@ struct PlatformSkillsInput {
     #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
     lines: Option<usize>,
 }
 
@@ -46,8 +48,11 @@ impl Tool for PlatformSkillsTool {
          - stop: Stop the OminiX engine service\n\
          - restart: Restart the OminiX engine service\n\
          - logs: View recent OminiX engine log output (optional: lines, default 50)\n\
-         - models: List available OminiX models catalog with download status\n\
-         - download_model: Download a model by model_id (e.g. 'Qwen3-ASR-1.7B-8bit')\n\
+         - models: List platform-enabled models with download status\n\
+         - available_models: List ALL ominix-api models (to see what can be enabled)\n\
+         - enable_model: Add a model to crew platform allowlist (model_id + role required)\n\
+         - disable_model: Remove a model from crew platform allowlist (model_id required)\n\
+         - download_model: Download a model by model_id (e.g. 'qwen3-asr-1.7b', 'qwen3-tts')\n\
          - remove_model: Remove a downloaded model by model_id\n\
          - install: Bootstrap an OminiX skill binary\n\
          - remove: Uninstall an OminiX skill"
@@ -59,7 +64,8 @@ impl Tool for PlatformSkillsTool {
                 "action": {
                     "type": "string",
                     "enum": ["status", "health", "start", "stop", "restart", "logs",
-                             "models", "download_model", "remove_model",
+                             "models", "available_models", "enable_model", "disable_model",
+                             "download_model", "remove_model",
                              "install", "remove"],
                     "description": "Action to perform on OminiX platform skills (ASR/TTS engine)"
                 },
@@ -69,7 +75,11 @@ impl Tool for PlatformSkillsTool {
                 },
                 "model_id": {
                     "type": "string",
-                    "description": "Model identifier for download_model/remove_model (e.g. 'Qwen3-ASR-1.7B-8bit', 'Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit')"
+                    "description": "Model identifier for download_model/remove_model/enable_model/disable_model (e.g. 'qwen3-asr-1.7b', 'qwen3-tts')"
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Model role for enable_model (e.g. 'asr', 'tts')"
                 },
                 "lines": {
                     "type": "integer",
@@ -260,9 +270,83 @@ impl Tool for PlatformSkillsTool {
                     }),
                 }
             }
+            "available_models" => {
+                match self
+                    .ctx
+                    .get("/api/admin/platform-skills/ominix-api/models/available")
+                    .await
+                {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Failed to get available models: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "enable_model" => {
+                let model_id = input
+                    .model_id
+                    .as_deref()
+                    .ok_or_else(|| eyre::eyre!("'model_id' is required for enable_model"))?;
+                let role = input
+                    .role
+                    .as_deref()
+                    .ok_or_else(|| eyre::eyre!("'role' is required for enable_model (e.g. 'asr', 'tts')"))?;
+                let body = serde_json::json!({ "model_id": model_id, "role": role });
+                match self
+                    .ctx
+                    .post(
+                        "/api/admin/platform-skills/ominix-api/models/enable",
+                        Some(&body),
+                    )
+                    .await
+                {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Enable model failed: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "disable_model" => {
+                let model_id = input
+                    .model_id
+                    .as_deref()
+                    .ok_or_else(|| eyre::eyre!("'model_id' is required for disable_model"))?;
+                let body = serde_json::json!({ "model_id": model_id });
+                match self
+                    .ctx
+                    .post(
+                        "/api/admin/platform-skills/ominix-api/models/disable",
+                        Some(&body),
+                    )
+                    .await
+                {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Disable model failed: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
             other => Ok(ToolResult {
                 output: format!(
-                    "Unknown action: {other}. Use: status, health, start, stop, restart, logs, models, download_model, remove_model, install, remove."
+                    "Unknown action: {other}. Use: status, health, start, stop, restart, logs, models, available_models, enable_model, disable_model, download_model, remove_model, install, remove."
                 ),
                 success: false,
                 ..Default::default()
@@ -306,6 +390,9 @@ mod tests {
                 "restart",
                 "logs",
                 "models",
+                "available_models",
+                "enable_model",
+                "disable_model",
                 "download_model",
                 "remove_model",
                 "install",
@@ -334,6 +421,7 @@ mod tests {
         let props = schema["properties"].as_object().unwrap();
         assert!(props.contains_key("name"));
         assert!(props.contains_key("model_id"));
+        assert!(props.contains_key("role"));
         assert!(props.contains_key("lines"));
         assert_eq!(props["lines"]["type"], "integer");
     }
@@ -352,13 +440,13 @@ mod tests {
     fn platform_skills_input_full() {
         let v = serde_json::json!({
             "action": "download_model",
-            "model_id": "Qwen3-ASR-1.7B-8bit",
+            "model_id": "qwen3-asr-1.7b",
             "name": "ominix-api",
             "lines": 100
         });
         let input: PlatformSkillsInput = serde_json::from_value(v).unwrap();
         assert_eq!(input.action, "download_model");
-        assert_eq!(input.model_id.as_deref(), Some("Qwen3-ASR-1.7B-8bit"));
+        assert_eq!(input.model_id.as_deref(), Some("qwen3-asr-1.7b"));
         assert_eq!(input.name.as_deref(), Some("ominix-api"));
         assert_eq!(input.lines, Some(100));
     }

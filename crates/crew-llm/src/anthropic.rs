@@ -83,10 +83,18 @@ impl AnthropicProvider {
                     }
                 })
                 .collect(),
-            system: messages
-                .iter()
-                .find(|m| m.role == crew_core::MessageRole::System)
-                .map(|m| m.content.as_str()),
+            system: {
+                let system_parts: Vec<&str> = messages
+                    .iter()
+                    .filter(|m| m.role == crew_core::MessageRole::System)
+                    .map(|m| m.content.as_str())
+                    .collect();
+                if system_parts.is_empty() {
+                    None
+                } else {
+                    Some(system_parts.join("\n\n"))
+                }
+            },
             tools: if tools.is_empty() { None } else { Some(tools) },
         }
     }
@@ -227,7 +235,7 @@ struct AnthropicRequest<'a> {
     max_tokens: u32,
     messages: Vec<AnthropicMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ToolSpec]>,
 }
@@ -486,7 +494,7 @@ mod tests {
         let request = provider.build_request(&messages, &[], &config);
 
         // System message should be extracted, not in messages array
-        assert_eq!(request.system, Some("system prompt"));
+        assert_eq!(request.system, Some("system prompt".to_string()));
         assert_eq!(request.messages.len(), 2); // user + assistant only
         assert_eq!(request.messages[0].role, "user");
         assert_eq!(request.messages[1].role, "assistant");
