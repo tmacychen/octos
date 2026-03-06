@@ -172,6 +172,25 @@ impl ToolRegistry {
         self.invalidate_cache();
     }
 
+    /// Create a new ToolRegistry by cloning all tools except the named exclusions.
+    ///
+    /// The new registry shares the same `Arc<dyn Tool>` instances (cheap).
+    /// Provider policy and context filter are also copied.
+    pub fn snapshot_excluding(&self, exclude: &[&str]) -> Self {
+        let tools: HashMap<String, Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .filter(|(name, _)| !exclude.contains(&name.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Self {
+            tools,
+            provider_policy: self.provider_policy.clone(),
+            context_filter: self.context_filter.clone(),
+            cached_specs: std::sync::Mutex::new(None),
+        }
+    }
+
     /// Clear the cached specs (called by mutation methods).
     fn invalidate_cache(&mut self) {
         // &mut self guarantees exclusive access, so get_mut() bypasses the mutex.
@@ -243,6 +262,7 @@ pub mod synthesize_research;
 pub mod take_photo;
 pub mod web_fetch;
 pub mod web_search;
+pub mod voice_synthesize;
 pub mod write_file;
 
 pub mod admin;
@@ -271,6 +291,7 @@ pub use shell::ShellTool;
 pub use spawn::SpawnTool;
 pub use synthesize_research::SynthesizeResearchTool;
 pub use take_photo::TakePhotoTool;
+pub use voice_synthesize::VoiceSynthesizeTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;

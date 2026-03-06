@@ -4,19 +4,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use chrono::Utc;
 use clap::Args;
 use colored::Colorize;
-use crew_agent::{
-    Agent, AgentConfig, HookExecutor, MessageTool, SendFileTool, SilentReporter, SkillsLoader,
-    SpawnTool, TokenTracker, /* TakePhotoTool, */ ToolRegistry,
-};
+use crew_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegistry};
 use crew_bus::{
     ActiveSessionStore, ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager,
     create_bus, validate_topic_name,
 };
-use crew_core::{AgentId, Message, MessageRole, OutboundMessage, SessionKey};
+use crew_core::{OutboundMessage, SessionKey};
 use crew_llm::{
     AdaptiveConfig, AdaptiveRouter, GroqTranscriber, LlmProvider, OminixClient, ProviderChain,
     ProviderRouter, RetryProvider, SwappableProvider, Transcriber,
@@ -30,10 +27,10 @@ use std::path::Path;
 
 use super::Executable;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
-use crate::config::{Config, QueueMode, detect_provider};
+use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
-use crate::cron_tool::CronTool;
 use crate::persona_service::PersonaService;
+use crate::session_actor::{ActorFactory, ActorRegistry, SnapshotToolRegistryFactory};
 use crate::status_indicator::StatusIndicator;
 
 /// Run as a persistent gateway daemon.
@@ -398,7 +395,6 @@ impl GatewayCommand {
         let cron_inbound_tx = publisher.inbound_sender();
         let heartbeat_inbound_tx = publisher.inbound_sender();
         let spawn_inbound_tx = publisher.inbound_sender();
-        let collect_inbound_tx = publisher.inbound_sender();
         let out_tx = agent_handle.outbound_sender();
 
         // Initialize cron service
@@ -423,15 +419,17 @@ impl GatewayCommand {
                 .wrap_err("failed to open tool config store")?,
         );
 
-        // Create messaging tools before the if/else (needed in both modes)
-        let message_tool = Arc::new(MessageTool::new(out_tx.clone()));
-        let send_file_tool = Arc::new(SendFileTool::new(out_tx.clone()));
-        drop(out_tx);
+        // Session-specific tools (message, send_file, spawn, cron, pipeline)
+        // are NOT registered in the base registry — they are created per-session
+        // by the ActorFactory to eliminate the set_context() race condition.
 
-        // Optional tools (only exist in normal mode)
-        let mut spawn_tool: Option<Arc<SpawnTool>> = None;
-        let cron_tool_arc: Option<Arc<CronTool>>;
-        let mut pipeline_tool: Option<Arc<crew_pipeline::RunPipelineTool>> = None;
+        // Store config needed for per-session tool creation
+        let mut provider_policy_for_factory: Option<crew_agent::ToolPolicy> = None;
+        let mut worker_prompt_for_factory: Option<String> = None;
+        let mut provider_router_for_factory: Option<Arc<ProviderRouter>> = None;
+        let mut pipeline_factory: Option<
+            Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>,
+        > = None;
 
         let mut tools;
         if admin_mode {
@@ -449,26 +447,17 @@ impl GatewayCommand {
             });
             crew_agent::register_admin_api_tools(&mut tools, admin_ctx);
 
-            // Cron tool (scheduled tasks, reminders)
-            let ct = Arc::new(CronTool::new(cron_service.clone()));
-            tools.register_arc(ct.clone() as Arc<dyn crew_agent::Tool>);
-            cron_tool_arc = Some(ct);
-
-            // Register messaging tools
-            tools.register_arc(message_tool.clone() as Arc<dyn crew_agent::Tool>);
-            tools.register_arc(send_file_tool.clone() as Arc<dyn crew_agent::Tool>);
+            // Session-specific tools (cron, message, send_file) are created
+            // per-session by the ActorFactory — not registered in base registry.
 
             // Shell tool for direct server access (diagnostics, troubleshooting)
             tools.register(crew_agent::ShellTool::new(&cwd));
-
-            // Note: admin mode does NOT load app-skill plugins (news, deep_search,
-            // etc.) — those are user-facing tools. Admin bot only has admin API tools.
 
             // Memory bank tools
             tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
             tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
 
-            info!("admin mode: registered admin API + cron + skills tools");
+            info!("admin mode: registered admin API + shell + memory tools");
         } else {
             // Normal mode: full tool registration
             let sandbox = crew_agent::create_sandbox(&config.sandbox);
@@ -514,13 +503,8 @@ impl GatewayCommand {
                 tools.set_provider_policy(policy);
             }
 
-            let ct = Arc::new(CronTool::new(cron_service.clone()));
-            tools.register_arc(ct.clone() as Arc<dyn crew_agent::Tool>);
-            cron_tool_arc = Some(ct);
-
-            // Register messaging tools
-            tools.register_arc(message_tool.clone() as Arc<dyn crew_agent::Tool>);
-            tools.register_arc(send_file_tool.clone() as Arc<dyn crew_agent::Tool>);
+            // Session-specific tools (cron, message, send_file, spawn, pipeline)
+            // are created per-session by the ActorFactory — not in base registry.
 
             // Build sub-provider router from config
             let provider_router = if !config.sub_providers.is_empty() {
@@ -564,26 +548,21 @@ impl GatewayCommand {
                 None
             };
 
-            // Spawn tool (background subagents)
-            let worker_prompt = super::load_prompt("worker", crew_agent::DEFAULT_WORKER_PROMPT);
-            let mut spawn =
-                SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_inbound_tx)
-                    .with_provider_policy(tools.provider_policy().cloned())
-                    .with_worker_prompt(worker_prompt);
-            if let Some(ref router) = provider_router {
-                spawn = spawn.with_provider_router(router.clone());
-            }
-            let st = Arc::new(spawn);
-            tools.register_arc(st.clone() as Arc<dyn crew_agent::Tool>);
-            spawn_tool = Some(st);
+            // Capture config for per-session SpawnTool and PipelineTool creation
+            provider_policy_for_factory = tools.provider_policy().cloned();
+            worker_prompt_for_factory = Some(super::load_prompt(
+                "worker",
+                crew_agent::DEFAULT_WORKER_PROMPT,
+            ));
+            provider_router_for_factory = provider_router.clone();
 
-            // Research synthesis tool
+            // Research synthesis tool (shared, no per-session state)
             tools.register(crew_agent::SynthesizeResearchTool::new(
                 llm.clone(),
                 data_dir.clone(),
             ));
 
-            // Deep research pipeline
+            // Deep research pipeline (shared, no per-session state)
             tools.register(crew_agent::DeepResearchTool::new(
                 llm.clone(),
                 cwd.clone(),
@@ -591,21 +570,54 @@ impl GatewayCommand {
                 plugin_dirs.clone(),
             ));
 
-            // Pipeline tool
-            let mut pt = crew_pipeline::RunPipelineTool::new(
-                llm.clone(),
-                memory.clone(),
-                cwd.clone(),
-                data_dir.clone(),
-            )
-            .with_provider_policy(tools.provider_policy().cloned())
-            .with_plugin_dirs(plugin_dirs.clone());
-            if let Some(ref router) = provider_router {
-                pt = pt.with_provider_router(router.clone());
+            // Pipeline tool factory for per-session instances
+            {
+                let llm_c = llm.clone();
+                let mem_c = memory.clone();
+                let cwd_c = cwd.clone();
+                let data_c = data_dir.clone();
+                let policy_c = tools.provider_policy().cloned();
+                let plugins_c = plugin_dirs.clone();
+                let router_c = provider_router.clone();
+
+                struct DefaultPipelineToolFactory {
+                    llm: Arc<dyn LlmProvider>,
+                    memory: Arc<crew_memory::EpisodeStore>,
+                    cwd: PathBuf,
+                    data_dir: PathBuf,
+                    policy: Option<crew_agent::ToolPolicy>,
+                    plugin_dirs: Vec<PathBuf>,
+                    router: Option<Arc<ProviderRouter>>,
+                }
+
+                impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
+                    fn create(&self) -> Arc<dyn crew_agent::Tool> {
+                        let mut pt = crew_pipeline::RunPipelineTool::new(
+                            self.llm.clone(),
+                            self.memory.clone(),
+                            self.cwd.clone(),
+                            self.data_dir.clone(),
+                        )
+                        .with_provider_policy(self.policy.clone())
+                        .with_plugin_dirs(self.plugin_dirs.clone());
+                        if let Some(ref router) = self.router {
+                            pt = pt.with_provider_router(router.clone());
+                        }
+                        Arc::new(pt)
+                    }
+                }
+
+                pipeline_factory = Some(Arc::new(DefaultPipelineToolFactory {
+                    llm: llm_c,
+                    memory: mem_c,
+                    cwd: cwd_c,
+                    data_dir: data_c,
+                    policy: policy_c,
+                    plugin_dirs: plugins_c,
+                    router: router_c,
+                })
+                    as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
             }
-            let pt = Arc::new(pt);
-            tools.register_arc(pt.clone() as Arc<dyn crew_agent::Tool>);
-            pipeline_tool = Some(pt);
 
             // Memory bank tools
             tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
@@ -642,7 +654,10 @@ impl GatewayCommand {
             .await
         };
 
-        // Build the agent
+        // Shared system prompt for hot-reload (factory reads this at actor spawn time)
+        let system_prompt = Arc::new(std::sync::RwLock::new(system_prompt));
+
+        // Build agent config (shared by all per-session agents)
         let max_iterations = self.max_iterations.or(config.max_iterations).unwrap_or(50);
         let agent_config = AgentConfig {
             max_iterations,
@@ -660,27 +675,71 @@ impl GatewayCommand {
         let shutdown_clone = shutdown.clone();
 
         let llm_for_compaction = llm.clone();
-        let mut agent = Agent::new(AgentId::new("gateway"), llm, tools, memory)
-            .with_config(agent_config)
-            .with_reporter(Arc::new(SilentReporter))
-            .with_shutdown(shutdown.clone())
-            .with_system_prompt(system_prompt);
 
-        if !config.hooks.is_empty() {
-            agent = agent.with_hooks(Arc::new(HookExecutor::new(config.hooks.clone())));
-        }
-
-        // Set hook context with profile_id (session_id updated per message)
-        if profile_id.is_some() || !config.hooks.is_empty() {
-            agent = agent.with_hook_context(crew_agent::HookContext {
+        // Build hook executor and context template
+        let hooks = if !config.hooks.is_empty() {
+            Some(Arc::new(HookExecutor::new(config.hooks.clone())))
+        } else {
+            None
+        };
+        let hook_context_template = if profile_id.is_some() || hooks.is_some() {
+            Some(HookContext {
                 session_id: None,
                 profile_id: profile_id.clone(),
-            });
-        }
+            })
+        } else {
+            None
+        };
 
-        if let Some(embedder) = create_embedder(&config) {
-            agent = agent.with_embedder(embedder);
-        }
+        // Create the base tool registry snapshot (excludes session-specific tools)
+        let tool_registry_factory = Arc::new(SnapshotToolRegistryFactory::new(tools));
+
+        // Create session manager (shared between ActorFactory and main loop for commands)
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&data_dir)
+                .wrap_err("failed to open session manager")?
+                .with_max_sessions(gw_config.max_sessions),
+        ));
+
+        let max_history = Arc::new(std::sync::atomic::AtomicUsize::new(gw_config.max_history));
+
+        // Active session store for multi-session support
+        let active_sessions = Arc::new(Mutex::new(
+            ActiveSessionStore::open(&data_dir).wrap_err("failed to open active session store")?,
+        ));
+
+        // Pending message buffer for inactive sessions
+        let pending_messages: crate::session_actor::PendingMessages =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        // Build ActorFactory with all shared resources
+        let actor_factory = ActorFactory {
+            agent_config,
+            llm: llm.clone(),
+            llm_for_compaction: llm_for_compaction.clone(),
+            memory,
+            system_prompt: system_prompt.clone(),
+            hooks,
+            hook_context_template,
+            session_mgr: session_mgr.clone(),
+            out_tx: out_tx.clone(),
+            spawn_inbound_tx,
+            cron_service: Some(cron_service.clone()),
+            tool_registry_factory,
+            pipeline_factory,
+            max_history: max_history.clone(),
+            idle_timeout: Duration::from_secs(crate::session_actor::DEFAULT_IDLE_TIMEOUT_SECS),
+            session_timeout: Duration::from_secs(session_timeout_secs),
+            shutdown: shutdown.clone(),
+            cwd: cwd.clone(),
+            provider_policy: provider_policy_for_factory,
+            worker_prompt: worker_prompt_for_factory,
+            provider_router: provider_router_for_factory,
+            embedder: create_embedder(&config).map(|e| e as Arc<dyn crew_llm::EmbeddingProvider>),
+            ominix_client: ominix_client.clone(),
+            active_sessions: active_sessions.clone(),
+            pending_messages: pending_messages.clone(),
+        };
 
         // Start config watcher for hot-reload
         let watch_paths = {
@@ -704,19 +763,6 @@ impl GatewayCommand {
         };
         let (config_tx, mut config_rx) = tokio::sync::watch::channel(None);
         let _watcher_handle = ConfigWatcher::new(watch_paths, config.clone(), config_tx).spawn();
-        let max_history = gw_config.max_history;
-
-        // Create session manager with LRU eviction (shared for concurrent access)
-        let session_mgr = Arc::new(Mutex::new(
-            SessionManager::open(&data_dir)
-                .wrap_err("failed to open session manager")?
-                .with_max_sessions(gw_config.max_sessions),
-        ));
-
-        // Active session store for multi-session support
-        let active_sessions = Arc::new(Mutex::new(
-            ActiveSessionStore::open(&data_dir).wrap_err("failed to open active session store")?,
-        ));
 
         // Create channel manager and register channels
         let mut channel_mgr = ChannelManager::new();
@@ -979,9 +1025,6 @@ impl GatewayCommand {
         );
         println!();
 
-        // Wrap agent in Arc for sharing across spawned tasks
-        let agent = Arc::new(agent);
-
         // Create status indicators for each channel (used for typing + dynamic status)
         let status_words = PersonaService::read_status_words(&data_dir);
         let status_indicators: Arc<HashMap<String, Arc<StatusIndicator>>> = {
@@ -1004,7 +1047,7 @@ impl GatewayCommand {
             crate::persona_service::DEFAULT_INTERVAL_SECS,
         ));
         {
-            let agent_for_persona = agent.clone();
+            let system_prompt_for_persona = system_prompt.clone();
             let base_prompt = gw_config.system_prompt.clone();
             let data_dir_p = data_dir.clone();
             let project_dir_p = project_dir.clone();
@@ -1021,7 +1064,7 @@ impl GatewayCommand {
                     let eds = extra_dirs_p.clone();
                     let ms = memory_store_p.clone();
                     let tc = tool_config_p.clone();
-                    let agent = agent_for_persona.clone();
+                    let prompt_lock = system_prompt_for_persona.clone();
                     tokio::spawn(async move {
                         let mut sl = SkillsLoader::new(&dd);
                         for dir in &eds {
@@ -1029,7 +1072,7 @@ impl GatewayCommand {
                         }
                         let new_prompt =
                             build_system_prompt(base.as_deref(), &dd, &pd, &ms, &sl, &tc).await;
-                        agent.set_system_prompt(new_prompt);
+                        *prompt_lock.write().unwrap_or_else(|e| e.into_inner()) = new_prompt;
                         info!("system prompt updated with new persona");
                     });
                 },
@@ -1043,19 +1086,19 @@ impl GatewayCommand {
             );
         }
 
-        // Per-session locks to serialize messages within the same session.
-        // Pruned periodically to prevent unbounded growth.
-        let session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
         // Semaphore to bound concurrent session processing
         let concurrency_semaphore = Arc::new(Semaphore::new(gw_config.max_concurrent_sessions));
 
-        // Track monitoring JoinHandles so we can await them on shutdown
-        let mut monitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        // Create ActorRegistry for per-session dispatch
+        let mut actor_registry =
+            ActorRegistry::new(actor_factory, concurrency_semaphore, out_tx.clone(), pending_messages.clone());
 
-        // Shared max_history behind Arc<Mutex<>> for hot-reload
-        let max_history = Arc::new(std::sync::atomic::AtomicUsize::new(max_history));
+        // Drop the original out_tx — factory and registry hold their own clones.
+        // This ensures the outbound channel closes properly when actors shut down.
+        drop(out_tx);
+
+        // Alias for hot-reload (avoids shadowing by ConfigChange::HotReload { system_prompt })
+        let system_prompt_lock = system_prompt.clone();
 
         // Main loop: dispatch inbound messages to concurrent tasks
         while let Some(mut inbound) = agent_handle.recv_inbound().await {
@@ -1072,8 +1115,12 @@ impl GatewayCommand {
                             max_history: new_max,
                         } => {
                             if let Some(prompt) = system_prompt {
-                                agent.set_system_prompt(prompt);
-                                info!("System prompt updated via hot-reload");
+                                *system_prompt_lock
+                                    .write()
+                                    .unwrap_or_else(|e| e.into_inner()) = prompt;
+                                info!(
+                                    "System prompt updated via hot-reload (new actors will use it)"
+                                );
                             }
                             if let Some(new_max) = new_max {
                                 max_history.store(new_max, Ordering::Release);
@@ -1295,6 +1342,12 @@ impl GatewayCommand {
                         metadata: serde_json::json!({}),
                     };
                     let _ = agent_handle.send_outbound(msg).await;
+
+                    // Flush any buffered messages from this session
+                    let target_key = SessionKey::new(&inbound.channel, &inbound.chat_id);
+                    actor_registry
+                        .flush_pending(&target_key.to_string())
+                        .await;
                 } else if let Err(reason) = validate_topic_name(name) {
                     let msg = OutboundMessage {
                         channel: reply_channel.clone(),
@@ -1340,6 +1393,11 @@ impl GatewayCommand {
                         metadata: serde_json::json!({}),
                     };
                     let _ = agent_handle.send_outbound(msg).await;
+
+                    // Flush any buffered messages from this session
+                    actor_registry
+                        .flush_pending(&new_key.to_string())
+                        .await;
                 }
                 continue;
             }
@@ -1390,7 +1448,7 @@ impl GatewayCommand {
                         let label = if topic.is_empty() {
                             "(default)".to_string()
                         } else {
-                            topic
+                            topic.clone()
                         };
                         let msg = OutboundMessage {
                             channel: reply_channel.clone(),
@@ -1401,6 +1459,16 @@ impl GatewayCommand {
                             metadata: serde_json::json!({}),
                         };
                         let _ = agent_handle.send_outbound(msg).await;
+
+                        // Flush any buffered messages from the target session
+                        let target_key = SessionKey::with_topic(
+                            &inbound.channel,
+                            &inbound.chat_id,
+                            &topic,
+                        );
+                        actor_registry
+                            .flush_pending(&target_key.to_string())
+                            .await;
                     }
                     Ok(None) => {
                         let msg = OutboundMessage {
@@ -1534,26 +1602,9 @@ impl GatewayCommand {
                 channel = %inbound.channel,
                 sender = %inbound.sender_id,
                 session = %session_key,
-                "dispatching message to concurrent handler"
+                "dispatching message to session actor"
             );
 
-            // Clone shared state for the spawned task
-            let agent = agent.clone();
-            let session_mgr = session_mgr.clone();
-            let session_locks = session_locks.clone();
-            let semaphore = concurrency_semaphore.clone();
-            let message_tool = message_tool.clone();
-            let send_file_tool = send_file_tool.clone();
-            // let take_photo_tool = take_photo_tool.clone();
-            let spawn_tool = spawn_tool.clone();
-            let cron_tool_arc = cron_tool_arc.clone();
-            let pipeline_tool = pipeline_tool.clone();
-            let llm_for_compaction = llm_for_compaction.clone();
-            let out_tx = agent_handle.outbound_sender();
-            let max_history = max_history.clone();
-            let shutdown = shutdown.clone();
-            let queue_mode = gw_config.queue_mode.clone();
-            let collect_inbound_tx = collect_inbound_tx.clone();
             // Skip status indicator for cron/heartbeat messages — they're background tasks
             let status_indicator = if inbound.channel == "system" {
                 None
@@ -1561,112 +1612,24 @@ impl GatewayCommand {
                 status_indicators.get(&reply_channel).cloned()
             };
 
-            let session_key_str = session_key.to_string();
-            let locks_for_prune = session_locks.clone();
-            let handle = tokio::spawn(async move {
-                // Acquire concurrency permit (blocks if at max)
-                let _permit = match semaphore.acquire().await {
-                    Ok(permit) => permit,
-                    Err(_) => return, // semaphore closed
-                };
-
-                if shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-
-                // Get or create per-session lock
-                let session_lock = {
-                    let mut locks = session_locks.lock().await;
-                    locks
-                        .entry(session_key.to_string())
-                        .or_insert_with(|| Arc::new(Mutex::new(())))
-                        .clone()
-                };
-
-                // Serialize processing within the same session
-                let _session_guard = session_lock.lock().await;
-
-                let session_timeout = std::time::Duration::from_secs(session_timeout_secs);
-                let result = tokio::time::timeout(
-                    session_timeout,
-                    process_session_message(
-                        &agent,
-                        &session_mgr,
-                        &message_tool,
-                        &send_file_tool,
-                        // &take_photo_tool,
-                        spawn_tool.as_deref(),
-                        cron_tool_arc.as_deref(),
-                        pipeline_tool.as_deref(),
-                        &llm_for_compaction,
-                        &out_tx,
-                        &inbound,
-                        &session_key,
-                        &reply_channel,
-                        &reply_chat_id,
-                        image_media,
-                        max_history.load(Ordering::Acquire),
-                        &queue_mode,
-                        &collect_inbound_tx,
-                        status_indicator.as_deref(),
-                    ),
+            // Dispatch to per-session actor (creates one if needed)
+            actor_registry
+                .dispatch(
+                    inbound,
+                    image_media,
+                    session_key,
+                    &reply_channel,
+                    &reply_chat_id,
+                    status_indicator,
                 )
                 .await;
 
-                if result.is_err() {
-                    tracing::error!(
-                        session = %session_key,
-                        timeout_secs = session_timeout_secs,
-                        "session processing timed out"
-                    );
-                    if out_tx
-                        .send(OutboundMessage {
-                            channel: reply_channel.to_string(),
-                            chat_id: reply_chat_id.to_string(),
-                            content: "Processing timed out. Please try again.".to_string(),
-                            reply_to: None,
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        tracing::error!(session = %session_key, "outbound channel closed (timeout msg)");
-                    }
-                }
-            });
-
-            // Monitor spawned task for panics; prune session lock after completion
-            let session_key_for_log = session_key_str;
-            let mh = tokio::spawn(async move {
-                if let Err(e) = handle.await {
-                    tracing::error!(
-                        session = %session_key_for_log,
-                        error = %e,
-                        "session task panicked"
-                    );
-                }
-                // Prune session lock if no other task holds a reference
-                let mut locks = locks_for_prune.lock().await;
-                if let Some(lock) = locks.get(&session_key_for_log) {
-                    // Arc::strong_count == 1 means only the HashMap holds it
-                    if Arc::strong_count(lock) == 1 {
-                        locks.remove(&session_key_for_log);
-                    }
-                }
-            });
-            monitor_handles.push(mh);
-
-            // Periodically clean up completed monitor handles to avoid Vec growth
-            if monitor_handles.len() > 100 {
-                monitor_handles.retain(|h| !h.is_finished());
-            }
+            // Periodically reap dead actors to free resources
+            actor_registry.reap_dead_actors();
         }
 
-        // Wait for all in-flight tasks to complete before shutdown
-        for h in monitor_handles {
-            let _ = h.await;
-        }
+        // Shut down all session actors gracefully
+        actor_registry.shutdown_all().await;
 
         persona_service.stop().await;
         heartbeat_service.stop().await;
@@ -1675,214 +1638,6 @@ impl GatewayCommand {
         println!("{}", "Gateway stopped.".dimmed());
         Ok(())
     }
-}
-
-/// Process a single inbound message for a session (runs inside a spawned task).
-#[allow(clippy::too_many_arguments)]
-async fn process_session_message(
-    agent: &Agent,
-    session_mgr: &Mutex<SessionManager>,
-    message_tool: &MessageTool,
-    send_file_tool: &SendFileTool,
-    // take_photo_tool: &TakePhotoTool,
-    spawn_tool: Option<&SpawnTool>,
-    cron_tool: Option<&CronTool>,
-    pipeline_tool: Option<&crew_pipeline::RunPipelineTool>,
-    llm: &Arc<dyn LlmProvider>,
-    out_tx: &tokio::sync::mpsc::Sender<OutboundMessage>,
-    inbound: &crew_core::InboundMessage,
-    session_key: &SessionKey,
-    reply_channel: &str,
-    reply_chat_id: &str,
-    image_media: Vec<String>,
-    max_history: usize,
-    queue_mode: &QueueMode,
-    collect_tx: &tokio::sync::mpsc::Sender<crew_core::InboundMessage>,
-    status_indicator: Option<&StatusIndicator>,
-) {
-    // Set tool context for this session's reply routing
-    // TODO: Race condition — these tools are shared Arc across all sessions.
-    // If two sessions run concurrently, set_context() calls can interleave,
-    // causing messages to be sent to the wrong chat. Fix requires per-session
-    // ToolRegistry or Agent instances. Use MessageTool::with_context() /
-    // SendFileTool::with_context() when per-session tool support is added.
-    message_tool.set_context(reply_channel, reply_chat_id);
-    send_file_tool.set_context(reply_channel, reply_chat_id);
-    // take_photo_tool.set_context(reply_channel, reply_chat_id);
-    if let Some(st) = spawn_tool {
-        st.set_context(reply_channel, reply_chat_id); // TODO: same race condition
-    }
-    if let Some(ct) = cron_tool {
-        ct.set_context(reply_channel, reply_chat_id); // TODO: same race condition
-    }
-
-    // Get conversation history (hold session_mgr lock briefly)
-    let history: Vec<Message> = {
-        let mut mgr = session_mgr.lock().await;
-        let session = mgr.get_or_create(session_key);
-        session.get_history(max_history).to_vec()
-    };
-
-    // Shared token tracker for real-time status updates
-    let token_tracker = Arc::new(TokenTracker::new());
-
-    // Start dynamic status indicator (typing + rotating status message + token counts)
-    let status_handle = status_indicator.map(|si| {
-        // Set up pipeline status bridge so pipeline nodes update the status words
-        if let Some(pt) = pipeline_tool {
-            let bridge = crew_pipeline::PipelineStatusBridge::new(
-                si.status_words_handle(),
-                Arc::clone(&token_tracker),
-            );
-            pt.set_status_bridge(bridge);
-        }
-
-        let voice_transcript = inbound
-            .metadata
-            .get("voice_transcript")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        si.start(
-            reply_chat_id.to_string(),
-            &inbound.content,
-            Arc::clone(&token_tracker),
-            voice_transcript,
-        )
-    });
-
-    // Update hook context with current session ID
-    agent.set_session_id(&session_key.to_string());
-
-    // Process message through agent (potentially long LLM call, no lock held)
-    let response = agent
-        .process_message_tracked(&inbound.content, &history, image_media, &token_tracker)
-        .await;
-
-    // Stop status indicator and clean up status message
-    if let Some(handle) = status_handle {
-        handle.stop().await;
-    }
-
-    match response {
-        Ok(conv_response) => {
-            // Save user + assistant messages (hold lock briefly)
-            {
-                let mut mgr = session_mgr.lock().await;
-                let user_msg = Message {
-                    role: MessageRole::User,
-                    content: inbound.content.clone(),
-                    media: vec![],
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    timestamp: Utc::now(),
-                };
-                if let Err(e) = mgr.add_message(session_key, user_msg).await {
-                    warn!(session = %session_key, error = %e, "failed to persist user message");
-                }
-
-                // Auto-generate summary from first user message
-                {
-                    let session = mgr.get_or_create(session_key);
-                    if session.summary.is_none() && !inbound.content.trim().is_empty() {
-                        let summary: String = inbound.content.chars().take(100).collect();
-                        session.summary = Some(summary);
-                    }
-                }
-
-                // Only save non-empty assistant messages to session history
-                if !conv_response.content.is_empty() {
-                    let assistant_msg = Message {
-                        role: MessageRole::Assistant,
-                        content: conv_response.content.clone(),
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                        timestamp: Utc::now(),
-                    };
-                    if let Err(e) = mgr.add_message(session_key, assistant_msg).await {
-                        warn!(session = %session_key, error = %e, "failed to persist assistant message");
-                    }
-                }
-
-                // Compact session if it's grown too large
-                if let Err(e) =
-                    crate::compaction::maybe_compact(&mut mgr, session_key, &**llm).await
-                {
-                    warn!("session compaction failed: {e}");
-                }
-            }
-
-            // Send response back through channel
-            // Strip <think>...</think> blocks from models that embed reasoning inline
-            let content = strip_think_tags(&conv_response.content);
-
-            // For cron-triggered messages: suppress delivery if the agent response
-            // is empty or starts with [SILENT] (allows conditional-notify jobs).
-            let is_cron = inbound.channel == "system" && inbound.sender_id == "cron";
-            let is_silent = content.trim().is_empty()
-                || content.contains("[SILENT]")
-                || content.contains("[NO_CHANGE]");
-
-            if is_cron && is_silent {
-                tracing::debug!("cron job response suppressed (silent/empty)");
-            } else {
-                let display_content = content
-                    .trim_start()
-                    .strip_prefix("[SILENT]")
-                    .or_else(|| content.trim_start().strip_prefix("[NO_CHANGE]"))
-                    .unwrap_or(&content)
-                    .to_string();
-
-                let outbound = OutboundMessage {
-                    channel: reply_channel.to_string(),
-                    chat_id: reply_chat_id.to_string(),
-                    content: display_content,
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                };
-                if out_tx.send(outbound).await.is_err() {
-                    tracing::error!(session = %session_key, "outbound channel closed");
-                }
-            }
-
-            // Collect mode: not applicable in concurrent processing
-            // (would require access to agent_handle which stays on main task)
-            let _ = (queue_mode, collect_tx);
-        }
-        Err(e) => {
-            tracing::error!(session = %session_key, error = %e, "agent processing failed");
-            let error_msg = OutboundMessage {
-                channel: reply_channel.to_string(),
-                chat_id: reply_chat_id.to_string(),
-                content: format!("Error: {e}"),
-                reply_to: None,
-                media: vec![],
-                metadata: serde_json::json!({}),
-            };
-            if out_tx.send(error_msg).await.is_err() {
-                tracing::error!(session = %session_key, "outbound channel closed (error msg)");
-            }
-        }
-    }
-}
-
-/// Strip `<think>...</think>` blocks that some models (e.g. MiniMax) embed inline.
-fn strip_think_tags(s: &str) -> String {
-    let mut result = s.to_string();
-    while let Some(start) = result.find("<think>") {
-        if let Some(end) = result[start..].find("</think>") {
-            result.replace_range(start..start + end + "</think>".len(), "");
-        } else {
-            // Unclosed <think> — strip from tag to end
-            result.truncate(start);
-            break;
-        }
-    }
-    result.trim().to_string()
 }
 
 /// Escape HTML special characters for Telegram's HTML parse mode.

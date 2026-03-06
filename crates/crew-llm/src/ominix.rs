@@ -100,12 +100,21 @@ impl OminixClient {
     }
 
     /// Synthesize text to speech, returning raw WAV bytes.
-    pub async fn synthesize(&self, text: &str, voice: &str, language: &str) -> Result<Vec<u8>> {
-        let body = serde_json::json!({
+    ///
+    /// `language` is optional — pass `None` to use the server's default.
+    pub async fn synthesize(
+        &self,
+        text: &str,
+        voice: &str,
+        language: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let mut body = serde_json::json!({
             "input": text,
             "voice": voice,
-            "language": language,
         });
+        if let Some(lang) = language {
+            body["language"] = serde_json::Value::String(lang.to_string());
+        }
 
         let resp = self
             .client
@@ -133,7 +142,7 @@ impl OminixClient {
         &self,
         text: &str,
         voice: &str,
-        language: &str,
+        language: Option<&str>,
         path: &Path,
     ) -> Result<f64> {
         let wav_bytes = self.synthesize(text, voice, language).await?;

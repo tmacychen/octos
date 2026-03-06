@@ -25,6 +25,19 @@ impl CronTool {
         }
     }
 
+    /// Create a new CronTool with context pre-set (for per-session instances).
+    pub fn with_context(
+        service: Arc<CronService>,
+        channel: impl Into<String>,
+        chat_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            service,
+            default_channel: std::sync::Mutex::new(channel.into()),
+            default_chat_id: std::sync::Mutex::new(chat_id.into()),
+        }
+    }
+
     /// Update the default channel/chat_id context (called per inbound message).
     pub fn set_context(&self, channel: &str, chat_id: &str) {
         *self
