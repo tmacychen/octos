@@ -23,6 +23,8 @@ struct UpdateInput {
     action: String,
     #[serde(default)]
     version: Option<String>,
+    #[serde(default)]
+    github_token: Option<String>,
 }
 
 #[async_trait]
@@ -31,7 +33,7 @@ impl Tool for UpdateCrewTool {
         "admin_update_crew"
     }
     fn description(&self) -> &str {
-        "Check for crew updates or apply an update. Actions: 'check' to see current/latest version, 'update' to download and install the latest (or a specific) version. The service restarts automatically after update."
+        "Check for crew updates or apply an update. Actions: 'check' to see current/latest version, 'update' to download and install the latest (or a specific) version. The service restarts automatically after update. Requires 'github_token' for private repos — ask the user if not provided."
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -45,6 +47,10 @@ impl Tool for UpdateCrewTool {
                 "version": {
                     "type": "string",
                     "description": "Version to update to (e.g. 'v0.2.0'). Defaults to latest."
+                },
+                "github_token": {
+                    "type": "string",
+                    "description": "GitHub personal access token for private repo access. Required for private repos."
                 }
             },
             "required": ["action"]
@@ -54,9 +60,13 @@ impl Tool for UpdateCrewTool {
         let input: UpdateInput =
             serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
 
+        let token = input
+            .github_token
+            .or_else(|| std::env::var("GITHUB_TOKEN").ok());
+
         match input.action.as_str() {
-            "check" => self.check_version().await,
-            "update" => self.do_update(input.version).await,
+            "check" => self.check_version(token.as_deref()).await,
+            "update" => self.do_update(input.version, token.as_deref()).await,
             other => Ok(ToolResult {
                 output: format!("Unknown action '{other}'. Use 'check' or 'update'."),
                 success: false,
@@ -67,8 +77,14 @@ impl Tool for UpdateCrewTool {
 }
 
 impl UpdateCrewTool {
-    async fn check_version(&self) -> Result<ToolResult> {
-        match self.ctx.get("/api/admin/system/version").await {
+    async fn check_version(&self, token: Option<&str>) -> Result<ToolResult> {
+        // Pass token via POST so it doesn't leak in query strings/logs
+        let body = serde_json::json!({ "github_token": token });
+        match self
+            .ctx
+            .post("/api/admin/system/version", Some(&body))
+            .await
+        {
             Ok(info) => {
                 let current = info
                     .get("current")
@@ -114,9 +130,12 @@ impl UpdateCrewTool {
         }
     }
 
-    async fn do_update(&self, version: Option<String>) -> Result<ToolResult> {
+    async fn do_update(&self, version: Option<String>, token: Option<&str>) -> Result<ToolResult> {
         let ver = version.unwrap_or_else(|| "latest".to_string());
-        let body = serde_json::json!({ "version": ver });
+        let mut body = serde_json::json!({ "version": ver });
+        if let Some(t) = token {
+            body["github_token"] = serde_json::json!(t);
+        }
 
         match self.ctx.post("/api/admin/system/update", Some(&body)).await {
             Ok(resp) => {

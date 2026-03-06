@@ -197,7 +197,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(admin::platform_models_remove),
         )
         // System update
-        .route("/api/admin/system/version", get(admin::system_version))
+        .route("/api/admin/system/version", post(admin::system_version))
         .route("/api/admin/system/update", post(admin::system_update));
 
     // Determine whether auth middleware is needed

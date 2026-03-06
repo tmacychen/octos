@@ -1694,13 +1694,18 @@ pub async fn platform_models_remove(
 
 // ── System Update ────────────────────────────────────────────────────
 
-/// GET /api/admin/system/version — check current and latest version
+/// POST /api/admin/system/version — check current and latest version
 pub async fn system_version(
     State(_state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let current = crate::updater::Updater::current_version();
+    let gh_token = body
+        .get("github_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    let updater = crate::updater::Updater::new()
+    let updater = crate::updater::Updater::new(gh_token)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let latest = match updater.check_latest().await {
@@ -1732,6 +1737,8 @@ pub async fn system_version(
 pub struct UpdateRequest {
     #[serde(default = "default_version")]
     pub version: String,
+    #[serde(default)]
+    pub github_token: Option<String>,
 }
 fn default_version() -> String {
     "latest".to_string()
@@ -1742,7 +1749,7 @@ pub async fn system_update(
     State(_state): State<Arc<AppState>>,
     Json(body): Json<UpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let updater = crate::updater::Updater::new()
+    let updater = crate::updater::Updater::new(body.github_token)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Resolve the release

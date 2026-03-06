@@ -37,15 +37,16 @@ pub struct Updater {
 }
 
 impl Updater {
-    /// Create an updater rooted at the directory containing the current executable.
-    pub fn new() -> Result<Self> {
+    /// Create an updater. If `github_token` is provided it's used for auth;
+    /// otherwise falls back to `GITHUB_TOKEN` env var.
+    pub fn new(github_token: Option<String>) -> Result<Self> {
         let exe = std::env::current_exe().wrap_err("cannot locate current executable")?;
         let bin_dir = exe
             .parent()
             .ok_or_else(|| eyre::eyre!("exe has no parent dir"))?
             .to_path_buf();
 
-        let github_token = std::env::var("GITHUB_TOKEN").ok();
+        let github_token = github_token.or_else(|| std::env::var("GITHUB_TOKEN").ok());
 
         let http = reqwest::Client::builder()
             .user_agent("crew-updater/1.0")
