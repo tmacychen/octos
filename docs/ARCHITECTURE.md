@@ -373,6 +373,22 @@ pub trait EmbeddingProvider: Send + Sync {
 
 `encode_image(path) -> (mime_type, base64_data)` — JPEG/PNG/GIF/WebP. `is_image(path) -> bool`.
 
+### Typed Error Hierarchy (`error.rs`)
+
+`LlmError` with `LlmErrorKind` enum: Authentication, RateLimited, ContextOverflow, ModelNotFound, ServerError, Network, Timeout, InvalidRequest, ContentFiltered, StreamError, Provider. `is_retryable()` returns true for RateLimited, ServerError, Network, Timeout, StreamError. `from_status(code, body)` maps HTTP status codes to error kinds. Provider response bodies logged at debug level only (not exposed in error messages).
+
+### High-Level Client (`high_level.rs`)
+
+`LlmClient` wraps `Arc<dyn LlmProvider>` with ergonomic APIs: `generate(prompt)`, `generate_with(messages, tools, config)`, `generate_object(prompt, schema_name, schema)`, `generate_typed<T>(prompt, schema_name, schema)`, `stream(prompt)`, `stream_with(messages, tools, config)`. Configurable via `with_config(ChatConfig)`.
+
+### Middleware Pipeline (`middleware.rs`)
+
+`LlmMiddleware` trait with `before()`/`after()`/`on_error()` hooks. `MiddlewareStack` wraps `LlmProvider` and runs layers in insertion order. `before()` can short-circuit with cached responses. Built-in: `LoggingMiddleware` (tracing), `CostTracker` (AtomicU64 counters for input/output tokens and request count). Streaming bypasses middleware (logged as debug warning).
+
+### Model Catalog (`catalog.rs`)
+
+`ModelCatalog` with `ModelInfo` (id, name, provider, context_window, max_output_tokens, capabilities, cost, aliases). Lookup by ID or alias via HashMap index. `with_defaults()` pre-registers 4 models (Claude Sonnet 4, Claude Haiku 4.5, GPT-4o, Gemini 2.5 Flash). `by_provider()` and `with_capability()` for filtered queries.
+
 ---
 
 ## crew-memory — Persistence & Search
@@ -931,6 +947,38 @@ pub struct SseBroadcaster {
 
 Subscribers receive events via `SseBroadcaster::subscribe() -> broadcast::Receiver<String>`. Send errors (no subscribers) are silently ignored.
 
+### Execution Environments (`exec_env.rs`)
+
+`ExecEnvironment` trait with `exec(cmd, args, env)`, `read_file(path)`, `write_file(path, content)`, `file_exists(path)`, `list_dir(path)`. Two implementations: `LocalEnvironment` (tokio::process::Command) and `DockerEnvironment` (docker exec). Environment variables sanitized via shared `BLOCKED_ENV_VARS`. Docker paths validated against injection characters (`\0`, `\n`, `\r`, `:`). Docker env vars forwarded via `--env` flags.
+
+### Provider Toolsets (`provider_tools.rs`)
+
+`ToolAdjustment` (prefer, demote, aliases, extras) per LLM provider. `ProviderToolsets` registry with `with_defaults()` for openai/anthropic/google. Used to optimize tool presentation per provider (e.g., OpenAI prefers shell/read_file, demotes diff_edit).
+
+### Typed Turns (`turn.rs`)
+
+`Turn` wraps `Message` with `TurnKind` (UserInput, AgentReply, ToolCall, ToolResult, System) and iteration number. `turns_to_messages()` converts back to `Vec<Message>` for LLM calls. Enables semantic analysis of conversation history.
+
+### Event Bus (`event_bus.rs`)
+
+`EventBus` with typed `EventSubscriber` for pub/sub within the agent. Decouples event producers (tool execution, LLM calls) from consumers (logging, metrics, UI updates).
+
+### Loop Detection (`loop_detect.rs`)
+
+Detects repetitive agent behavior (e.g., calling the same tool with same args). Configurable threshold and window. Returns early with diagnostic message when loop detected.
+
+### Session State (`session.rs`)
+
+`SessionState` with `SessionLimits` and `SessionUsage` tracking. `SessionStateHandle` for thread-safe access. Tracks token usage, iteration count, and wall-clock time against configured limits.
+
+### Steering (`steering.rs`)
+
+`SteeringMessage` with `SteeringSender`/`SteeringReceiver` (mpsc channel). Allows external control of agent behavior mid-conversation (e.g., injecting guidance, changing strategy).
+
+### Prompt Layers (`prompt_layer.rs`)
+
+`PromptLayerBuilder` for composing system prompts from multiple sources (base prompt, persona, user context, memory, skills). Layers are concatenated in order with configurable separators.
+
 ---
 
 ## crew-bus — Gateway Infrastructure
@@ -1110,6 +1158,16 @@ DOT-based pipeline orchestration engine for defining and executing multi-step wo
 - `condition.rs` — Conditional edge evaluation (branching logic)
 - `tool.rs` — RunPipelineTool integration (exposes pipeline execution as an agent tool)
 - `validate.rs` — Graph validation and lint diagnostics
+- `human_gate.rs` — Human-in-the-loop gates with `HumanInputProvider` trait, `ChannelInputProvider` (mpsc + oneshot, 5min default timeout), `AutoApproveProvider`. Input types: Approval, FreeText, Choice
+- `fidelity.rs` — `FidelityMode` enum (Full, Truncate, Compact, Summary) for context carryover control between nodes. Parse from config strings. Safety caps: 10MB max_chars, 100K max_lines
+- `manager.rs` — `PipelineManager` supervisor with `SupervisionStrategy` (AllOrNothing, BestEffort, RetryFailed). Retry capped at 10 with exponential backoff (100ms-5s). `ManagerOutcome` converts to `NodeOutcome`
+- `thread.rs` — `ThreadRegistry` for LLM session reuse across pipeline nodes. `Thread` stores model_id + message history. Limits: 1000 threads, 10000 messages per thread
+- `server.rs` — `PipelineServer` trait with `SubmitRequest` (validated: 1MB DOT, 256KB input, 64 variables, safe pipeline IDs), `RunStatus` lifecycle (Queued → Running → Completed/Failed/Cancelled)
+- `artifact.rs` — Pipeline artifact storage for intermediate outputs
+- `checkpoint.rs` — Pipeline checkpoint/resume for crash recovery
+- `events.rs` — Pipeline event system for progress tracking
+- `run_dir.rs` — Per-run working directories with isolation
+- `stylesheet.rs` — Visual styling for pipeline graph rendering
 
 ---
 

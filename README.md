@@ -86,10 +86,15 @@ Comprehensive guides covering dashboard setup, LLM providers, tool configuration
 - **Config migration**: Versioned config with automatic migration
 - **Adaptive routing**: Metrics-driven provider selection with latency tracking and circuit breakers
 - **Self-updater**: Check and install updates via admin API
-- **Pipeline orchestration**: DOT-based multi-step workflow execution
+- **Pipeline orchestration**: DOT-based multi-step workflow execution with human gates, supervision strategies, context fidelity control, and thread reuse
 - **Office tools**: DOCX/PPTX/XLSX manipulation (extract, pack, validate)
 - **Prompt injection guard**: Detection and sanitization of injection attempts
 - **8 bundled app-skills**: news, deep-search, deep-crawl, send-email, weather, account-manager, clock, ASR
+- **Typed LLM errors**: Structured error hierarchy (rate limit, auth, context overflow) with retryability classification
+- **LLM middleware**: Composable request/response interceptors (logging, cost tracking, caching)
+- **Model catalog**: Programmatic model discovery with capabilities, costs, and alias-based lookup
+- **High-level LLM client**: Ergonomic `generate()`, `generate_object()`, `generate_typed<T>()`, `stream()` APIs
+- **Execution environments**: Abstracted local/Docker command execution with env sanitization
 - **Pure Rust TLS**: No OpenSSL dependency (uses rustls)
 
 ---
