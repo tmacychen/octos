@@ -49,8 +49,8 @@ pub use provider_tools::{ProviderToolsets, ToolAdjustment};
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use tools::{
-    BrowserTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool,
-    GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool, ReadFileTool, RecallMemoryTool, SaveMemoryTool,
+    BrowserTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool, GlobTool, GrepTool,
+    ListDirTool, ManageSkillsTool, MessageTool, ReadFileTool, RecallMemoryTool, SaveMemoryTool,
     SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
     ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
     WriteFileTool,

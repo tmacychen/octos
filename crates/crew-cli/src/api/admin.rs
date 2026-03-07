@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use chrono::Utc;
@@ -667,14 +667,7 @@ fn resolve_saved_key(
     let profile_id = match identity {
         Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
         Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
-            // Admin: resolve from first profile (same as /api/my/* endpoints)
-            let profiles = ps
-                .list()
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            profiles
-                .first()
-                .map(|p| p.id.clone())
-                .ok_or((StatusCode::NOT_FOUND, "no profiles exist".into()))?
+            super::auth_handlers::ADMIN_PROFILE_ID.into()
         }
         None => {
             return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
@@ -849,14 +842,7 @@ fn resolve_saved_search_key(
     let profile_id = match identity {
         Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
         Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
-            // Admin: resolve from first profile (same as /api/my/* endpoints)
-            let profiles = ps
-                .list()
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            profiles
-                .first()
-                .map(|p| p.id.clone())
-                .ok_or((StatusCode::NOT_FOUND, "no profiles exist".into()))?
+            super::auth_handlers::ADMIN_PROFILE_ID.into()
         }
         None => {
             return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
@@ -1034,11 +1020,14 @@ pub async fn create_sub_account(
 
 /// GET /api/admin/system/metrics — return system resource metrics (CPU, memory, disk).
 pub async fn system_metrics(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sysinfo::{Disks, System};
 
-    let mut sys = System::new_all();
+    let include_procs = params.get("procs").map(|v| v == "1").unwrap_or(false);
+
+    let mut sys = state.sysinfo.lock().await;
     sys.refresh_all();
 
     // CPU info
@@ -1077,6 +1066,37 @@ pub async fn system_metrics(
         })
         .collect();
 
+    // Top processes (only when requested via ?procs=1)
+    let top_processes: Vec<serde_json::Value> = if include_procs {
+        let mut procs: Vec<_> = sys
+            .processes()
+            .values()
+            .map(|p| {
+                (
+                    p.pid().as_u32(),
+                    p.name().to_string_lossy().to_string(),
+                    (p.cpu_usage() * 10.0).round() / 10.0,
+                    p.memory(),
+                )
+            })
+            .collect();
+        procs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        procs.truncate(10);
+        procs
+            .into_iter()
+            .map(|(pid, name, cpu, mem)| {
+                serde_json::json!({
+                    "pid": pid,
+                    "name": name,
+                    "cpu_percent": cpu,
+                    "memory_bytes": mem,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Platform
     let hostname = System::host_name().unwrap_or_default();
     let os_name = System::name().unwrap_or_default();
@@ -1099,6 +1119,7 @@ pub async fn system_metrics(
             "used_bytes": used_swap,
         },
         "disks": disk_info,
+        "top_processes": top_processes,
         "platform": {
             "hostname": hostname,
             "os": os_name,
@@ -1578,9 +1599,13 @@ pub async fn platform_models_catalog(
         Ok(catalog) => catalog
             .into_iter()
             .map(|m| {
-                let role = allowlist.find(&m.id).map(|p| p.role.as_str()).unwrap_or("unknown");
+                let role = allowlist
+                    .find(&m.id)
+                    .map(|p| p.role.as_str())
+                    .unwrap_or("unknown");
                 let mut v = serde_json::to_value(&m).unwrap_or_default();
-                v.as_object_mut().map(|o| o.insert("role".into(), role.into()));
+                v.as_object_mut()
+                    .map(|o| o.insert("role".into(), role.into()));
                 v
             })
             .collect(),
@@ -1624,10 +1649,17 @@ pub async fn platform_models_download(
     ))?;
     let allowlist = crew_llm::ominix::PlatformModels::load_or_create(store.crew_home_dir());
     if allowlist.find(model_id).is_none() {
-        let valid: Vec<&str> = allowlist.platform_models.iter().map(|m| m.id.as_str()).collect();
+        let valid: Vec<&str> = allowlist
+            .platform_models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("Model '{model_id}' not in platform allowlist. Valid: {}", valid.join(", ")),
+            format!(
+                "Model '{model_id}' not in platform allowlist. Valid: {}",
+                valid.join(", ")
+            ),
         ));
     }
 
@@ -1760,10 +1792,10 @@ pub async fn platform_models_enable(
         .get("model_id")
         .and_then(|v| v.as_str())
         .ok_or((StatusCode::BAD_REQUEST, "missing model_id".into()))?;
-    let role = body
-        .get("role")
-        .and_then(|v| v.as_str())
-        .ok_or((StatusCode::BAD_REQUEST, "missing role (asr, tts, etc.)".into()))?;
+    let role = body.get("role").and_then(|v| v.as_str()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "missing role (asr, tts, etc.)".into(),
+    ))?;
 
     let store = state.profile_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1779,10 +1811,12 @@ pub async fn platform_models_enable(
         })));
     }
 
-    allowlist.platform_models.push(crew_llm::ominix::PlatformModel {
-        id: model_id.to_string(),
-        role: role.to_string(),
-    });
+    allowlist
+        .platform_models
+        .push(crew_llm::ominix::PlatformModel {
+            id: model_id.to_string(),
+            role: role.to_string(),
+        });
     allowlist.save(&crew_home).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
