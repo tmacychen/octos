@@ -7,7 +7,7 @@ import ConfirmDialog from '../../components/ConfirmDialog'
 import StatusBadge from '../../components/StatusBadge'
 import { CHANNEL_COLORS, CHANNEL_LABELS } from '../../types'
 import type { ProfileResponse } from '../../types'
-import { api } from '../../api'
+import { api, myApi } from '../../api'
 import { useToast } from '../../components/Toast'
 
 export default function HomePage() {
@@ -28,10 +28,12 @@ export default function HomePage() {
   const [subsLoading, setSubsLoading] = useState(false)
 
   const loadSubAccounts = useCallback(async () => {
-    if (parentId || !profileId || !isAdmin) return
+    if (parentId || !profileId) return
     try {
       setSubsLoading(true)
-      const subs = await api.listSubAccounts(profileId)
+      const subs = isAdmin
+        ? await api.listSubAccounts(profileId)
+        : await myApi.listSubAccounts()
       setSubAccounts(subs)
     } catch {
       // silently ignore — profile may not have sub-accounts
@@ -67,7 +69,11 @@ export default function HomePage() {
 
   const handleSubStart = async (id: string) => {
     try {
-      await api.startGateway(id)
+      if (isAdmin) {
+        await api.startGateway(id)
+      } else {
+        await myApi.startSubGateway(id)
+      }
       toast(`Gateway '${id}' started`)
       loadSubAccounts()
     } catch (e: any) {
@@ -77,7 +83,11 @@ export default function HomePage() {
 
   const handleSubStop = async (id: string) => {
     try {
-      await api.stopGateway(id)
+      if (isAdmin) {
+        await api.stopGateway(id)
+      } else {
+        await myApi.stopSubGateway(id)
+      }
       toast(`Gateway '${id}' stopped`)
       loadSubAccounts()
     } catch (e: any) {
@@ -226,8 +236,8 @@ export default function HomePage() {
         </div>
       </div>
 
-      {/* Sub-Accounts section — only for parent profiles, admin only */}
-      {!parentId && isAdmin && (
+      {/* Sub-Accounts section — only for parent profiles */}
+      {!parentId && (
         <div className="mt-6 bg-surface rounded-xl border border-gray-700/50 p-5">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-sm font-semibold text-white">

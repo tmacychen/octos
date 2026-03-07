@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::StreamExt;
@@ -561,6 +561,112 @@ pub async fn my_provider_metrics(
     match pm.read_metrics(&profile_id).await {
         Some(metrics) => Ok(Json(metrics)),
         None => Ok(Json(serde_json::json!(null))),
+    }
+}
+
+/// GET /api/my/profile/accounts — List sub-accounts for the current user's profile.
+pub async fn my_sub_accounts(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<Vec<crate::api::admin::ProfileResponse>>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile_id = resolve_my_profile_id(&identity, ps)?;
+    let pm = state
+        .process_manager
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let subs = ps
+        .list_sub_accounts(&profile_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut items = Vec::with_capacity(subs.len());
+    for s in subs {
+        let status = pm.status(&s.id).await;
+        items.push(crate::api::admin::ProfileResponse {
+            profile: crate::profiles::mask_secrets(&s),
+            status,
+        });
+    }
+    Ok(Json(items))
+}
+
+/// Helper: resolve a sub-account owned by the current user.
+fn resolve_my_sub_account(
+    identity: &AuthIdentity,
+    ps: &crate::profiles::ProfileStore,
+    sub_id: &str,
+) -> Result<crate::profiles::UserProfile, StatusCode> {
+    let parent_id = resolve_my_profile_id(identity, ps)?;
+    let sub = ps
+        .get(sub_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    // Ensure the sub-account belongs to this user
+    if sub.parent_id.as_deref() != Some(&parent_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(sub)
+}
+
+/// POST /api/my/profile/accounts/:id/start — Start a sub-account gateway.
+pub async fn start_my_sub_gateway(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(sub_id): Path<String>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let pm = state
+        .process_manager
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let sub = resolve_my_sub_account(&identity, ps, &sub_id)?;
+
+    match pm.start(&sub).await {
+        Ok(()) => Ok(Json(ActionResponse {
+            ok: true,
+            message: Some(format!("Gateway '{}' started", sub.id)),
+        })),
+        Err(e) => Ok(Json(ActionResponse {
+            ok: false,
+            message: Some(e.to_string()),
+        })),
+    }
+}
+
+/// POST /api/my/profile/accounts/:id/stop — Stop a sub-account gateway.
+pub async fn stop_my_sub_gateway(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(sub_id): Path<String>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let pm = state
+        .process_manager
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let _ = resolve_my_sub_account(&identity, ps, &sub_id)?;
+
+    match pm.stop(&sub_id).await {
+        Ok(_) => Ok(Json(ActionResponse {
+            ok: true,
+            message: Some(format!("Gateway '{}' stopped", sub_id)),
+        })),
+        Err(e) => Ok(Json(ActionResponse {
+            ok: false,
+            message: Some(e.to_string()),
+        })),
     }
 }
 

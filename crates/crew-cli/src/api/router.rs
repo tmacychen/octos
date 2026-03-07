@@ -84,7 +84,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/auth/me", get(auth_handlers::me))
         .route("/api/my/test-provider", post(admin::test_provider))
-        .route("/api/my/test-search", post(admin::test_search));
+        .route("/api/my/test-search", post(admin::test_search))
+        .route(
+            "/api/my/profile/accounts",
+            get(auth_handlers::my_sub_accounts),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}/start",
+            post(auth_handlers::start_my_sub_gateway),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}/stop",
+            post(auth_handlers::stop_my_sub_gateway),
+        );
 
     // Admin API routes (admin auth only, 1MB body limit)
     let admin_api = Router::new()

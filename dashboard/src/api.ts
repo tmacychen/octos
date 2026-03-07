@@ -228,6 +228,15 @@ export const myApi = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+
+  listSubAccounts: () =>
+    authedRequest<ProfileResponse[]>('/my/profile/accounts'),
+
+  startSubGateway: (id: string) =>
+    authedRequest<ActionResponse>(`/my/profile/accounts/${id}/start`, { method: 'POST' }),
+
+  stopSubGateway: (id: string) =>
+    authedRequest<ActionResponse>(`/my/profile/accounts/${id}/stop`, { method: 'POST' }),
 }
 
 // Helper to get SSE log URL with auth token (user's own profile)
