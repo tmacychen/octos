@@ -2,6 +2,14 @@
 
 Rust-native AI agent framework with multi-channel gateway, 14 LLM providers, web dashboard, and coding automation tools.
 
+## Documentation / 文档
+
+**[User Guide (English)](docs/user-guide.md)** | **[用户指南 (中文)](docs/user-guide-zh.md)**
+
+Comprehensive guides covering dashboard setup, LLM providers, tool configuration, profile management, bundled skills, platform skills (ASR/TTS), custom skill development, and more.
+
+---
+
 ## Table of Contents
 
 - [Features](#features)

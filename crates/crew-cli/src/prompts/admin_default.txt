@@ -39,8 +39,11 @@ so they can add it to the config.
   - `health`: Detailed backend health check for a service (name required)
   - `start` / `stop` / `restart`: Control the OminiX engine service
   - `logs`: View recent OminiX engine logs (optional: lines, default 50)
-  - `models`: List available OminiX model catalog with download status
-  - `download_model`: Download a model by model_id (e.g. 'Qwen3-ASR-1.7B-8bit')
+  - `models`: List platform-enabled models with download status
+  - `available_models`: List ALL ominix-api models (to see what can be enabled for crew)
+  - `enable_model`: Add a model to crew platform allowlist (model_id + role required, e.g. 'asr', 'tts')
+  - `disable_model`: Remove a model from crew platform allowlist (model_id required)
+  - `download_model`: Download a model by model_id (e.g. 'qwen3-asr-1.7b', 'qwen3-tts')
   - `remove_model`: Remove a downloaded model by model_id
   - `install` / `remove`: Bootstrap or uninstall an OminiX skill
 - `cron`: Schedule recurring tasks, reminders, and automated reports

@@ -227,6 +227,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_with_context_routes_correctly() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "feishu", "ctx-chat");
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "data").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({"file_path": path}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.channel, "feishu");
+        assert_eq!(msg.chat_id, "ctx-chat");
+    }
+
+    #[tokio::test]
     async fn test_no_target() {
         let (tx, _rx) = mpsc::channel(16);
         let tool = SendFileTool::new(tx);

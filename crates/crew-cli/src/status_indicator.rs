@@ -294,10 +294,14 @@ fn format_status(
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Voice transcript suffix (truncate long transcripts)
+    // Voice transcript suffix (truncate long transcripts, char-safe)
     let voice_part = voice_transcript.map(|t| {
-        let truncated = if t.len() > 80 { &t[..80] } else { t };
-        format!("\n🎙 {truncated}")
+        let truncated: String = t.chars().take(80).collect();
+        if truncated.len() < t.len() {
+            format!("\n🎙 {truncated}...")
+        } else {
+            format!("\n🎙 {truncated}")
+        }
     });
 
     let base = if details.is_empty() {

@@ -531,7 +531,12 @@ impl ServeCommand {
             }
         }
 
-        // Plugins
+        // Bootstrap bundled app-skills and platform skills
+        let crew_home = cwd.join(".crew");
+        crew_agent::bootstrap::bootstrap_bundled_skills(&crew_home);
+        crew_agent::bootstrap::bootstrap_platform_skills(&crew_home);
+
+        // Plugins (includes bootstrapped skills from bundled-app-skills/ and platform-skills/)
         let plugin_dirs = Config::plugin_dirs(cwd);
         if !plugin_dirs.is_empty() {
             let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs);

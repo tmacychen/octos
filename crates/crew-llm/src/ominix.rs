@@ -1,10 +1,170 @@
-//! Async HTTP client for ominix-api (ASR/TTS).
+//! Async HTTP client for ominix-api (ASR/TTS) and platform model allowlist.
+//!
+//! Model metadata lives in ominix-api (`~/.OminiX/local_models_config.json`
+//! and `/v1/models/catalog`).  crew-rs only maintains a small allowlist at
+//! `~/.crew/platform-models.json` that specifies which ominix-api models the
+//! platform skills are permitted to use.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eyre::{Result, WrapErr};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
+
+// ---------------------------------------------------------------------------
+// Platform model allowlist — ~/.crew/platform-models.json
+// ---------------------------------------------------------------------------
+
+/// An entry in the platform allowlist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformModel {
+    /// Model ID as known by ominix-api (e.g. "qwen3-asr-1.7b").
+    pub id: String,
+    /// Role this model fills for crew platform skills: "asr" or "tts".
+    pub role: String,
+}
+
+/// The allowlist file: `~/.crew/platform-models.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformModels {
+    pub platform_models: Vec<PlatformModel>,
+}
+
+impl PlatformModels {
+    /// Default allowlist — the two core ASR/TTS models.
+    pub fn defaults() -> Self {
+        Self {
+            platform_models: vec![
+                PlatformModel {
+                    id: "qwen3-asr-1.7b".into(),
+                    role: "asr".into(),
+                },
+                PlatformModel {
+                    id: "qwen3-tts".into(),
+                    role: "tts".into(),
+                },
+            ],
+        }
+    }
+
+    /// Load from disk, or create with defaults if missing.
+    pub fn load_or_create(crew_home: &Path) -> Self {
+        let path = Self::path(crew_home);
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(list) = serde_json::from_str::<PlatformModels>(&data) {
+                return list;
+            }
+            tracing::warn!("invalid platform-models.json, using defaults");
+        }
+        let list = Self::defaults();
+        if let Ok(json) = serde_json::to_string_pretty(&list) {
+            let _ = std::fs::create_dir_all(crew_home);
+            let _ = std::fs::write(&path, json);
+        }
+        list
+    }
+
+    /// Path to the allowlist file.
+    pub fn path(crew_home: &Path) -> PathBuf {
+        crew_home.join("platform-models.json")
+    }
+
+    /// Find an entry by model ID.
+    pub fn find(&self, id: &str) -> Option<&PlatformModel> {
+        self.platform_models.iter().find(|m| m.id == id)
+    }
+
+    /// Save the allowlist to disk.
+    pub fn save(&self, crew_home: &Path) -> Result<()> {
+        let path = Self::path(crew_home);
+        let _ = std::fs::create_dir_all(crew_home);
+        let json = serde_json::to_string_pretty(self)
+            .wrap_err("failed to serialise platform-models.json")?;
+        std::fs::write(&path, json)
+            .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Get all model IDs for a given role.
+    pub fn ids_for_role(&self, role: &str) -> Vec<&str> {
+        self.platform_models
+            .iter()
+            .filter(|m| m.role == role)
+            .map(|m| m.id.as_str())
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CatalogModel — ominix-api's model schema (for deserialising API responses)
+// ---------------------------------------------------------------------------
+
+/// A model from ominix-api's `/v1/models/catalog` response.
+///
+/// We only define the fields crew-rs needs; unknown fields are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogModel {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub source: CatalogSource,
+    #[serde(default)]
+    pub storage: CatalogStorage,
+    #[serde(default)]
+    pub runtime: CatalogRuntime,
+    #[serde(default = "default_status")]
+    pub status: String,
+}
+
+fn default_status() -> String {
+    "not_downloaded".into()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogSource {
+    #[serde(default)]
+    pub primary_url: String,
+    #[serde(default)]
+    pub backup_urls: Vec<String>,
+    #[serde(default)]
+    pub source_type: String,
+    #[serde(default)]
+    pub repo_id: Option<String>,
+    #[serde(default)]
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogStorage {
+    #[serde(default)]
+    pub local_path: String,
+    #[serde(default)]
+    pub total_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub total_size_display: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogRuntime {
+    #[serde(default)]
+    pub memory_required_mb: u32,
+    #[serde(default)]
+    pub quantization: Option<String>,
+    #[serde(default)]
+    pub inference_engine: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// OminixClient — async HTTP client for ominix-api
+// ---------------------------------------------------------------------------
 
 /// Async client for ominix-api ASR/TTS endpoints.
 pub struct OminixClient {
@@ -42,9 +202,41 @@ impl OminixClient {
         }
     }
 
+    /// Fetch the full model catalog from ominix-api `/v1/models/catalog`.
+    pub async fn fetch_catalog(&self) -> Result<Vec<CatalogModel>> {
+        let resp = self
+            .client
+            .get(format!("{}/v1/models/catalog", self.base_url))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .wrap_err("ominix-api unreachable")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            eyre::bail!("ominix-api catalog returned {status}");
+        }
+
+        resp.json()
+            .await
+            .wrap_err("failed to parse ominix-api catalog")
+    }
+
+    /// Fetch catalog from ominix-api, filtered to only platform-allowed models.
+    pub async fn platform_catalog(
+        &self,
+        allowlist: &PlatformModels,
+    ) -> Result<Vec<CatalogModel>> {
+        let all = self.fetch_catalog().await?;
+        let filtered = all
+            .into_iter()
+            .filter(|m| allowlist.find(&m.id).is_some())
+            .collect();
+        Ok(filtered)
+    }
+
     /// Transcribe an audio file to text.
     pub async fn transcribe(&self, audio_path: &Path) -> Result<String> {
-        // Guard against oversized files (100MB limit matches the ASR app skill)
         let meta = tokio::fs::metadata(audio_path)
             .await
             .wrap_err_with(|| format!("failed to stat audio: {}", audio_path.display()))?;
@@ -56,7 +248,6 @@ impl OminixClient {
             .await
             .wrap_err_with(|| format!("failed to read audio: {}", audio_path.display()))?;
 
-        // ominix-api expects JSON with base64-encoded audio
         use base64::Engine;
         let file_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
@@ -65,7 +256,6 @@ impl OminixClient {
             "response_format": "verbose_json",
         });
 
-        // Only send language hint if explicitly configured (auto-detect otherwise)
         if let Some(ref lang) = self.language {
             body["language"] = serde_json::Value::String(lang.clone());
         }
@@ -100,12 +290,19 @@ impl OminixClient {
     }
 
     /// Synthesize text to speech, returning raw WAV bytes.
-    pub async fn synthesize(&self, text: &str, voice: &str, language: &str) -> Result<Vec<u8>> {
-        let body = serde_json::json!({
+    pub async fn synthesize(
+        &self,
+        text: &str,
+        voice: &str,
+        language: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let mut body = serde_json::json!({
             "input": text,
             "voice": voice,
-            "language": language,
         });
+        if let Some(lang) = language {
+            body["language"] = serde_json::Value::String(lang.to_string());
+        }
 
         let resp = self
             .client
@@ -133,7 +330,7 @@ impl OminixClient {
         &self,
         text: &str,
         voice: &str,
-        language: &str,
+        language: Option<&str>,
         path: &Path,
     ) -> Result<f64> {
         let wav_bytes = self.synthesize(text, voice, language).await?;

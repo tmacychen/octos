@@ -51,6 +51,28 @@ impl SpawnTool {
         }
     }
 
+    /// Create a new SpawnTool with context pre-set (for per-session instances).
+    pub fn with_context(
+        llm: Arc<dyn LlmProvider>,
+        memory: Arc<EpisodeStore>,
+        working_dir: PathBuf,
+        inbound_tx: tokio::sync::mpsc::Sender<InboundMessage>,
+        channel: impl Into<String>,
+        chat_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            llm,
+            memory,
+            working_dir,
+            inbound_tx,
+            origin: std::sync::Mutex::new((channel.into(), chat_id.into())),
+            worker_count: AtomicU32::new(0),
+            provider_policy: None,
+            provider_router: None,
+            worker_prompt: None,
+        }
+    }
+
     /// Inherit a provider-specific tool policy from the parent agent.
     pub fn with_provider_policy(mut self, policy: Option<ToolPolicy>) -> Self {
         self.provider_policy = policy;
