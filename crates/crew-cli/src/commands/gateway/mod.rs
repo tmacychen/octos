@@ -214,6 +214,11 @@ impl GatewayCommand {
         );
 
         let model_id = base_provider.model_id().to_string();
+
+        // Build provider chain, keeping a typed reference to AdaptiveRouter
+        // (if created) for responsiveness feedback from session actors.
+        let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
+
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
             base_provider
         } else if config.fallback_models.is_empty() {
@@ -249,8 +254,18 @@ impl GatewayCommand {
                     .as_ref()
                     .map(AdaptiveConfig::from)
                     .unwrap_or_default();
+                let ar_config = config.adaptive_routing.as_ref();
                 info!("adaptive routing enabled ({} providers)", providers.len());
-                Arc::new(AdaptiveRouter::new(providers, adaptive_config))
+                let mode = ar_config
+                    .map(|c| c.mode.into())
+                    .unwrap_or(crew_llm::AdaptiveMode::Off);
+                let qos = ar_config.is_some_and(|c| c.qos_ranking);
+                let router = Arc::new(
+                    AdaptiveRouter::new(providers, adaptive_config)
+                        .with_adaptive_config(mode, qos),
+                );
+                adaptive_router_ref = Some(router.clone());
+                router
             } else {
                 Arc::new(ProviderChain::new(providers))
             }
@@ -345,24 +360,24 @@ impl GatewayCommand {
             info!(count = n, "bootstrapped platform skills");
         }
 
-        // Voice transcription via asr platform skill binary (after bootstrap)
-        let asr_binary_path = project_dir
+        // Voice transcription via voice platform skill binary (after bootstrap)
+        let voice_binary_path = project_dir
             .join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR)
-            .join("asr")
+            .join("voice")
             .join("main");
         let ominix_url = std::env::var("OMINIX_API_URL").ok().or_else(|| {
             let home = std::env::var_os("HOME")?;
             let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
             std::fs::read_to_string(discovery).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
         });
-        let asr_binary = if asr_binary_path.exists() && ominix_url.is_some() {
+        let asr_binary = if voice_binary_path.exists() && ominix_url.is_some() {
             let url = ominix_url.unwrap();
-            println!("{}: asr platform skill ({})", "Transcriber".green(), url);
+            println!("{}: voice platform skill ({})", "Transcriber".green(), url);
             println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
-            // Export so the asr binary can find the server
+            // Export so the voice binary can find the server
             #[allow(unsafe_code)]
             unsafe { std::env::set_var("OMINIX_API_URL", &url); }
-            Some(asr_binary_path)
+            Some(voice_binary_path)
         } else {
             None
         };
@@ -391,7 +406,7 @@ impl GatewayCommand {
         //   2. Parent profile skills (if sub-account)
         //   3. Global profile skills (project_dir/skills)
         //   4. Bundled app-skills (project_dir/bundled-app-skills)
-        //   5. Platform skills (project_dir/platform-skills)
+        // Note: platform skills (voice, etc.) are admin-only — loaded in serve.rs
         let skills_loader = if data_dir != project_dir {
             let mut loader = SkillsLoader::new(&data_dir);
             for dir in &extra_skills_dirs {
@@ -405,7 +420,6 @@ impl GatewayCommand {
         let mut skills_loader = skills_loader;
         skills_loader
             .add_skills_path(project_dir.join(crew_agent::bootstrap::BUNDLED_APP_SKILLS_DIR));
-        skills_loader.add_skills_path(project_dir.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR));
         // Extra skills dirs from CREW_SKILLS_PATH env var
         if let Ok(extra) = std::env::var("CREW_SKILLS_PATH") {
             for p in extra.split(':') {
@@ -778,6 +792,8 @@ impl GatewayCommand {
             embedder: create_embedder(&config).map(|e| e as Arc<dyn crew_llm::EmbeddingProvider>),
             active_sessions: active_sessions.clone(),
             pending_messages: pending_messages.clone(),
+            queue_mode: gw_config.queue_mode,
+            adaptive_router: adaptive_router_ref,
         };
 
         // Start config watcher for hot-reload
@@ -815,12 +831,26 @@ impl GatewayCommand {
                     let env = settings_str(&entry.settings, "token_env", "TELEGRAM_BOT_TOKEN");
                     let token = std::env::var(&env)
                         .wrap_err_with(|| format!("{env} environment variable not set"))?;
-                    channel_mgr.register(Arc::new(crew_bus::TelegramChannel::new(
+                    let bot_username = entry
+                        .settings
+                        .get("bot_username")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let require_mention = entry
+                        .settings
+                        .get("require_mention")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let mut tg = crew_bus::TelegramChannel::new(
                         &token,
                         entry.allowed_senders.clone(),
                         shutdown.clone(),
                         media_dir.clone(),
-                    )));
+                    );
+                    if require_mention {
+                        tg = tg.with_mention_gating(bot_username);
+                    }
+                    channel_mgr.register(Arc::new(tg));
                 }
                 #[cfg(feature = "discord")]
                 "discord" => {
@@ -1614,20 +1644,20 @@ fn merge_queued_by_session(
         .collect()
 }
 
-/// Transcribe audio by spawning the asr platform skill binary.
+/// Transcribe audio by spawning the voice platform skill binary.
 async fn transcribe_via_skill(
-    asr_binary: &std::path::Path,
+    voice_binary: &std::path::Path,
     input_json: &str,
 ) -> eyre::Result<String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut child = tokio::process::Command::new(asr_binary)
+    let mut child = tokio::process::Command::new(voice_binary)
         .arg("voice_transcribe")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .wrap_err("failed to spawn asr skill binary")?;
+        .wrap_err("failed to spawn voice skill binary")?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(input_json.as_bytes()).await?;
@@ -1637,16 +1667,16 @@ async fn transcribe_via_skill(
     let output =
         tokio::time::timeout(std::time::Duration::from_secs(120), child.wait_with_output())
             .await
-            .map_err(|_| eyre::eyre!("asr transcription timed out"))??;
+            .map_err(|_| eyre::eyre!("voice transcription timed out"))??;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result: serde_json::Value =
-        serde_json::from_str(&stdout).wrap_err("invalid asr skill output")?;
+        serde_json::from_str(&stdout).wrap_err("invalid voice skill output")?;
 
     if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
         Ok(result["output"].as_str().unwrap_or("").to_string())
     } else {
         let msg = result["output"].as_str().unwrap_or("unknown error");
-        eyre::bail!("asr skill failed: {msg}")
+        eyre::bail!("voice skill failed: {msg}")
     }
 }

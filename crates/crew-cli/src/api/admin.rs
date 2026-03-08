@@ -567,7 +567,9 @@ pub async fn test_provider(
                     .as_deref()
                     .unwrap_or("https://api.openai.com/v1");
                 Arc::new(
-                    crew_llm::openai::OpenAIProvider::new(&api_key, &req.model).with_base_url(url),
+                    crew_llm::openai::OpenAIProvider::new(&api_key, &req.model)
+                        .with_base_url(url)
+                        .with_provider_label(&req.provider),
                 )
             }
         }
@@ -1410,7 +1412,7 @@ pub async fn platform_skill_health(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match name.as_str() {
-        "asr" | "ominix-api" => {
+        "voice" | "asr" | "ominix-api" => {
             let url = ominix_api_url();
             let health_url = format!("{}/health", url.trim_end_matches('/'));
             let result = state
@@ -1989,5 +1991,350 @@ pub async fn system_update(
         "new_version": result.new_version,
         "binaries_updated": result.binaries_updated,
         "message": "Update complete. Restarting service...",
+    })))
+}
+
+// ── Session & Cron diagnostic endpoints ──────────────────────────────
+
+/// GET /api/admin/profiles/:id/sessions — List session files for a profile.
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let ps = pm.profile_store();
+    let profile = ps
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let sessions_dir = data_dir.join("sessions");
+
+    let mut sessions = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let file_name = path
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let decoded_key = crew_bus::SessionManager::decode_filename(&file_name);
+            let meta = std::fs::metadata(&path).ok();
+            let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta
+                .and_then(|m| m.modified().ok())
+                .map(|t| {
+                    let dt: chrono::DateTime<Utc> = t.into();
+                    dt.to_rfc3339()
+                });
+            // Count lines (messages = lines - 1 for metadata line)
+            let line_count = std::fs::File::open(&path)
+                .ok()
+                .map(|f| {
+                    use std::io::BufRead;
+                    std::io::BufReader::new(f).lines().count()
+                })
+                .unwrap_or(0);
+            let msg_count = line_count.saturating_sub(1);
+
+            sessions.push(serde_json::json!({
+                "key": decoded_key,
+                "file": file_name,
+                "messages": msg_count,
+                "size_bytes": size_bytes,
+                "modified": modified,
+            }));
+        }
+    }
+    // Sort by modified descending (most recent first)
+    sessions.sort_by(|a, b| {
+        let ma = a.get("modified").and_then(|v| v.as_str()).unwrap_or("");
+        let mb = b.get("modified").and_then(|v| v.as_str()).unwrap_or("");
+        mb.cmp(ma)
+    });
+
+    Ok(Json(serde_json::json!({
+        "profile_id": id,
+        "count": sessions.len(),
+        "sessions": sessions,
+    })))
+}
+
+/// Query params for reading a session.
+#[derive(Deserialize)]
+pub struct ReadSessionQuery {
+    /// Session key (percent-decoded)
+    pub key: String,
+    /// Max number of recent messages to return (default 50)
+    #[serde(default = "default_session_lines")]
+    pub lines: usize,
+}
+
+fn default_session_lines() -> usize {
+    50
+}
+
+/// GET /api/admin/profiles/:id/sessions/read?key=...&lines=50 — Read session messages.
+pub async fn read_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ReadSessionQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let ps = pm.profile_store();
+    let profile = ps
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+
+    // Read session file directly (read-only, no side effects)
+    let sm = crew_bus::SessionManager::open(&data_dir)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let key = crew_core::SessionKey(query.key.clone());
+    let session = sm.load(&key).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("session '{}' not found", query.key),
+    ))?;
+
+    let max_lines = query.lines.min(200);
+    let messages = session.get_history(max_lines);
+    let msg_json: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| {
+            let mut obj = serde_json::json!({
+                "role": m.role.as_str(),
+                "content": truncate_str(&m.content, 500),
+            });
+            if let Some(ref tc) = m.tool_calls {
+                if !tc.is_empty() {
+                    obj["tool_calls"] = serde_json::json!(tc.iter().map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "arguments": truncate_str(&t.arguments.to_string(), 200),
+                        })
+                    }).collect::<Vec<_>>());
+                }
+            }
+            if let Some(ref name) = m.tool_call_id {
+                obj["tool_call_id"] = serde_json::json!(name);
+            }
+            obj
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "profile_id": id,
+        "session_key": query.key,
+        "total_messages": session.messages.len(),
+        "returned": msg_json.len(),
+        "created_at": session.created_at.to_rfc3339(),
+        "updated_at": session.updated_at.to_rfc3339(),
+        "messages": msg_json,
+    })))
+}
+
+/// Truncate a string to max_len chars, appending "..." if truncated.
+/// Safe for multi-byte UTF-8 (truncates at char boundary).
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{truncated}...")
+    }
+}
+
+/// GET /api/admin/profiles/:id/cron — List cron jobs for a profile.
+pub async fn list_cron_jobs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let ps = pm.profile_store();
+    let profile = ps
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let cron_path = data_dir.join("cron.json");
+
+    if !cron_path.exists() {
+        return Ok(Json(serde_json::json!({
+            "profile_id": id,
+            "count": 0,
+            "jobs": [],
+        })));
+    }
+
+    let content = tokio::fs::read_to_string(&cron_path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read cron.json: {e}")))?;
+    let store: crew_bus::CronStore = serde_json::from_str(&content)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to parse cron.json: {e}")))?;
+
+    let now_ms = Utc::now().timestamp_millis();
+    let jobs: Vec<serde_json::Value> = store
+        .jobs
+        .iter()
+        .map(|j| {
+            let next_in = j.state.next_run_at_ms.map(|t| {
+                let secs = (t - now_ms) / 1000;
+                if secs < 0 {
+                    "overdue".to_string()
+                } else if secs < 60 {
+                    format!("{secs}s")
+                } else if secs < 3600 {
+                    format!("{}m", secs / 60)
+                } else {
+                    format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+                }
+            });
+            let last_run = j.state.last_run_at_ms.map(|t| {
+                chrono::DateTime::from_timestamp_millis(t)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_default()
+            });
+            serde_json::json!({
+                "id": j.id,
+                "name": j.name,
+                "enabled": j.enabled,
+                "schedule": serde_json::to_value(&j.schedule).unwrap_or_default(),
+                "message": truncate_str(&j.payload.message, 100),
+                "channel": j.payload.channel,
+                "last_run": last_run,
+                "last_status": j.state.last_status,
+                "next_in": next_in,
+                "timezone": j.timezone,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "profile_id": id,
+        "count": jobs.len(),
+        "jobs": jobs,
+    })))
+}
+
+/// GET /api/admin/profiles/:id/config-check — Check runtime config for a profile.
+pub async fn config_check(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let ps = pm.profile_store();
+    let profile = ps
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+
+    // Check which env vars are set (names only, not values)
+    let env_var_names: Vec<String> = profile
+        .config
+        .env_vars
+        .keys()
+        .cloned()
+        .collect();
+
+    // Check email config
+    let email_status = if let Some(ref email) = profile.config.email {
+        let has_host = email.smtp_host.is_some();
+        let has_user = email.username.is_some();
+        let has_password = email.password.is_some() || email.password_env.is_some();
+        let has_from = email.from_address.is_some();
+        serde_json::json!({
+            "configured": has_host && has_user && has_password,
+            "smtp_host": has_host,
+            "username": has_user,
+            "password": has_password,
+            "from_address": has_from,
+            "smtp_port": email.smtp_port,
+        })
+    } else {
+        serde_json::json!({ "configured": false })
+    };
+
+    // Check channels
+    let channels: Vec<&str> = profile
+        .config
+        .channels
+        .iter()
+        .map(|c| match c {
+            crate::profiles::ChannelCredentials::Telegram { .. } => "telegram",
+            crate::profiles::ChannelCredentials::Discord { .. } => "discord",
+            crate::profiles::ChannelCredentials::Slack { .. } => "slack",
+            crate::profiles::ChannelCredentials::WhatsApp { .. } => "whatsapp",
+            crate::profiles::ChannelCredentials::Feishu { .. } => "feishu",
+            crate::profiles::ChannelCredentials::Email { .. } => "email",
+            crate::profiles::ChannelCredentials::Twilio { .. } => "twilio",
+        })
+        .collect();
+
+    // Check LLM provider
+    let provider = profile.config.provider.as_deref().unwrap_or("unknown");
+    let model = profile.config.model.as_deref().unwrap_or("unknown");
+
+    // Check skills
+    let skills_dir = data_dir.join("skills");
+    let installed_skills: Vec<String> = if skills_dir.exists() {
+        std::fs::read_dir(&skills_dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Check data dir sizes
+    let sessions_count = std::fs::read_dir(data_dir.join("sessions"))
+        .ok()
+        .map(|e| e.flatten().count())
+        .unwrap_or(0);
+    let has_cron = data_dir.join("cron.json").exists();
+
+    // Check gateway running status
+    let status = pm.status(&id).await;
+
+    Ok(Json(serde_json::json!({
+        "profile_id": id,
+        "name": profile.name,
+        "enabled": profile.enabled,
+        "provider": provider,
+        "model": model,
+        "channels": channels,
+        "email": email_status,
+        "env_vars": env_var_names,
+        "installed_skills": installed_skills,
+        "sessions_count": sessions_count,
+        "has_cron_jobs": has_cron,
+        "gateway_status": {
+            "running": status.running,
+            "pid": status.pid,
+            "uptime_secs": status.uptime_secs,
+        },
     })))
 }

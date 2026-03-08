@@ -152,13 +152,18 @@ impl SessionManager {
                                 .unwrap_or(0)
                         };
                         // Decode percent-encoded filename back to session key
-                        let decoded = Self::decode_session_name(name);
+                        let decoded = Self::decode_filename(name);
                         result.push((decoded, count));
                     }
                 }
             }
         }
         result
+    }
+
+    /// Load a session from disk (read-only). Returns None if not found.
+    pub fn load(&self, key: &SessionKey) -> Option<Session> {
+        self.load_from_disk(key)
     }
 
     /// Get or create a session. Loads from disk on first access.
@@ -224,7 +229,7 @@ impl SessionManager {
     }
 
     /// Decode a percent-encoded session filename back to the original session key.
-    fn decode_session_name(encoded: &str) -> String {
+    pub fn decode_filename(encoded: &str) -> String {
         let mut bytes = Vec::new();
         let mut chars = encoded.chars();
         while let Some(c) = chars.next() {
@@ -548,7 +553,7 @@ impl SessionManager {
                 continue;
             }
 
-            let decoded = Self::decode_session_name(name);
+            let decoded = Self::decode_filename(name);
 
             // Check if this session belongs to the given base key
             let session_base = decoded.split('#').next().unwrap_or(&decoded);
@@ -1072,22 +1077,22 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_session_name() {
+    fn test_decode_filename() {
         assert_eq!(
-            SessionManager::decode_session_name("feishu%3Aoc_abc123"),
+            SessionManager::decode_filename("feishu%3Aoc_abc123"),
             "feishu:oc_abc123"
         );
         assert_eq!(
-            SessionManager::decode_session_name("cli%3Adefault"),
+            SessionManager::decode_filename("cli%3Adefault"),
             "cli:default"
         );
         assert_eq!(
-            SessionManager::decode_session_name("plain-name"),
+            SessionManager::decode_filename("plain-name"),
             "plain-name"
         );
         // Double-byte UTF-8 round-trip
         assert_eq!(
-            SessionManager::decode_session_name("hello%E4%B8%96%E7%95%8C"),
+            SessionManager::decode_filename("hello%E4%B8%96%E7%95%8C"),
             "hello\u{4e16}\u{754c}" // hello世界
         );
     }

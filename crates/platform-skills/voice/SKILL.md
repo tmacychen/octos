@@ -1,14 +1,14 @@
 ---
-name: asr
-description: OminiX ASR (speech-to-text), TTS (text-to-speech), and podcast generation via Qwen3 models on Apple Silicon. Triggers: voice, transcribe audio, text to speech, podcast, 语音识别, 语音合成, speak this, read aloud, 播客.
+name: voice
+description: OminiX ASR (speech-to-text), TTS (text-to-speech), and model management via Qwen3 models on Apple Silicon. Triggers: voice, transcribe audio, text to speech, model management, download model, 语音识别, 语音合成, speak this, read aloud, 模型管理.
 version: 1.0.0
 author: hagency
 always: false
 ---
 
-# OminiX ASR / TTS / Podcast
+# OminiX ASR / TTS / Model Management
 
-On-device speech-to-text, text-to-speech, and multi-speaker podcast generation using OminiX Qwen3 ASR/TTS models on Apple Silicon.
+On-device speech-to-text, text-to-speech, and model management using OminiX Qwen3 ASR/TTS models on Apple Silicon.
 
 ## Configuration
 
@@ -47,19 +47,46 @@ Generate speech audio from text. Produces a WAV file.
 
 **Available speakers:** vivian, serena, ryan, aiden, eric, dylan (English/Chinese), uncle_fu (Chinese), ono_anna (Japanese), sohee (Korean)
 
-### generate_podcast
+### list_models
 
-Generate multi-speaker podcast from a dialogue script.
+List all loaded models and available models in the catalog.
 
 ```json
-{
-  "script": [
-    {"speaker": "Host", "voice": "vivian", "text": "Welcome to today's episode..."},
-    {"speaker": "Guest", "voice": "ryan", "text": "Thanks for having me..."}
-  ],
-  "output_path": "/tmp/podcast.wav",
-  "language": "english"
-}
+{}
 ```
 
-All segments are synthesized individually and concatenated into a single WAV file (24kHz 16-bit mono). If ffmpeg is available, an MP3 version is also produced.
+No parameters required. Returns loaded models and downloadable catalog.
+
+### download_model
+
+Download a model from the catalog.
+
+```json
+{"model_id": "Qwen3-ASR-2B-MLX-4bit"}
+```
+
+**Parameters:**
+- `model_id` (required): Model ID from the catalog (use list_models to see available models)
+
+### load_model
+
+Load a downloaded model into memory for inference.
+
+```json
+{"model": "Qwen3-ASR-2B-MLX-4bit", "model_type": "asr"}
+```
+
+**Parameters:**
+- `model` (required): Model name or path
+- `model_type` (optional, default "llm"): "llm", "asr", "tts"
+
+### unload_model
+
+Unload a model from memory.
+
+```json
+{"model_type": "asr"}
+```
+
+**Parameters:**
+- `model_type` (required): Type of model to unload — "llm", "asr", "tts"

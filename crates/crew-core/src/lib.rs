@@ -6,6 +6,7 @@
 //! - Message protocol between agents
 //! - Context and result types
 
+pub mod abort;
 mod error;
 pub mod gateway;
 mod message;
@@ -18,4 +19,5 @@ pub use gateway::{InboundMessage, OutboundMessage};
 pub use message::AgentMessage;
 pub use task::{Task, TaskContext, TaskKind, TaskResult, TaskStatus, TokenUsage};
 pub use types::{AgentId, EpisodeRef, Message, MessageRole, SessionKey, TaskId, ToolCall};
+pub use abort::is_abort_trigger;
 pub use utils::{tool_output_limit, truncate_head_tail, truncate_utf8, truncated_utf8};

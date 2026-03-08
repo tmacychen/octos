@@ -155,6 +155,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/users", get(user_admin::list_users))
         .route("/api/admin/users", post(user_admin::create_user))
         .route("/api/admin/users/{id}", delete(user_admin::delete_user))
+        // Session & cron diagnostics
+        .route(
+            "/api/admin/profiles/{id}/sessions",
+            get(admin::list_sessions),
+        )
+        .route(
+            "/api/admin/profiles/{id}/sessions/read",
+            get(admin::read_session),
+        )
+        .route(
+            "/api/admin/profiles/{id}/cron",
+            get(admin::list_cron_jobs),
+        )
+        .route(
+            "/api/admin/profiles/{id}/config-check",
+            get(admin::config_check),
+        )
         // System metrics
         .route("/api/admin/system/metrics", get(admin::system_metrics))
         // Monitor control

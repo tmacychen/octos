@@ -15,6 +15,11 @@ use tracing::{info, warn};
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::Agent;
 
+/// Callback for delivering background task results directly to the session actor.
+/// When set, bypasses the InboundMessage relay (avoids an extra LLM call).
+pub type BackgroundResultSender =
+    Arc<dyn Fn(String, String) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
 /// Tool that spawns background worker agents for long-running tasks.
 pub struct SpawnTool {
     llm: Arc<dyn LlmProvider>,
@@ -29,6 +34,8 @@ pub struct SpawnTool {
     provider_router: Option<Arc<ProviderRouter>>,
     /// Default worker prompt for sub-agents (overrides compiled-in worker.txt).
     worker_prompt: Option<String>,
+    /// Direct delivery channel to session actor (bypasses InboundMessage relay).
+    background_result_sender: Option<BackgroundResultSender>,
 }
 
 impl SpawnTool {
@@ -48,6 +55,7 @@ impl SpawnTool {
             provider_policy: None,
             provider_router: None,
             worker_prompt: None,
+            background_result_sender: None,
         }
     }
 
@@ -70,7 +78,16 @@ impl SpawnTool {
             provider_policy: None,
             provider_router: None,
             worker_prompt: None,
+            background_result_sender: None,
         }
+    }
+
+    /// Set a direct result sender that bypasses the InboundMessage relay.
+    /// When set, background task results are injected as system messages
+    /// into the session without triggering an extra LLM call.
+    pub fn with_background_result_sender(mut self, sender: BackgroundResultSender) -> Self {
+        self.background_result_sender = Some(sender);
+        self
     }
 
     /// Inherit a provider-specific tool policy from the parent agent.
@@ -354,6 +371,8 @@ impl Tool for SpawnTool {
             let provider_policy = self.provider_policy.clone();
             let custom_system_prompt = input.system_prompt;
             let default_worker_prompt = self.worker_prompt.clone();
+            let bg_sender = self.background_result_sender.clone();
+            let task_label = label.clone();
 
             tokio::spawn(async move {
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
@@ -386,6 +405,22 @@ impl Tool for SpawnTool {
 
                 let result = worker.run_task(&subtask).await;
 
+                let content = match &result {
+                    Ok(r) => format!(
+                        "Status: {}\n\n{}",
+                        if r.success { "SUCCESS" } else { "FAILED" },
+                        r.output
+                    ),
+                    Err(e) => format!("Status: FAILED\nError: {e}"),
+                };
+
+                // Direct injection path: inject as system message, no extra LLM call
+                if let Some(sender) = bg_sender {
+                    sender(task_label, content).await;
+                    return;
+                }
+
+                // Legacy path: relay via InboundMessage (triggers extra LLM call)
                 let content = match &result {
                     Ok(r) => format!(
                         "[Subagent {} completed]\nTask: {}\nStatus: {}\n\nResult:\n{}\n\nPlease summarize this result naturally for the user.",
@@ -447,6 +482,7 @@ mod tests {
             provider_policy: None,
             provider_router: None,
             worker_prompt: None,
+            background_result_sender: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);

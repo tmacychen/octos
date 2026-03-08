@@ -192,43 +192,52 @@ impl LlmProvider for OpenAIResponsesProvider {
 // ---- Input message building ----
 
 fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
-    messages
-        .iter()
-        .filter(|m| {
-            !(m.role == MessageRole::Assistant
-                && m.content.is_empty()
-                && m.tool_calls.as_ref().is_none_or(|tc| tc.is_empty()))
-        })
-        .map(build_input_message)
-        .collect()
+    let mut input = Vec::new();
+    for msg in messages {
+        // Skip empty assistant messages with no tool calls
+        if msg.role == MessageRole::Assistant
+            && msg.content.is_empty()
+            && msg.tool_calls.as_ref().is_none_or(|tc| tc.is_empty())
+        {
+            continue;
+        }
+        build_input_items(msg, &mut input);
+    }
+    input
 }
 
-fn build_input_message(msg: &Message) -> serde_json::Value {
+/// Append one or more Responses API input items for a message.
+///
+/// The Responses API requires `function_call` to be a top-level input item,
+/// NOT nested inside an assistant message's content array (which only accepts
+/// `output_text` and `refusal`). So an assistant message with tool calls is
+/// split into: an assistant message (text only) + separate function_call items.
+fn build_input_items(msg: &Message, out: &mut Vec<serde_json::Value>) {
     match msg.role {
         MessageRole::System => {
-            serde_json::json!({
+            out.push(serde_json::json!({
                 "role": "system",
                 "content": &msg.content,
-            })
+            }));
         }
         MessageRole::User => {
-            serde_json::json!({
+            out.push(serde_json::json!({
                 "role": "user",
                 "content": build_user_content(msg),
-            })
+            }));
         }
-        MessageRole::Assistant if msg.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) => {
-            // Assistant message with function calls
-            let mut output = Vec::new();
+        MessageRole::Assistant => {
+            // Emit assistant text content (if any)
             if !msg.content.is_empty() {
-                output.push(serde_json::json!({
-                    "type": "output_text",
-                    "text": &msg.content,
+                out.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": &msg.content }],
                 }));
             }
+            // Emit each tool call as a top-level function_call item
             if let Some(tool_calls) = &msg.tool_calls {
                 for tc in tool_calls {
-                    output.push(serde_json::json!({
+                    out.push(serde_json::json!({
                         "type": "function_call",
                         "id": &tc.id,
                         "call_id": &tc.id,
@@ -237,24 +246,14 @@ fn build_input_message(msg: &Message) -> serde_json::Value {
                     }));
                 }
             }
-            serde_json::json!({
-                "role": "assistant",
-                "content": output,
-            })
-        }
-        MessageRole::Assistant => {
-            serde_json::json!({
-                "role": "assistant",
-                "content": [{ "type": "output_text", "text": &msg.content }],
-            })
         }
         MessageRole::Tool => {
             let call_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
-            serde_json::json!({
+            out.push(serde_json::json!({
                 "type": "function_call_output",
                 "call_id": call_id,
                 "output": &msg.content,
-            })
+            }));
         }
     }
 }
@@ -592,18 +591,22 @@ mod tests {
     #[test]
     fn test_build_input_system_message() {
         let m = msg(MessageRole::System, "be helpful");
-        let result = build_input_message(&m);
-        assert_eq!(result["role"].as_str(), Some("system"));
-        assert_eq!(result["content"].as_str(), Some("be helpful"));
+        let mut items = Vec::new();
+        build_input_items(&m, &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["role"].as_str(), Some("system"));
+        assert_eq!(items[0]["content"].as_str(), Some("be helpful"));
     }
 
     #[test]
     fn test_build_input_user_message() {
         let m = msg(MessageRole::User, "hello");
-        let result = build_input_message(&m);
-        assert_eq!(result["role"].as_str(), Some("user"));
-        assert_eq!(result["content"][0]["type"].as_str(), Some("input_text"));
-        assert_eq!(result["content"][0]["text"].as_str(), Some("hello"));
+        let mut items = Vec::new();
+        build_input_items(&m, &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["role"].as_str(), Some("user"));
+        assert_eq!(items[0]["content"][0]["type"].as_str(), Some("input_text"));
+        assert_eq!(items[0]["content"][0]["text"].as_str(), Some("hello"));
     }
 
     #[test]
@@ -617,10 +620,12 @@ mod tests {
             reasoning_content: None,
             timestamp: chrono::Utc::now(),
         };
-        let result = build_input_message(&m);
-        assert_eq!(result["type"].as_str(), Some("function_call_output"));
-        assert_eq!(result["call_id"].as_str(), Some("call_123"));
-        assert_eq!(result["output"].as_str(), Some("file contents"));
+        let mut items = Vec::new();
+        build_input_items(&m, &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"].as_str(), Some("function_call_output"));
+        assert_eq!(items[0]["call_id"].as_str(), Some("call_123"));
+        assert_eq!(items[0]["output"].as_str(), Some("file contents"));
     }
 
     #[test]
@@ -639,12 +644,19 @@ mod tests {
             reasoning_content: None,
             timestamp: chrono::Utc::now(),
         };
-        let result = build_input_message(&m);
-        assert_eq!(result["role"].as_str(), Some("assistant"));
-        let content = result["content"].as_array().unwrap();
+        // Should produce two top-level items: assistant message + function_call
+        let mut items = Vec::new();
+        build_input_items(&m, &mut items);
+        assert_eq!(items.len(), 2);
+        // First: assistant message with text only
+        assert_eq!(items[0]["role"].as_str(), Some("assistant"));
+        let content = items[0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"].as_str(), Some("output_text"));
-        assert_eq!(content[1]["type"].as_str(), Some("function_call"));
-        assert_eq!(content[1]["name"].as_str(), Some("shell"));
+        assert_eq!(content[0]["text"].as_str(), Some("Let me check"));
+        // Second: top-level function_call item
+        assert_eq!(items[1]["type"].as_str(), Some("function_call"));
+        assert_eq!(items[1]["name"].as_str(), Some("shell"));
+        assert_eq!(items[1]["call_id"].as_str(), Some("call_1"));
     }
 
     #[test]

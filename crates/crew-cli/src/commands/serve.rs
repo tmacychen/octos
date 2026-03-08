@@ -155,6 +155,7 @@ impl ServeCommand {
                 .with_bridge_js(bridge_js_path)
                 .with_serve_config(self.port, auth_token.clone()),
         );
+        process_manager.set_self_ref();
 
         // Initialize user store and auth manager for multi-user support
         let user_store = Arc::new(
@@ -537,8 +538,13 @@ impl ServeCommand {
         crew_agent::bootstrap::bootstrap_bundled_skills(&crew_home);
         crew_agent::bootstrap::bootstrap_platform_skills(&crew_home);
 
-        // Plugins (includes bootstrapped skills from bundled-app-skills/ and platform-skills/)
-        let plugin_dirs = Config::plugin_dirs(cwd);
+        // Plugins (includes bootstrapped skills from bundled-app-skills/)
+        let mut plugin_dirs = Config::plugin_dirs(cwd);
+        // Platform skills are admin-only — add them here (not in Config::plugin_dirs)
+        let platform_dir = crew_home.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR);
+        if platform_dir.exists() {
+            plugin_dirs.push(platform_dir);
+        }
         if !plugin_dirs.is_empty() {
             let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs);
         }

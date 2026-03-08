@@ -24,6 +24,13 @@ pub struct StatusIndicator {
 }
 
 impl StatusIndicator {
+    /// Get a reference to the underlying channel (for stream forwarding).
+    pub fn channel(&self) -> &Arc<dyn Channel> {
+        &self.channel
+    }
+}
+
+impl StatusIndicator {
     pub fn new(channel: Arc<dyn Channel>, status_words: Vec<String>) -> Self {
         Self {
             channel,
@@ -126,8 +133,8 @@ impl StatusIndicator {
 
 /// Handle to an active status indicator. Call `stop()` to clean up.
 pub struct StatusHandle {
-    cancelled: Arc<AtomicBool>,
-    status_msg_id: Arc<Mutex<Option<String>>>,
+    pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) status_msg_id: Arc<Mutex<Option<String>>>,
     channel: Arc<dyn Channel>,
     chat_id: String,
 }

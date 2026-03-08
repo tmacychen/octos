@@ -328,7 +328,7 @@ impl Updater {
                     "deep-crawl",
                     "send-email",
                     "account-manager",
-                    "asr",
+                    "voice",
                     "clock",
                     "weather",
                 ];

@@ -164,6 +164,15 @@ impl LlmProvider for GeminiProvider {
         let stop_reason = match candidate.finish_reason.as_deref() {
             Some("STOP") => StopReason::EndTurn,
             Some("MAX_TOKENS") => StopReason::MaxTokens,
+            Some("SAFETY" | "RECITATION" | "OTHER" | "BLOCKLIST" | "PROHIBITED_CONTENT") => {
+                StopReason::ContentFiltered
+            }
+            Some("MALFORMED_FUNCTION_CALL") => {
+                // Gemini sometimes fails to format tool calls properly.
+                // Treat as empty response so the retry logic picks it up.
+                tracing::warn!("Gemini returned MALFORMED_FUNCTION_CALL");
+                StopReason::EndTurn
+            }
             _ if !tool_calls.is_empty() => StopReason::ToolUse,
             _ => StopReason::EndTurn,
         };
@@ -693,6 +702,12 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
                     "STOP" if state.has_tool_calls => StopReason::ToolUse,
                     "STOP" => StopReason::EndTurn,
                     "MAX_TOKENS" => StopReason::MaxTokens,
+                    "SAFETY" | "RECITATION" | "OTHER" | "BLOCKLIST"
+                    | "PROHIBITED_CONTENT" => StopReason::ContentFiltered,
+                    "MALFORMED_FUNCTION_CALL" => {
+                        tracing::warn!("Gemini returned MALFORMED_FUNCTION_CALL (streaming)");
+                        StopReason::EndTurn
+                    }
                     _ if state.has_tool_calls => StopReason::ToolUse,
                     _ => StopReason::EndTurn,
                 };

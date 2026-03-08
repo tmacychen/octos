@@ -503,6 +503,336 @@ impl Tool for SystemMetricsTool {
     }
 }
 
+// ── admin_view_sessions ──────────────────────────────────────────────
+
+pub struct ViewSessionsTool {
+    ctx: Arc<AdminApiContext>,
+}
+
+impl ViewSessionsTool {
+    pub fn new(ctx: Arc<AdminApiContext>) -> Self {
+        Self { ctx }
+    }
+}
+
+#[derive(Deserialize)]
+struct ViewSessionsInput {
+    profile_id: String,
+    /// If provided, read this specific session's messages. Otherwise list all sessions.
+    #[serde(default)]
+    session_key: Option<String>,
+    /// Max messages to return when reading a session (default 30, max 100).
+    #[serde(default = "default_session_lines")]
+    lines: usize,
+}
+
+fn default_session_lines() -> usize {
+    30
+}
+
+#[async_trait]
+impl Tool for ViewSessionsTool {
+    fn name(&self) -> &str {
+        "admin_view_sessions"
+    }
+    fn description(&self) -> &str {
+        "List or read session history for a profile. Without session_key, lists all sessions. With session_key, returns recent messages from that session. Use this to diagnose conversation issues, check cron job results (system:cron_* sessions), or review tool call outcomes."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "profile_id": { "type": "string", "description": "Profile ID" },
+                "session_key": { "type": "string", "description": "Session key to read (e.g. 'system:cron_abc123' or 'telegram:12345'). Omit to list all sessions." },
+                "lines": { "type": "integer", "description": "Max messages to return when reading a session (default 30, max 100)" }
+            },
+            "required": ["profile_id"]
+        })
+    }
+    async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let input: ViewSessionsInput =
+            serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
+
+        if let Some(ref key) = input.session_key {
+            // Read specific session
+            let max_lines = input.lines.min(100);
+            // Simple percent-encode for query parameter
+            let encoded_key: String = key.bytes().map(|b| {
+                if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+                    format!("{}", b as char)
+                } else {
+                    format!("%{b:02X}")
+                }
+            }).collect();
+            let url = format!(
+                "/api/admin/profiles/{}/sessions/read?key={}&lines={}",
+                input.profile_id,
+                encoded_key,
+                max_lines
+            );
+            match self.ctx.get(&url).await {
+                Ok(data) => {
+                    let total = data.get("total_messages").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let returned = data.get("returned").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let updated = data.get("updated_at").and_then(|v| v.as_str()).unwrap_or("?");
+
+                    let mut out = format!(
+                        "Session '{}' ({} total messages, showing last {}, updated: {}):\n\n",
+                        key, total, returned, updated
+                    );
+
+                    if let Some(messages) = data.get("messages").and_then(|v| v.as_array()) {
+                        for msg in messages {
+                            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            out.push_str(&format!("[{}] {}\n", role, content));
+                            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                                for tc in tcs {
+                                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let args = tc.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                                    out.push_str(&format!("  -> tool_call: {}({})\n", name, args));
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(ToolResult {
+                        output: out,
+                        success: true,
+                        ..Default::default()
+                    })
+                }
+                Err(e) => Ok(ToolResult {
+                    output: format!("Failed to read session: {e}"),
+                    success: false,
+                    ..Default::default()
+                }),
+            }
+        } else {
+            // List all sessions
+            match self.ctx.get(&format!("/api/admin/profiles/{}/sessions", input.profile_id)).await {
+                Ok(data) => {
+                    let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let mut out = format!("{} sessions for '{}':\n\n", count, input.profile_id);
+
+                    if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
+                        for s in sessions {
+                            let key = s.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+                            let msgs = s.get("messages").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let modified = s.get("modified").and_then(|v| v.as_str()).unwrap_or("?");
+                            let size = s.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                            out.push_str(&format!(
+                                "  {} — {} msgs, {}KB, modified: {}\n",
+                                key, msgs, size / 1024, modified
+                            ));
+                        }
+                    }
+
+                    Ok(ToolResult {
+                        output: out,
+                        success: true,
+                        ..Default::default()
+                    })
+                }
+                Err(e) => Ok(ToolResult {
+                    output: format!("Failed to list sessions: {e}"),
+                    success: false,
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+}
+
+// ── admin_cron_status ───────────────────────────────────────────────
+
+pub struct CronStatusTool {
+    ctx: Arc<AdminApiContext>,
+}
+
+impl CronStatusTool {
+    pub fn new(ctx: Arc<AdminApiContext>) -> Self {
+        Self { ctx }
+    }
+}
+
+#[async_trait]
+impl Tool for CronStatusTool {
+    fn name(&self) -> &str {
+        "admin_cron_status"
+    }
+    fn description(&self) -> &str {
+        "List cron jobs for a profile with schedule, last run time, last status, and next fire time. Use to diagnose missed or failed cron jobs."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "profile_id": { "type": "string", "description": "Profile ID" }
+            },
+            "required": ["profile_id"]
+        })
+    }
+    async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let input: ProfileIdInput =
+            serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
+
+        match self.ctx.get(&format!("/api/admin/profiles/{}/cron", input.profile_id)).await {
+            Ok(data) => {
+                let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                if count == 0 {
+                    return Ok(ToolResult {
+                        output: format!("No cron jobs configured for '{}'.", input.profile_id),
+                        success: true,
+                        ..Default::default()
+                    });
+                }
+
+                let mut out = format!("{} cron jobs for '{}':\n\n", count, input.profile_id);
+
+                if let Some(jobs) = data.get("jobs").and_then(|v| v.as_array()) {
+                    for j in jobs {
+                        let id = j.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                        let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let enabled = j.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let message = j.get("message").and_then(|v| v.as_str()).unwrap_or("?");
+                        let last_run = j.get("last_run").and_then(|v| v.as_str()).unwrap_or("never");
+                        let last_status = j.get("last_status").and_then(|v| v.as_str()).unwrap_or("n/a");
+                        let next_in = j.get("next_in").and_then(|v| v.as_str()).unwrap_or("n/a");
+                        let status_icon = if enabled { "ON" } else { "OFF" };
+
+                        out.push_str(&format!(
+                            "  [{status_icon}] {name} (id: {id})\n    Message: {message}\n    Last run: {last_run} — Status: {last_status}\n    Next fire in: {next_in}\n\n"
+                        ));
+                    }
+                }
+
+                Ok(ToolResult {
+                    output: out,
+                    success: true,
+                    ..Default::default()
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                output: format!("Failed to get cron status: {e}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+// ── admin_check_config ──────────────────────────────────────────────
+
+pub struct CheckConfigTool {
+    ctx: Arc<AdminApiContext>,
+}
+
+impl CheckConfigTool {
+    pub fn new(ctx: Arc<AdminApiContext>) -> Self {
+        Self { ctx }
+    }
+}
+
+#[async_trait]
+impl Tool for CheckConfigTool {
+    fn name(&self) -> &str {
+        "admin_check_config"
+    }
+    fn description(&self) -> &str {
+        "Check a profile's runtime configuration: LLM provider, channels, email setup, env vars (names only), installed skills, and gateway status. Use to diagnose configuration issues."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "profile_id": { "type": "string", "description": "Profile ID" }
+            },
+            "required": ["profile_id"]
+        })
+    }
+    async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let input: ProfileIdInput =
+            serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
+
+        match self.ctx.get(&format!("/api/admin/profiles/{}/config-check", input.profile_id)).await {
+            Ok(data) => {
+                let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                let provider = data.get("provider").and_then(|v| v.as_str()).unwrap_or("?");
+                let model = data.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+
+                let mut out = format!("Config check for '{}' ({}):\n\n", input.profile_id, name);
+                out.push_str(&format!("  Enabled: {enabled}\n"));
+                out.push_str(&format!("  Provider: {provider}, Model: {model}\n"));
+
+                // Gateway status
+                if let Some(gw) = data.get("gateway_status") {
+                    let running = gw.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let uptime = gw.get("uptime_secs").and_then(|v| v.as_i64());
+                    if running {
+                        let uptime_str = uptime.map(super::format_duration).unwrap_or_else(|| "?".into());
+                        out.push_str(&format!("  Gateway: RUNNING (uptime: {uptime_str})\n"));
+                    } else {
+                        out.push_str("  Gateway: STOPPED\n");
+                    }
+                }
+
+                // Channels
+                if let Some(channels) = data.get("channels").and_then(|v| v.as_array()) {
+                    let ch_list: Vec<&str> = channels.iter().filter_map(|v| v.as_str()).collect();
+                    out.push_str(&format!("  Channels: {}\n", if ch_list.is_empty() { "none".into() } else { ch_list.join(", ") }));
+                }
+
+                // Email
+                if let Some(email) = data.get("email") {
+                    let configured = email.get("configured").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if configured {
+                        out.push_str("  Email (SMTP): CONFIGURED\n");
+                    } else {
+                        let mut missing = Vec::new();
+                        if !email.get("smtp_host").and_then(|v| v.as_bool()).unwrap_or(false) { missing.push("host"); }
+                        if !email.get("username").and_then(|v| v.as_bool()).unwrap_or(false) { missing.push("username"); }
+                        if !email.get("password").and_then(|v| v.as_bool()).unwrap_or(false) { missing.push("password"); }
+                        out.push_str(&format!("  Email (SMTP): NOT CONFIGURED (missing: {})\n", missing.join(", ")));
+                    }
+                }
+
+                // Env vars
+                if let Some(vars) = data.get("env_vars").and_then(|v| v.as_array()) {
+                    let var_names: Vec<&str> = vars.iter().filter_map(|v| v.as_str()).collect();
+                    out.push_str(&format!("  Env vars: {} set ({})\n", var_names.len(),
+                        if var_names.is_empty() { "none".into() } else { var_names.join(", ") }));
+                }
+
+                // Skills
+                if let Some(skills) = data.get("installed_skills").and_then(|v| v.as_array()) {
+                    let skill_names: Vec<&str> = skills.iter().filter_map(|v| v.as_str()).collect();
+                    out.push_str(&format!("  Skills: {}\n",
+                        if skill_names.is_empty() { "none".into() } else { skill_names.join(", ") }));
+                }
+
+                // Sessions & cron
+                let sessions = data.get("sessions_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let has_cron = data.get("has_cron_jobs").and_then(|v| v.as_bool()).unwrap_or(false);
+                out.push_str(&format!("  Sessions: {sessions} files\n"));
+                out.push_str(&format!("  Cron jobs: {}\n", if has_cron { "yes" } else { "none" }));
+
+                Ok(ToolResult {
+                    output: out,
+                    success: true,
+                    ..Default::default()
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                output: format!("Failed to check config: {e}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

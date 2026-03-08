@@ -690,14 +690,18 @@ impl Tool for UpdateProfileTool {
                 "enabled": { "type": "boolean", "description": "Enable/disable auto-start" },
                 "email": {
                     "type": "object",
-                    "description": "Email sending config. For SMTP: {provider:'smtp', smtp_host, smtp_port, username, password_env, from_address}. For Feishu: {provider:'feishu', feishu_app_id, feishu_app_secret_env, feishu_from_address}.",
+                    "description": "Email sending config. For SMTP: {provider:'smtp', smtp_host, smtp_port, username, password, from_address}. For Feishu: {provider:'feishu', feishu_app_id, feishu_app_secret, feishu_from_address}.",
                     "properties": {
                         "provider": { "type": "string", "enum": ["smtp", "feishu"], "description": "Email provider type" },
                         "smtp_host": { "type": "string", "description": "SMTP server hostname (e.g. smtp.gmail.com)" },
                         "smtp_port": { "type": "integer", "description": "SMTP port (465 for TLS, 587 for STARTTLS)" },
                         "username": { "type": "string", "description": "SMTP login username" },
-                        "password_env": { "type": "string", "description": "Env var name holding SMTP password" },
-                        "from_address": { "type": "string", "description": "Sender email address" }
+                        "password": { "type": "string", "description": "SMTP password (app password for Gmail)" },
+                        "password_env": { "type": "string", "description": "Env var name holding SMTP password (legacy, prefer 'password')" },
+                        "from_address": { "type": "string", "description": "Sender email address" },
+                        "feishu_app_id": { "type": "string", "description": "Feishu app ID" },
+                        "feishu_app_secret": { "type": "string", "description": "Feishu app secret" },
+                        "feishu_from_address": { "type": "string", "description": "Feishu sender email address" }
                     }
                 },
                 "env_vars": {

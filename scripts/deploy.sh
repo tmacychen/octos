@@ -15,7 +15,7 @@ PW_2="vbasx129"
 TARGET="${1:-all}"
 REMOTE_BIN="/Users/cloud/.cargo/bin"
 PLIST="io.ominix.crew-serve"
-BINARIES=(crew news_fetch deep-search deep_crawl send_email account_manager asr clock weather)
+BINARIES=(crew news_fetch deep-search deep_crawl send_email account_manager voice clock weather)
 
 ssh_cmd() {
     local idx=$1; shift
@@ -44,7 +44,7 @@ esac
 # --- Build ---
 echo "==> Building release binaries..."
 cargo build --release -p crew-cli --features telegram,whatsapp,feishu,twilio,api
-cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p asr -p clock -p weather
+cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather
 
 # Build ominix-api if source is available
 OMINIX_DIR="${OMINIX_DIR:-$HOME/home/ominix-api}"
@@ -168,7 +168,7 @@ echo "  ominix-api plist generated"'"'"
     }' || echo "  WARN: could not check ffmpeg"
 
     echo "==> Cleaning stale skill dirs (bootstrap recreates them)..."
-    for skill in news deep-search deep-crawl send-email account-manager asr clock weather; do
+    for skill in news deep-search deep-crawl send-email account-manager voice clock weather; do
         ssh_cmd "$idx" "rm -rf /Users/cloud/.crew/skills/${skill}" 2>/dev/null || true
     done
     # Also clean bundled-app-skills and platform-skills so bootstrap picks up new binaries

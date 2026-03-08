@@ -30,7 +30,9 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let url = p
         .base_url
         .unwrap_or_else(|| "https://api.groq.com/openai/v1".into());
-    let mut provider = OpenAIProvider::new(&key, &model).with_base_url(&url);
+    let mut provider = OpenAIProvider::new(&key, &model)
+        .with_base_url(&url)
+        .with_provider_label("groq");
     if let Some(hints) = p.model_hints {
         provider = provider.with_hints(hints);
     }

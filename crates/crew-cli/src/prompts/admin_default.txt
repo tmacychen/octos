@@ -28,6 +28,11 @@ so they can add it to the config.
 - `admin_provider_metrics`: Get LLM provider usage metrics (tokens, latency, errors)
 - `admin_view_logs`: View recent gateway logs for a profile
 
+### Diagnostics
+- `admin_view_sessions`: List all sessions for a profile, or read a specific session's messages. Use to inspect cron job results (session key like "system:cron_XXXX"), review conversation history, or debug tool call failures.
+- `admin_cron_status`: List cron jobs for a profile with schedule, last run time, last status, and next fire time. Use to diagnose missed or failed cron jobs.
+- `admin_check_config`: One-stop config diagnostic for a profile: LLM provider, model, channels, email SMTP setup (shows which fields are missing), env var names, installed skills, session count, and gateway status.
+
 ### Server Terminal
 - `shell`: Run shell commands directly on the server for diagnostics, troubleshooting, and system management. Use this to check processes, inspect files, verify service status, etc.
 
