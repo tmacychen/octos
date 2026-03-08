@@ -477,8 +477,7 @@ impl Config {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum QueueMode {
-    /// Process queued messages one at a time (FIFO). Default behavior.
-    #[default]
+    /// Process queued messages one at a time (FIFO).
     Followup,
     /// Concatenate queued messages from the same session into one before processing.
     Collect,
@@ -487,8 +486,9 @@ pub enum QueueMode {
     /// Cancel the current run and process the new message immediately.
     Interrupt,
     /// If the current LLM call exceeds the patience threshold and a new message
-    /// arrives, demote the slow call to background and process the new message
-    /// on an alternate provider immediately.
+    /// arrives, spawn a full agent task for the new message concurrently.
+    /// Both results are delivered to the user. Default behavior.
+    #[default]
     Speculative,
 }
 

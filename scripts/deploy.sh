@@ -43,7 +43,7 @@ esac
 
 # --- Build ---
 echo "==> Building release binaries..."
-cargo build --release -p crew-cli --features telegram,whatsapp,feishu,twilio,api
+cargo build --release -p crew-cli --features telegram,whatsapp,feishu,twilio,wecom,api
 cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather
 
 # Build ominix-api if source is available
@@ -162,10 +162,20 @@ echo "  ominix-api plist generated"'"'"
     ssh_cmd "$idx" "launchctl load ~/Library/LaunchAgents/io.ominix.ominix-api.plist 2>/dev/null || true"
     echo "    ominix-api service started"
 
-    echo "==> Ensuring ffmpeg is installed..."
-    ssh_cmd "$idx" 'command -v ffmpeg &>/dev/null && echo "  ffmpeg: OK" || {
-        if command -v brew &>/dev/null; then brew install ffmpeg; else echo "  WARN: install ffmpeg manually"; fi
-    }' || echo "  WARN: could not check ffmpeg"
+    echo "==> Ensuring Homebrew and ffmpeg are installed..."
+    ssh_cmd "$idx" 'bash -c '\''
+        if ! command -v brew &>/dev/null; then
+            echo "  Installing Homebrew..."
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        fi
+        if ! command -v ffmpeg &>/dev/null; then
+            echo "  Installing ffmpeg..."
+            brew install ffmpeg
+        else
+            echo "  ffmpeg: OK"
+        fi
+    '\'''
 
     echo "==> Cleaning stale skill dirs (bootstrap recreates them)..."
     for skill in news deep-search deep-crawl send-email account-manager voice clock weather; do

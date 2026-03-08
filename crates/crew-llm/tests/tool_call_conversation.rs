@@ -590,7 +590,7 @@ async fn test_kimi_k25() {
 async fn test_minimax_m1() {
     let key = std::env::var("MINIMAX_API_KEY").expect("MINIMAX_API_KEY not set");
     let p: Arc<dyn LlmProvider> = Arc::new(
-        OpenAIProvider::new(key, "MiniMax-M1").with_base_url("https://api.minimaxi.chat/v1"),
+        OpenAIProvider::new(key, "MiniMax-M1").with_base_url("https://api.minimax.io/v1"),
     );
     let (_, _, result) = test_provider("MiniMax", "MiniMax-M1", p).await;
     assert!(result.is_ok(), "MiniMax failed: {:?}", result.err());
@@ -715,7 +715,7 @@ async fn test_gemini_31_pro() {
 async fn test_minimax_m25() {
     let key = std::env::var("MINIMAX_API_KEY").expect("MINIMAX_API_KEY not set");
     let p: Arc<dyn LlmProvider> = Arc::new(
-        OpenAIProvider::new(key, "MiniMax-M2.5").with_base_url("https://api.minimaxi.chat/v1"),
+        OpenAIProvider::new(key, "MiniMax-M2.5").with_base_url("https://api.minimax.io/v1"),
     );
     let (_, _, result) = test_provider("MiniMax", "MiniMax-M2.5", p).await;
     assert!(result.is_ok(), "MiniMax-M2.5 failed: {:?}", result.err());
@@ -796,7 +796,7 @@ async fn test_all_providers_tool_call_conversation() {
             "MiniMax-M1",
             Arc::new(
                 OpenAIProvider::new(key.clone(), "MiniMax-M1")
-                    .with_base_url("https://api.minimaxi.chat/v1"),
+                    .with_base_url("https://api.minimax.io/v1"),
             ),
         ));
         providers.push((
@@ -804,7 +804,7 @@ async fn test_all_providers_tool_call_conversation() {
             "MiniMax-M2.5",
             Arc::new(
                 OpenAIProvider::new(key, "MiniMax-M2.5")
-                    .with_base_url("https://api.minimaxi.chat/v1"),
+                    .with_base_url("https://api.minimax.io/v1"),
             ),
         ));
     }

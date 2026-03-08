@@ -132,8 +132,8 @@ pub struct Agent {
     system_prompt: RwLock<String>,
     /// Agent configuration.
     config: AgentConfig,
-    /// Progress reporter.
-    reporter: Arc<dyn ProgressReporter>,
+    /// Progress reporter (RwLock for interior-mutable swap without &mut self).
+    reporter: RwLock<Arc<dyn ProgressReporter>>,
     /// Lifecycle hooks executor.
     hooks: Option<Arc<HookExecutor>>,
     /// Session-level context for hook payloads.
@@ -160,7 +160,32 @@ impl Agent {
             embedder: None,
             system_prompt: RwLock::new(system_prompt),
             config: AgentConfig::default(),
-            reporter: Arc::new(SilentReporter),
+            reporter: RwLock::new(Arc::new(SilentReporter)),
+            hooks: None,
+            hook_context: std::sync::Mutex::new(None),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Create a new agent sharing pre-existing Arc-wrapped resources.
+    /// Useful for per-request agents that share tools/memory with a base agent.
+    pub fn new_shared(
+        id: AgentId,
+        llm: Arc<dyn LlmProvider>,
+        tools: Arc<ToolRegistry>,
+        memory: Arc<EpisodeStore>,
+    ) -> Self {
+        let system_prompt = include_str!("prompts/worker.txt").to_string();
+
+        Self {
+            id,
+            llm,
+            tools,
+            memory,
+            embedder: None,
+            system_prompt: RwLock::new(system_prompt),
+            config: AgentConfig::default(),
+            reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -181,14 +206,24 @@ impl Agent {
     }
 
     /// Set the progress reporter.
-    pub fn with_reporter(mut self, reporter: Arc<dyn ProgressReporter>) -> Self {
-        self.reporter = reporter;
+    pub fn with_reporter(self, reporter: Arc<dyn ProgressReporter>) -> Self {
+        *self.reporter.write().unwrap_or_else(|e| e.into_inner()) = reporter;
         self
     }
 
     /// Replace the progress reporter at runtime (e.g. per-message stream reporter).
-    pub fn set_reporter(&mut self, reporter: Arc<dyn ProgressReporter>) {
-        self.reporter = reporter;
+    /// Takes `&self` (not `&mut self`) — uses interior mutability via RwLock so
+    /// the agent can be behind an Arc for concurrent speculative overflow.
+    pub fn set_reporter(&self, reporter: Arc<dyn ProgressReporter>) {
+        *self.reporter.write().unwrap_or_else(|e| e.into_inner()) = reporter;
+    }
+
+    /// Get a clone of the current reporter (cheap Arc clone through read lock).
+    fn reporter(&self) -> Arc<dyn ProgressReporter> {
+        self.reporter
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Set the shutdown signal.
@@ -266,6 +301,34 @@ impl Agent {
     /// The LLM provider name in use.
     pub fn provider_name(&self) -> &str {
         self.llm.provider_name()
+    }
+
+    /// Get a reference to the LLM provider (for sharing with per-request agents).
+    pub fn llm_provider(&self) -> Arc<dyn LlmProvider> {
+        self.llm.clone()
+    }
+
+    /// Get a reference to the tool registry.
+    pub fn tool_registry(&self) -> &Arc<ToolRegistry> {
+        &self.tools
+    }
+
+    /// Get a reference to the episode store.
+    pub fn memory_store(&self) -> Arc<EpisodeStore> {
+        self.memory.clone()
+    }
+
+    /// Get a clone of the agent config.
+    pub fn agent_config(&self) -> AgentConfig {
+        self.config.clone()
+    }
+
+    /// Get a snapshot of the current system prompt.
+    pub fn system_prompt_snapshot(&self) -> String {
+        self.system_prompt
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Process a single message in conversation mode (chat/gateway).
@@ -358,6 +421,8 @@ impl Agent {
             iteration += 1;
             let tools_spec = self.tools.specs();
             self.trim_to_context_window(&mut messages);
+            normalize_system_messages(&mut messages);
+            repair_tool_pairs(&mut messages);
 
             tracing::info!(
                 iteration,
@@ -482,7 +547,7 @@ impl Agent {
 
         async {
             info!("starting task");
-            self.reporter.report(ProgressEvent::TaskStarted {
+            self.reporter().report(ProgressEvent::TaskStarted {
                 task_id: task.id.to_string(),
             });
 
@@ -506,7 +571,8 @@ impl Agent {
 
                 iteration += 1;
                 let iter_start = Instant::now();
-                self.reporter.report(ProgressEvent::Thinking { iteration });
+                self.reporter()
+                    .report(ProgressEvent::Thinking { iteration });
 
                 let tools_spec = self.tools.specs();
                 self.trim_to_context_window(&mut messages);
@@ -576,7 +642,7 @@ impl Agent {
                         }
 
                         self.emit_cost_update(&total_usage, &response.usage);
-                        self.reporter.report(ProgressEvent::TaskCompleted {
+                        self.reporter().report(ProgressEvent::TaskCompleted {
                             success: true,
                             iterations: iteration,
                             duration: task_start.elapsed(),
@@ -604,7 +670,7 @@ impl Agent {
                     }
                     StopReason::MaxTokens => {
                         self.emit_cost_update(&total_usage, &response.usage);
-                        self.reporter.report(ProgressEvent::TaskCompleted {
+                        self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
                             duration: task_start.elapsed(),
@@ -614,16 +680,15 @@ impl Agent {
                     StopReason::ContentFiltered => {
                         warn!("content filtered by provider safety/moderation in task");
                         self.emit_cost_update(&total_usage, &response.usage);
-                        self.reporter.report(ProgressEvent::TaskCompleted {
+                        self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
                             duration: task_start.elapsed(),
                         });
-                        let mut result =
-                            self.build_result(&response, total_usage, files_modified);
+                        let mut result = self.build_result(&response, total_usage, files_modified);
                         if result.output.is_empty() {
-                            result.output = "[Content was blocked by the model's safety filter.]"
-                                .to_string();
+                            result.output =
+                                "[Content was blocked by the model's safety filter.]".to_string();
                         }
                         return Ok(result);
                     }
@@ -791,7 +856,7 @@ impl Agent {
             .map(|tool_call| {
                 // Clone Arc-wrapped fields so the spawned task is 'static
                 let tools = self.tools.clone();
-                let reporter = self.reporter.clone();
+                let reporter = self.reporter();
                 let hooks = self.hooks.clone();
                 let hook_ctx = self.hook_ctx();
                 let tc_name = tool_call.name.clone();
@@ -1110,6 +1175,11 @@ impl Agent {
             keep_from = max_keep_from;
         }
 
+        // Don't split inside a tool-call group
+        while keep_from > 1 && messages[keep_from].role == MessageRole::Tool {
+            keep_from -= 1;
+        }
+
         if keep_from > 1 {
             let dropped = keep_from - 1;
             messages.drain(1..keep_from);
@@ -1139,7 +1209,7 @@ impl Agent {
         iteration: u32,
     ) -> Result<(ChatResponse, bool)> {
         // Clear any pending status line (e.g., "Thinking...")
-        self.reporter.report(ProgressEvent::Response {
+        self.reporter().report(ProgressEvent::Response {
             content: String::new(),
             iteration,
         });
@@ -1171,7 +1241,7 @@ impl Agent {
                     reasoning.push_str(&delta);
                 }
                 StreamEvent::TextDelta(delta) => {
-                    self.reporter.report(ProgressEvent::StreamChunk {
+                    self.reporter().report(ProgressEvent::StreamChunk {
                         text: delta.clone(),
                         iteration,
                     });
@@ -1214,7 +1284,7 @@ impl Agent {
 
         let streamed = !text.is_empty();
         if streamed {
-            self.reporter
+            self.reporter()
                 .report(ProgressEvent::StreamDone { iteration });
         }
 
@@ -1301,7 +1371,7 @@ impl Agent {
             pricing.map(|p| p.cost(response_usage.input_tokens, response_usage.output_tokens));
         let session_cost =
             pricing.map(|p| p.cost(total_usage.input_tokens, total_usage.output_tokens));
-        self.reporter.report(ProgressEvent::CostUpdate {
+        self.reporter().report(ProgressEvent::CostUpdate {
             session_input_tokens: total_usage.input_tokens,
             session_output_tokens: total_usage.output_tokens,
             response_cost,
@@ -1376,21 +1446,25 @@ impl Agent {
     /// Detect if text content is stuck in a repetitive loop.
     /// Returns true if the same phrase (>= 20 chars) repeats 5+ times.
     fn is_repetitive_output(text: &str) -> bool {
-        if text.len() < 200 {
+        // Use char count for multi-byte safety (Chinese, emoji, etc.)
+        let char_count = text.chars().count();
+        if char_count < 200 {
             return false;
         }
         // Check last 500 chars for repeating patterns of 20-100 char lengths
-        let check_region = if text.len() > 500 {
-            &text[text.len() - 500..]
+        let check_region: String = if char_count > 500 {
+            text.chars().skip(char_count - 500).collect()
         } else {
-            text
+            text.to_string()
         };
+        let region_chars: Vec<char> = check_region.chars().collect();
+        let region_len = region_chars.len();
         for pattern_len in [20, 40, 60, 100] {
-            if check_region.len() < pattern_len * 3 {
+            if region_len < pattern_len * 3 {
                 continue;
             }
-            let pattern = &check_region[check_region.len() - pattern_len..];
-            let count = check_region.matches(pattern).count();
+            let pattern: String = region_chars[region_len - pattern_len..].iter().collect();
+            let count = check_region.matches(&pattern).count();
             if count >= 4 {
                 return true;
             }
@@ -1541,12 +1615,17 @@ impl Agent {
     ) -> Result<()> {
         // Fix tool_call IDs — some models (e.g. qwen via dashscope) generate
         // duplicate or empty IDs which downstream providers reject with 400.
+        // Also sanitize characters: some providers (e.g. Moonshot/kimi) generate IDs
+        // with colons like "admin_view_sessions:11" which OpenAI rejects.
         // We fix IDs on the response clone so both the assistant message and tool result
         // messages use the same corrected IDs.
         let mut response = response.clone();
         {
             let mut seen_ids = std::collections::HashSet::new();
             for (i, tc) in response.tool_calls.iter_mut().enumerate() {
+                // Sanitize characters: keep only alphanumeric, underscore, hyphen
+                tc.id = sanitize_tool_call_id(&tc.id);
+
                 if tc.id.is_empty() || !seen_ids.insert(tc.id.clone()) {
                     let new_id = format!("call_{}_{}", i, &tc.name);
                     tracing::warn!(
@@ -1596,7 +1675,7 @@ impl Agent {
         match stop {
             BudgetStop::Shutdown => {
                 info!(iteration, "shutdown signal received");
-                self.reporter.report(ProgressEvent::TaskInterrupted {
+                self.reporter().report(ProgressEvent::TaskInterrupted {
                     iterations: iteration,
                 });
             }
@@ -1606,20 +1685,20 @@ impl Agent {
                     max = self.config.max_iterations,
                     "hit max iterations limit"
                 );
-                self.reporter.report(ProgressEvent::MaxIterationsReached {
+                self.reporter().report(ProgressEvent::MaxIterationsReached {
                     limit: self.config.max_iterations,
                 });
             }
             BudgetStop::MaxTokens { used, limit } => {
                 warn!(used, max = limit, "hit token budget limit");
-                self.reporter.report(ProgressEvent::TokenBudgetExceeded {
+                self.reporter().report(ProgressEvent::TokenBudgetExceeded {
                     used: *used,
                     limit: *limit,
                 });
             }
             BudgetStop::WallClockTimeout { limit } => {
                 warn!(limit_s = limit.as_secs(), "hit wall-clock timeout");
-                self.reporter
+                self.reporter()
                     .report(ProgressEvent::WallClockTimeoutReached {
                         elapsed: *limit,
                         limit: *limit,
@@ -1627,6 +1706,131 @@ impl Agent {
             }
         }
     }
+}
+
+/// Sanitize a tool_call_id to contain only characters accepted by all providers.
+/// Some models (e.g. Moonshot/kimi) generate IDs like "admin_view_sessions:11"
+/// which OpenAI rejects (only allows letters, numbers, underscores, dashes).
+/// Merge all system messages into the first one so providers that require a
+/// single leading system message (e.g. Qwen) don't reject the request.
+///
+/// After context compaction or session history reload, system messages can end
+/// up scattered throughout the message list.  This collects their content into
+/// the first system message and removes the rest.
+fn normalize_system_messages(messages: &mut Vec<Message>) {
+    if messages.len() <= 1 {
+        return;
+    }
+    // Find all system messages after the first one
+    let mut extra_indices = Vec::new();
+    for (i, m) in messages.iter().enumerate().skip(1) {
+        if m.role == MessageRole::System {
+            extra_indices.push(i);
+        }
+    }
+    if extra_indices.is_empty() {
+        return;
+    }
+    // Collect their content
+    let extra_content: Vec<String> = extra_indices
+        .iter()
+        .filter_map(|&i| {
+            let c = &messages[i].content;
+            if c.is_empty() { None } else { Some(c.clone()) }
+        })
+        .collect();
+    // Merge into first system message
+    if !extra_content.is_empty() {
+        let first = &mut messages[0];
+        for text in extra_content {
+            first.content.push_str("\n\n");
+            first.content.push_str(&text);
+        }
+    }
+    // Remove extra system messages in reverse order
+    for &i in extra_indices.iter().rev() {
+        messages.remove(i);
+    }
+}
+
+/// Repair orphaned tool_call / tool_result pairs in the message list.
+///
+/// LLM providers reject messages where an assistant has tool_calls but the
+/// corresponding tool result messages are missing (or vice versa).  This can
+/// happen when compaction or session history truncation splits a tool group.
+///
+/// Strategy: find matched pairs (call ID exists in both assistant tool_calls
+/// AND tool result messages). Strip anything unmatched.
+fn repair_tool_pairs(messages: &mut Vec<Message>) {
+    use std::collections::HashSet;
+
+    // Collect all tool_call IDs from assistant messages
+    let call_ids: HashSet<String> = messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Assistant)
+        .flat_map(|m| {
+            m.tool_calls
+                .as_ref()
+                .into_iter()
+                .flat_map(|calls| calls.iter().map(|tc| tc.id.clone()))
+        })
+        .collect();
+
+    // Collect all tool_call_ids from Tool result messages
+    let result_ids: HashSet<String> = messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+
+    // Matched = present in both sets
+    let matched: HashSet<&String> = call_ids.intersection(&result_ids).collect();
+
+    // Strip tool_calls from assistant messages where ANY call ID is unmatched
+    for m in messages.iter_mut() {
+        if m.role == MessageRole::Assistant {
+            if let Some(ref calls) = m.tool_calls {
+                if calls.iter().any(|tc| !matched.contains(&tc.id)) {
+                    let names: Vec<_> = calls.iter().map(|tc| tc.name.as_str()).collect();
+                    if m.content.is_empty() {
+                        m.content = format!("[Called tools: {}]", names.join(", "));
+                    }
+                    m.tool_calls = None;
+                }
+            }
+        }
+    }
+
+    // Remove Tool result messages whose call ID is unmatched or whose
+    // parent assistant had its tool_calls stripped.
+    let remaining_call_ids: HashSet<String> = messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Assistant)
+        .flat_map(|m| {
+            m.tool_calls
+                .as_ref()
+                .into_iter()
+                .flat_map(|calls| calls.iter().map(|tc| tc.id.clone()))
+        })
+        .collect();
+
+    messages.retain(|m| {
+        if m.role == MessageRole::Tool {
+            if let Some(ref id) = m.tool_call_id {
+                return remaining_call_ids.contains(id);
+            }
+        }
+        true
+    });
+}
+
+fn sanitize_tool_call_id(id: &str) -> String {
+    id.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => c,
+            _ => '_',
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1800,6 +2004,173 @@ mod tests {
     #[test]
     fn should_not_flag_short_text() {
         assert!(!Agent::is_repetitive_output("hello hello hello"));
+    }
+
+    // ---------- normalize_system_messages ----------
+
+    fn sys(content: &str) -> Message {
+        Message {
+            role: MessageRole::System,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn user(content: &str) -> Message {
+        Message {
+            role: MessageRole::User,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn should_merge_multiple_system_messages_into_first() {
+        let mut msgs = vec![
+            sys("system prompt"),
+            sys("compaction summary"),
+            user("hello"),
+        ];
+        normalize_system_messages(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, MessageRole::System);
+        assert!(msgs[0].content.contains("system prompt"));
+        assert!(msgs[0].content.contains("compaction summary"));
+        assert_eq!(msgs[1].role, MessageRole::User);
+    }
+
+    #[test]
+    fn should_merge_scattered_system_messages() {
+        let mut msgs = vec![
+            sys("prompt"),
+            user("msg1"),
+            sys("mid-summary"),
+            user("msg2"),
+        ];
+        normalize_system_messages(&mut msgs);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, MessageRole::System);
+        assert!(msgs[0].content.contains("prompt"));
+        assert!(msgs[0].content.contains("mid-summary"));
+        assert_eq!(msgs[1].role, MessageRole::User);
+        assert_eq!(msgs[2].role, MessageRole::User);
+    }
+
+    #[test]
+    fn should_noop_when_single_system_message() {
+        let mut msgs = vec![sys("prompt"), user("hello")];
+        normalize_system_messages(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "prompt");
+    }
+
+    // ---------- repair_tool_pairs ----------
+
+    fn assistant_with_tools(tool_ids: &[&str]) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(
+                tool_ids
+                    .iter()
+                    .map(|id| crew_core::ToolCall {
+                        id: id.to_string(),
+                        name: "test_tool".to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn tool_result_msg(id: &str) -> Message {
+        Message {
+            role: MessageRole::Tool,
+            content: "result".to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn should_strip_orphaned_tool_calls() {
+        let mut msgs = vec![
+            sys("prompt"),
+            assistant_with_tools(&["tc1", "tc2"]),
+            tool_result_msg("tc1"),
+            // tc2 result is missing — orphaned
+            user("next question"),
+        ];
+        repair_tool_pairs(&mut msgs);
+        // assistant's tool_calls should be stripped (tc2 has no result)
+        assert!(msgs[1].tool_calls.is_none());
+        assert!(msgs[1].content.contains("test_tool"));
+        // tc1 result should also be removed (its assistant lost tool_calls)
+        assert_eq!(msgs.len(), 3); // sys, assistant(text), user
+    }
+
+    #[test]
+    fn should_keep_complete_tool_pairs() {
+        let mut msgs = vec![
+            sys("prompt"),
+            assistant_with_tools(&["tc1"]),
+            tool_result_msg("tc1"),
+            user("thanks"),
+        ];
+        repair_tool_pairs(&mut msgs);
+        assert_eq!(msgs.len(), 4);
+        assert!(msgs[1].tool_calls.is_some());
+    }
+
+    #[test]
+    fn should_remove_orphaned_tool_results() {
+        let mut msgs = vec![
+            sys("prompt"),
+            tool_result_msg("tc_orphan"), // no matching assistant
+            user("hello"),
+        ];
+        repair_tool_pairs(&mut msgs);
+        assert_eq!(msgs.len(), 2); // sys, user
+    }
+
+    // ---------- sanitize_tool_call_id ----------
+
+    #[test]
+    fn should_sanitize_colons_in_tool_call_id() {
+        assert_eq!(
+            sanitize_tool_call_id("admin_view_sessions:11"),
+            "admin_view_sessions_11"
+        );
+    }
+
+    #[test]
+    fn should_preserve_valid_tool_call_id() {
+        assert_eq!(sanitize_tool_call_id("call_0_shell"), "call_0_shell");
+        assert_eq!(sanitize_tool_call_id("toolu_01A-bC"), "toolu_01A-bC");
+    }
+
+    #[test]
+    fn should_sanitize_special_chars_in_tool_call_id() {
+        assert_eq!(
+            sanitize_tool_call_id("id.with.dots:and:colons"),
+            "id_with_dots_and_colons"
+        );
     }
 
     // ---------- Agent::is_retryable_stream_error ----------

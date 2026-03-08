@@ -28,7 +28,6 @@ use eyre::{Result, WrapErr};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 
-
 use super::Executable;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
 use crate::config::{Config, detect_provider};
@@ -258,11 +257,10 @@ impl GatewayCommand {
                 info!("adaptive routing enabled ({} providers)", providers.len());
                 let mode = ar_config
                     .map(|c| c.mode.into())
-                    .unwrap_or(crew_llm::AdaptiveMode::Off);
-                let qos = ar_config.is_some_and(|c| c.qos_ranking);
+                    .unwrap_or(crew_llm::AdaptiveMode::Hedge);
+                let qos = ar_config.map(|c| c.qos_ranking).unwrap_or(true);
                 let router = Arc::new(
-                    AdaptiveRouter::new(providers, adaptive_config)
-                        .with_adaptive_config(mode, qos),
+                    AdaptiveRouter::new(providers, adaptive_config).with_adaptive_config(mode, qos),
                 );
                 adaptive_router_ref = Some(router.clone());
                 router
@@ -368,7 +366,10 @@ impl GatewayCommand {
         let ominix_url = std::env::var("OMINIX_API_URL").ok().or_else(|| {
             let home = std::env::var_os("HOME")?;
             let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
-            std::fs::read_to_string(discovery).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+            std::fs::read_to_string(discovery)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
         });
         let asr_binary = if voice_binary_path.exists() && ominix_url.is_some() {
             let url = ominix_url.unwrap();
@@ -376,7 +377,9 @@ impl GatewayCommand {
             println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
             // Export so the voice binary can find the server
             #[allow(unsafe_code)]
-            unsafe { std::env::set_var("OMINIX_API_URL", &url); }
+            unsafe {
+                std::env::set_var("OMINIX_API_URL", &url);
+            }
             Some(voice_binary_path)
         } else {
             None
@@ -1222,9 +1225,7 @@ impl GatewayCommand {
                         if let Some(ref lang) = asr_language {
                             input["language"] = serde_json::Value::String(lang.clone());
                         }
-                        match transcribe_via_skill(asr_bin, &input.to_string())
-                            .await
-                        {
+                        match transcribe_via_skill(asr_bin, &input.to_string()).await {
                             Ok(text) => {
                                 // Store transcript in metadata for status indicator display
                                 if let Some(obj) = inbound.metadata.as_object_mut() {
@@ -1362,7 +1363,13 @@ impl GatewayCommand {
                     // Clear current session (existing behavior)
                     match session_mgr.lock().await.clear(&session_key).await {
                         Ok(()) => {
-                            let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "Session cleared.")).await;
+                            let _ = agent_handle
+                                .send_outbound(make_reply(
+                                    &reply_channel,
+                                    &reply_chat_id,
+                                    "Session cleared.",
+                                ))
+                                .await;
                         }
                         Err(e) => {
                             warn!("session clear failed: {e}");
@@ -1371,14 +1378,26 @@ impl GatewayCommand {
                 } else {
                     // Create/switch to named session
                     if let Err(reason) = validate_topic_name(name) {
-                        let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Invalid session name: {reason}"))).await;
+                        let _ = agent_handle
+                            .send_outbound(make_reply(
+                                &reply_channel,
+                                &reply_chat_id,
+                                format!("Invalid session name: {reason}"),
+                            ))
+                            .await;
                     } else {
                         active_sessions
                             .lock()
                             .await
                             .switch_to(&base_key_str, name)
                             .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
-                        let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Switched to session: {name}"))).await;
+                        let _ = agent_handle
+                            .send_outbound(make_reply(
+                                &reply_channel,
+                                &reply_chat_id,
+                                format!("Switched to session: {name}"),
+                            ))
+                            .await;
                     }
                 }
                 continue;
@@ -1394,13 +1413,25 @@ impl GatewayCommand {
                         .await
                         .switch_to(&base_key_str, "")
                         .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
-                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "Switched to default session.")).await;
+                    let _ = agent_handle
+                        .send_outbound(make_reply(
+                            &reply_channel,
+                            &reply_chat_id,
+                            "Switched to default session.",
+                        ))
+                        .await;
 
                     // Flush any buffered messages from this session
                     let target_key = SessionKey::new(&inbound.channel, &inbound.chat_id);
                     actor_registry.flush_pending(&target_key.to_string()).await;
                 } else if let Err(reason) = validate_topic_name(name) {
-                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Invalid session name: {reason}"))).await;
+                    let _ = agent_handle
+                        .send_outbound(make_reply(
+                            &reply_channel,
+                            &reply_chat_id,
+                            format!("Invalid session name: {reason}"),
+                        ))
+                        .await;
                 } else {
                     active_sessions
                         .lock()
@@ -1427,7 +1458,13 @@ impl GatewayCommand {
                         }
                     };
 
-                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Switched to session: {name}{preview}"))).await;
+                    let _ = agent_handle
+                        .send_outbound(make_reply(
+                            &reply_channel,
+                            &reply_chat_id,
+                            format!("Switched to session: {name}{preview}"),
+                        ))
+                        .await;
 
                     // Flush any buffered messages from this session
                     actor_registry.flush_pending(&new_key.to_string()).await;
@@ -1448,7 +1485,13 @@ impl GatewayCommand {
                     .to_string();
 
                 if entries.is_empty() {
-                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "No sessions found. Use /new <name> to create one.")).await;
+                    let _ = agent_handle
+                        .send_outbound(make_reply(
+                            &reply_channel,
+                            &reply_chat_id,
+                            "No sessions found. Use /new <name> to create one.",
+                        ))
+                        .await;
                 } else {
                     let keyboard = session_ui::build_session_keyboard(&entries, &active_topic);
                     let text = session_ui::build_session_text(&entries, &active_topic);
@@ -1469,7 +1512,13 @@ impl GatewayCommand {
                         } else {
                             topic.clone()
                         };
-                        let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Switched back to session: {label}"))).await;
+                        let _ = agent_handle
+                            .send_outbound(make_reply(
+                                &reply_channel,
+                                &reply_chat_id,
+                                format!("Switched back to session: {label}"),
+                            ))
+                            .await;
 
                         // Flush any buffered messages from the target session
                         let target_key =
@@ -1477,7 +1526,13 @@ impl GatewayCommand {
                         actor_registry.flush_pending(&target_key.to_string()).await;
                     }
                     Ok(None) => {
-                        let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "No previous session to switch to.")).await;
+                        let _ = agent_handle
+                            .send_outbound(make_reply(
+                                &reply_channel,
+                                &reply_chat_id,
+                                "No previous session to switch to.",
+                            ))
+                            .await;
                     }
                     Err(e) => {
                         warn!("go_back failed: {e}");
@@ -1490,7 +1545,13 @@ impl GatewayCommand {
             if cmd.starts_with("/delete ") {
                 let name = cmd.strip_prefix("/delete").unwrap_or("").trim();
                 if name.is_empty() {
-                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "Usage: /delete <session-name>")).await;
+                    let _ = agent_handle
+                        .send_outbound(make_reply(
+                            &reply_channel,
+                            &reply_chat_id,
+                            "Usage: /delete <session-name>",
+                        ))
+                        .await;
                 } else {
                     let del_key = SessionKey::with_topic(&inbound.channel, &inbound.chat_id, name);
                     match session_mgr.lock().await.clear(&del_key).await {
@@ -1500,7 +1561,13 @@ impl GatewayCommand {
                                 .await
                                 .remove_topic(&base_key_str, name)
                                 .unwrap_or_else(|e| warn!("remove_topic failed: {e}"));
-                            let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Deleted session: {name}"))).await;
+                            let _ = agent_handle
+                                .send_outbound(make_reply(
+                                    &reply_channel,
+                                    &reply_chat_id,
+                                    format!("Deleted session: {name}"),
+                                ))
+                                .await;
                         }
                         Err(e) => {
                             warn!("delete session failed: {e}");
@@ -1520,7 +1587,9 @@ impl GatewayCommand {
                     .unwrap_or("")
                     .trim();
                 let response = tool_config.handle_config_command(args).await;
-                let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, response)).await;
+                let _ = agent_handle
+                    .send_outbound(make_reply(&reply_channel, &reply_chat_id, response))
+                    .await;
                 continue;
             }
 
@@ -1534,9 +1603,15 @@ impl GatewayCommand {
                     .strip_prefix("/account")
                     .unwrap_or("")
                     .trim();
-                let response =
-                    account_handler::handle_account_command(args, profile_id.as_deref(), &profile_store).await;
-                let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, response)).await;
+                let response = account_handler::handle_account_command(
+                    args,
+                    profile_id.as_deref(),
+                    &profile_store,
+                )
+                .await;
+                let _ = agent_handle
+                    .send_outbound(make_reply(&reply_channel, &reply_chat_id, response))
+                    .await;
                 continue;
             }
 
@@ -1549,10 +1624,16 @@ impl GatewayCommand {
                     .strip_prefix("/skills")
                     .unwrap_or("")
                     .trim();
-                let response =
-                    skills_handler::handle_skills_command(args, profile_id.as_deref(), &data_dir, &profile_store)
-                        .await;
-                let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, response)).await;
+                let response = skills_handler::handle_skills_command(
+                    args,
+                    profile_id.as_deref(),
+                    &data_dir,
+                    &profile_store,
+                )
+                .await;
+                let _ = agent_handle
+                    .send_outbound(make_reply(&reply_channel, &reply_chat_id, response))
+                    .await;
                 continue;
             }
 
@@ -1664,10 +1745,12 @@ async fn transcribe_via_skill(
         drop(stdin);
     }
 
-    let output =
-        tokio::time::timeout(std::time::Duration::from_secs(120), child.wait_with_output())
-            .await
-            .map_err(|_| eyre::eyre!("voice transcription timed out"))??;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| eyre::eyre!("voice transcription timed out"))??;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result: serde_json::Value =
