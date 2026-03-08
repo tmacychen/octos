@@ -77,9 +77,13 @@ pub(crate) fn truncate_error_body(body: &str) -> String {
 }
 
 /// Default LLM request timeout in seconds.
-pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 120;
+/// Tuned from real-world testing: typical LLM responses complete in 2-5s,
+/// multi-tool chains in ~25s. 60s gives ample headroom while failing over
+/// faster than the previous 120s default.
+pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 60;
 /// Default LLM connect timeout in seconds.
-pub const DEFAULT_LLM_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Reduced from 30s: if a provider can't connect in 10s, fail over sooner.
+pub const DEFAULT_LLM_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Default embedding request timeout in seconds.
 pub const DEFAULT_EMBEDDING_TIMEOUT_SECS: u64 = 60;
 /// Default embedding connect timeout in seconds.

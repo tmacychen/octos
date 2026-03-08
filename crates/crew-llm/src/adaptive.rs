@@ -5,7 +5,7 @@
 //! Supports probe/canary requests to keep metrics fresh for non-primary providers.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -48,7 +48,7 @@ impl Default for AdaptiveConfig {
         Self {
             ema_alpha: 0.3,
             failure_threshold: 3,
-            latency_threshold_ms: 30_000,
+            latency_threshold_ms: 10_000,
             error_rate_threshold: 0.3,
             probe_probability: 0.1,
             probe_interval_secs: 60,
@@ -265,6 +265,50 @@ struct AdaptiveSlot {
     priority: usize,
 }
 
+/// Adaptive routing mode — mutually exclusive strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdaptiveMode {
+    /// Static priority order. Failover only when a provider is circuit-broken
+    /// (N consecutive failures). No scoring, no racing.
+    Off = 0,
+    /// Hedged racing: fire each request to 2 providers simultaneously,
+    /// take the winner, cancel the loser. Both results accumulate QoS.
+    Hedge = 1,
+    /// Score-based lane changing: dynamically pick the best single provider
+    /// based on latency/error/priority scoring. Cheaper than hedge.
+    Lane = 2,
+}
+
+impl AdaptiveMode {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Hedge,
+            2 => Self::Lane,
+            _ => Self::Off,
+        }
+    }
+}
+
+impl std::fmt::Display for AdaptiveMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::Hedge => write!(f, "hedge"),
+            Self::Lane => write!(f, "lane"),
+        }
+    }
+}
+
+/// Runtime status of adaptive features (for dashboard / chat commands).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveStatus {
+    pub mode: AdaptiveMode,
+    pub qos_ranking: bool,
+    pub failure_threshold: u32,
+    pub provider_count: usize,
+}
+
 /// Adaptive provider router with metrics-driven selection.
 ///
 /// Drop-in replacement for `ProviderChain`. Tracks latency and error rates
@@ -275,6 +319,12 @@ pub struct AdaptiveRouter {
     config: AdaptiveConfig,
     /// RNG state for probe selection (simple xorshift).
     rng_state: AtomicU64,
+    /// Adaptive mode: Off / Hedge / Lane (mutually exclusive).
+    mode: AtomicU8,
+    /// Runtime toggle: QoS quality ranking (orthogonal to mode).
+    qos_ranking: AtomicBool,
+    /// Last provider index selected (for detecting switches).
+    last_selected: AtomicU32,
 }
 
 impl AdaptiveRouter {
@@ -304,6 +354,53 @@ impl AdaptiveRouter {
                     .unwrap_or_default()
                     .as_nanos() as u64,
             ),
+            mode: AtomicU8::new(AdaptiveMode::Off as u8),
+            qos_ranking: AtomicBool::new(false),
+            last_selected: AtomicU32::new(0),
+        }
+    }
+
+    /// Set initial adaptive mode and QoS toggle from config.
+    /// Uses atomic stores (interior mutability) so `mut` is not required.
+    pub fn with_adaptive_config(self, mode: AdaptiveMode, qos_ranking: bool) -> Self {
+        self.mode.store(mode as u8, Ordering::Relaxed);
+        self.qos_ranking.store(qos_ranking, Ordering::Relaxed);
+        self
+    }
+
+    /// Get the current adaptive mode.
+    pub fn mode(&self) -> AdaptiveMode {
+        AdaptiveMode::from_u8(self.mode.load(Ordering::Relaxed))
+    }
+
+    /// Switch adaptive mode at runtime (lock-free, mutually exclusive).
+    pub fn set_mode(&self, mode: AdaptiveMode) {
+        self.mode.store(mode as u8, Ordering::Relaxed);
+        info!(%mode, "adaptive mode changed");
+    }
+
+    /// Toggle QoS quality ranking at runtime (orthogonal to mode).
+    pub fn set_qos_ranking(&self, enabled: bool) {
+        self.qos_ranking.store(enabled, Ordering::Relaxed);
+        info!(enabled, "QoS quality ranking toggled");
+    }
+
+    /// Get the name of the currently selected provider (most recent selection).
+    pub fn current_provider_name(&self) -> &str {
+        let idx = self.last_selected.load(Ordering::Relaxed) as usize;
+        self.slots
+            .get(idx)
+            .map(|s| s.provider.provider_name())
+            .unwrap_or("unknown")
+    }
+
+    /// Get the current adaptive feature status (for dashboard / chat commands).
+    pub fn adaptive_status(&self) -> AdaptiveStatus {
+        AdaptiveStatus {
+            mode: self.mode(),
+            qos_ranking: self.qos_ranking.load(Ordering::Relaxed),
+            failure_threshold: self.config.failure_threshold,
+            provider_count: self.slots.len(),
         }
     }
 
@@ -382,7 +479,32 @@ impl AdaptiveRouter {
     }
 
     /// Select provider index and whether this is a probe request.
+    ///
+    /// - Off / Hedge: priority order, skip circuit-broken only.
+    ///   (Hedge mode uses this to pick the primary for racing.)
+    /// - Lane: score-based selection across all providers.
     fn select_provider(&self) -> (usize, bool) {
+        let mode = self.mode();
+
+        // Off and Hedge both use priority order for the primary selection.
+        // (Hedge picks the alternate separately in hedged_chat.)
+        if mode != AdaptiveMode::Lane {
+            for (i, slot) in self.slots.iter().enumerate() {
+                if !slot.metrics.is_circuit_open(self.config.failure_threshold) {
+                    let prev = self.last_selected.swap(i as u32, Ordering::Relaxed);
+                    if prev != i as u32 {
+                        info!(
+                            from = self.slots.get(prev as usize).map(|s| s.provider.provider_name()).unwrap_or("?"),
+                            to = slot.provider.provider_name(),
+                            "provider failover (circuit breaker, lane changing disabled)"
+                        );
+                    }
+                    return (i, false);
+                }
+            }
+            // All circuit-broken — fall through to least-failed logic below
+        }
+
         // Score all non-circuit-broken providers
         let mut scored: Vec<(usize, f64)> = self
             .slots
@@ -405,6 +527,7 @@ impl AdaptiveRouter {
                 provider = self.slots[best].provider.provider_name(),
                 "all providers circuit-broken, using least-failed"
             );
+            self.last_selected.store(best as u32, Ordering::Relaxed);
             return (best, false);
         }
 
@@ -429,6 +552,18 @@ impl AdaptiveRouter {
             }
         }
 
+        // Detect lane change
+        let prev = self.last_selected.swap(best_idx as u32, Ordering::Relaxed);
+        if prev != best_idx as u32 && prev < self.slots.len() as u32 {
+            info!(
+                from = self.slots[prev as usize].provider.provider_name(),
+                to = self.slots[best_idx].provider.provider_name(),
+                from_score = format!("{:.3}", self.score(&self.slots[prev as usize])),
+                to_score = format!("{:.3}", self.score(&self.slots[best_idx])),
+                "adaptive lane change"
+            );
+        }
+
         (best_idx, false)
     }
 
@@ -443,6 +578,84 @@ impl AdaptiveRouter {
         self.rng_state.store(x, Ordering::Relaxed);
         let prob = (x % 1000) as f64 / 1000.0;
         prob < self.config.probe_probability
+    }
+
+    /// Race request against two providers. Returns `Some(result)` if a race
+    /// was executed, `None` if no second provider is available.
+    ///
+    /// Both providers record metrics regardless of win/lose — this is how
+    /// QoS scores accumulate under hedging. The loser's future is dropped
+    /// (cancelled) once the winner completes.
+    async fn hedged_chat(
+        &self,
+        primary_idx: usize,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Option<Result<ChatResponse>> {
+        // Pick the best alternate provider (not the primary, not circuit-broken)
+        let alternate_idx = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                *i != primary_idx && !s.metrics.is_circuit_open(self.config.failure_threshold)
+            })
+            .map(|(i, s)| (i, self.score(s)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)?;
+
+        info!(
+            primary = self.slots[primary_idx].provider.provider_name(),
+            alternate = self.slots[alternate_idx].provider.provider_name(),
+            "hedged race: firing to 2 providers"
+        );
+
+        // Race! Both futures start simultaneously. When one completes, the
+        // other is dropped (cancelled). Both record_success/record_failure
+        // in try_chat before returning, so the winner's metrics are captured.
+        // The loser's metrics are NOT recorded (future dropped mid-flight) —
+        // this is correct: we only score completed requests.
+        tokio::select! {
+            result = self.try_chat(primary_idx, messages, tools, config) => {
+                match &result {
+                    Ok(_) => info!(
+                        winner = self.slots[primary_idx].provider.provider_name(),
+                        loser = self.slots[alternate_idx].provider.provider_name(),
+                        "hedged race: primary won"
+                    ),
+                    Err(e) => warn!(
+                        provider = self.slots[primary_idx].provider.provider_name(),
+                        error = %e,
+                        "hedged race: primary failed, waiting for alternate"
+                    ),
+                }
+                if result.is_ok() {
+                    return Some(result);
+                }
+                // Primary failed — try alternate sequentially (it was cancelled by select)
+                Some(self.try_chat(alternate_idx, messages, tools, config).await)
+            }
+            result = self.try_chat(alternate_idx, messages, tools, config) => {
+                match &result {
+                    Ok(_) => info!(
+                        winner = self.slots[alternate_idx].provider.provider_name(),
+                        loser = self.slots[primary_idx].provider.provider_name(),
+                        "hedged race: alternate won"
+                    ),
+                    Err(e) => warn!(
+                        provider = self.slots[alternate_idx].provider.provider_name(),
+                        error = %e,
+                        "hedged race: alternate failed, waiting for primary"
+                    ),
+                }
+                if result.is_ok() {
+                    return Some(result);
+                }
+                // Alternate failed — try primary sequentially
+                Some(self.try_chat(primary_idx, messages, tools, config).await)
+            }
+        }
     }
 
     /// Try a request on a specific provider, returning result and latency.
@@ -537,19 +750,28 @@ impl LlmProvider for AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        let mode = self.mode();
         let (start_idx, is_probe) = self.select_provider();
 
         debug!(
             selected = self.slots[start_idx].provider.provider_name(),
             model = self.slots[start_idx].provider.model_id(),
             is_probe = is_probe,
+            %mode,
             score = format!("{:.3}", self.score(&self.slots[start_idx])),
             "adaptive router selected provider"
         );
 
-        // Try the selected provider
+        // ── Hedged racing: fire to 2 providers, take the winner ────────
+        if mode == AdaptiveMode::Hedge && self.slots.len() > 1 {
+            if let Some(result) = self.hedged_chat(start_idx, messages, tools, config).await {
+                return result;
+            }
+        }
+
+        // ── Single-provider path (Off / Lane / fallthrough) ────────────
         match self.try_chat(start_idx, messages, tools, config).await {
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => Ok(resp),
             Err(e) => {
                 if self.slots.len() == 1 {
                     return Err(e);
@@ -562,7 +784,6 @@ impl LlmProvider for AdaptiveRouter {
                 );
 
                 // Failover: try remaining providers in score order.
-                // Any error → try next provider. Don't stop on specific error types.
                 let mut scored: Vec<(usize, f64)> = self
                     .slots
                     .iter()
@@ -905,6 +1126,187 @@ mod tests {
         // Buffer is 64 slots, so we have values 37..100
         // p95 of 37..100 = ceil(64*0.95) = 61st value = 97
         assert!(p95 >= 90_000 && p95 <= 100_000, "p95 was {}", p95 / 1000);
+    }
+
+    #[tokio::test]
+    async fn test_lane_changing_off_uses_priority_order() {
+        let config = AdaptiveConfig {
+            failure_threshold: 2,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 50, // slower
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "fast-fallback",
+                    model: "m2",
+                    latency_ms: 1, // faster
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+
+        // Lane changing OFF (default) — should always pick primary despite higher latency
+        router.set_mode(AdaptiveMode::Off);
+
+        // Warm up metrics so the score-based path would prefer fast-fallback
+        for _ in 0..5 {
+            let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+            assert_eq!(resp.content.as_deref(), Some("from-primary"));
+        }
+
+        // Even after metrics show primary is slower, lane_changing=OFF sticks to priority
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-primary"));
+    }
+
+    #[tokio::test]
+    async fn test_lane_changing_off_skips_circuit_broken() {
+        let config = AdaptiveConfig {
+            failure_threshold: 1, // trip after 1 failure
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "Primary",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+        router.set_mode(AdaptiveMode::Off);
+
+        // Primary fails → circuit breaks → falls over to fallback
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-fallback"));
+
+        // Now primary is circuit-broken; lane_changing=OFF should skip it
+        assert!(router.slots[0].metrics.is_circuit_open(1));
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-fallback"));
+    }
+
+    #[tokio::test]
+    async fn test_hedged_racing_picks_faster_provider() {
+        let config = AdaptiveConfig {
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "slow-primary",
+                    model: "m1",
+                    latency_ms: 200, // slow
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "fast-fallback",
+                    model: "m2",
+                    latency_ms: 10, // fast
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+
+        // Enable hedged racing
+        router.set_mode(AdaptiveMode::Hedge);
+
+        let start = Instant::now();
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Should get the fast provider's response (race winner)
+        assert_eq!(resp.content.as_deref(), Some("from-fast-fallback"));
+        // Should complete in ~10ms, not ~200ms
+        assert!(elapsed.as_millis() < 150, "took {}ms, expected <150ms", elapsed.as_millis());
+    }
+
+    #[tokio::test]
+    async fn test_hedged_racing_survives_one_failure() {
+        let config = AdaptiveConfig {
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "failing-primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "Primary",
+                }),
+                Arc::new(MockProvider {
+                    name: "good-fallback",
+                    model: "m2",
+                    latency_ms: 10,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+
+        router.set_mode(AdaptiveMode::Hedge);
+
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-good-fallback"));
+    }
+
+    #[tokio::test]
+    async fn test_hedged_off_uses_single_provider() {
+        let config = AdaptiveConfig {
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "slow-primary",
+                    model: "m1",
+                    latency_ms: 50,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "fast-fallback",
+                    model: "m2",
+                    latency_ms: 1,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+
+        // Hedging OFF (default) — should use primary (priority order)
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-slow-primary"));
     }
 
     #[test]

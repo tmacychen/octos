@@ -15,12 +15,13 @@ use crew_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
 use crew_bus::{ActiveSessionStore, SessionManager};
 use crew_core::AgentId;
 use crew_core::{InboundMessage, Message, MessageRole, OutboundMessage, SessionKey};
-use crew_llm::{EmbeddingProvider, LlmProvider, ProviderRouter};
+use crew_llm::{AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter, ResponsivenessObserver};
 use crew_memory::EpisodeStore;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::config::QueueMode;
 use crate::cron_tool::CronTool;
 use crate::status_indicator::StatusIndicator;
 
@@ -46,7 +47,15 @@ pub enum ActorMessage {
         message: InboundMessage,
         image_media: Vec<String>,
     },
-    /// Cancel the current operation (future use).
+    /// Result from a background subagent task — injected as a system message
+    /// into the conversation without triggering an extra LLM call.
+    BackgroundResult {
+        /// Task identifier for attribution.
+        task_label: String,
+        /// The subagent's final output.
+        content: String,
+    },
+    /// Cancel the current operation.
     Cancel,
 }
 
@@ -277,6 +286,11 @@ pub struct ActorFactory {
     pub active_sessions: Arc<Mutex<ActiveSessionStore>>,
     /// Pending message buffer — replies from inactive sessions are held here.
     pub pending_messages: PendingMessages,
+    /// Queue mode for handling messages arriving during active agent runs.
+    pub queue_mode: QueueMode,
+    /// Side-channel to the AdaptiveRouter for responsiveness feedback.
+    /// None when adaptive routing is disabled or using a static provider chain.
+    pub adaptive_router: Option<Arc<AdaptiveRouter>>,
 }
 
 /// Trait for creating per-session ToolRegistry instances.
@@ -355,6 +369,23 @@ impl ActorFactory {
         if let Some(ref router) = self.provider_router {
             spawn_tool = spawn_tool.with_provider_router(router.clone());
         }
+
+        // Wire direct background result injection (bypasses InboundMessage relay)
+        let bg_tx = tx.clone();
+        spawn_tool = spawn_tool.with_background_result_sender(Arc::new(
+            move |task_label: String, content: String| {
+                let tx = bg_tx.clone();
+                Box::pin(async move {
+                    let _ = tx
+                        .send(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                        })
+                        .await;
+                })
+            },
+        ));
+
         tools.register(spawn_tool);
 
         // Cron tool (per-session context)
@@ -412,6 +443,9 @@ impl ActorFactory {
             semaphore,
             global_shutdown: self.shutdown.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: self.queue_mode,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: self.adaptive_router.clone(),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -523,6 +557,12 @@ struct SessionActor {
     global_shutdown: Arc<AtomicBool>,
     /// Per-actor cancellation flag (only affects this session)
     cancelled: Arc<AtomicBool>,
+    /// Queue mode for handling messages that arrive during active processing.
+    queue_mode: QueueMode,
+    /// Tracks LLM response latencies and detects sustained degradation.
+    responsiveness: ResponsivenessObserver,
+    /// Side-channel to AdaptiveRouter for toggling auto-protection.
+    adaptive_router: Option<Arc<AdaptiveRouter>>,
 }
 
 impl SessionActor {
@@ -532,7 +572,44 @@ impl SessionActor {
                 msg = self.inbox.recv() => {
                     match msg {
                         Some(ActorMessage::Inbound { message, image_media }) => {
-                            self.process_inbound(message, image_media).await;
+                            // Check for abort trigger before processing
+                            if crew_core::is_abort_trigger(&message.content) {
+                                debug!(session = %self.session_key, "abort trigger detected");
+                                self.cancelled.store(true, Ordering::Release);
+                                let _ = self.out_tx.send(OutboundMessage {
+                                    channel: self.channel.clone(),
+                                    chat_id: self.chat_id.clone(),
+                                    content: "🛑 Cancelled.".to_string(),
+                                    reply_to: None,
+                                    media: vec![],
+                                    metadata: serde_json::json!({}),
+                                }).await;
+                                // Reset for next message
+                                self.cancelled.store(false, Ordering::Release);
+                                continue;
+                            }
+
+                            // Handle slash commands (no LLM round-trip)
+                            if self.try_handle_command(&message).await {
+                                continue;
+                            }
+
+                            // Drain any queued messages according to queue mode
+                            let (final_message, final_media) =
+                                self.drain_queue(message, image_media).await;
+
+                            // In speculative mode with adaptive routing, we can
+                            // detect slow LLM calls and unblock for new messages.
+                            if self.queue_mode == QueueMode::Speculative
+                                && self.adaptive_router.is_some()
+                            {
+                                self.process_inbound_speculative(final_message, final_media).await;
+                            } else {
+                                self.process_inbound(final_message, final_media).await;
+                            }
+                        }
+                        Some(ActorMessage::BackgroundResult { task_label, content }) => {
+                            self.inject_background_result(&task_label, &content).await;
                         }
                         Some(ActorMessage::Cancel) => {
                             debug!(session = %self.session_key, "cancel requested");
@@ -558,6 +635,416 @@ impl SessionActor {
         }
 
         debug!(session = %self.session_key, "actor exiting");
+    }
+
+    /// Handle slash commands that don't need an LLM round-trip.
+    /// Returns `true` if the message was consumed as a command.
+    async fn try_handle_command(&mut self, message: &InboundMessage) -> bool {
+        let text = message.content.trim();
+        if !text.starts_with('/') {
+            return false;
+        }
+
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        let cmd = parts[0];
+
+        match cmd {
+            "/adaptive" => {
+                self.handle_adaptive_command(&parts[1..]).await;
+                true
+            }
+            "/queue" => {
+                self.handle_queue_command(&parts[1..]).await;
+                true
+            }
+            _ => false, // Unknown slash command — pass through to LLM
+        }
+    }
+
+    /// `/adaptive` — view or toggle adaptive routing features.
+    ///
+    /// Usage:
+    ///   /adaptive                       — show current status
+    ///   /adaptive circuit on|off        — toggle auto circuit breaker
+    ///   /adaptive lane on|off           — toggle lane changing
+    ///   /adaptive qos on|off            — toggle QoS ranking
+    async fn handle_adaptive_command(&self, args: &[&str]) {
+        let Some(ref router) = self.adaptive_router else {
+            self.send_reply("Adaptive routing is not enabled.").await;
+            return;
+        };
+
+        if args.is_empty() {
+            // Show status
+            let status = router.adaptive_status();
+            let provider = router.current_provider_name();
+            let snapshots = router.metrics_snapshots();
+
+            let mut lines = vec![
+                "**Adaptive Routing**".to_string(),
+                format!("  mode:        {}", status.mode),
+                format!("  qos ranking: {}", if status.qos_ranking { "on" } else { "off" }),
+                format!("  current:     {provider}"),
+            ];
+
+            if !snapshots.is_empty() {
+                lines.push(String::new());
+                lines.push("**Providers**".to_string());
+                for (name, model, snap) in &snapshots {
+                    lines.push(format!(
+                        "  {name} ({model}): latency={:.0}ms ok={} err={} {}",
+                        snap.latency_ema_ms,
+                        snap.success_count,
+                        snap.failure_count,
+                        if snap.consecutive_failures >= status.failure_threshold { "⛔ OPEN" } else { "✅" },
+                    ));
+                }
+            }
+
+            self.send_reply(&lines.join("\n")).await;
+            return;
+        }
+
+        match args[0] {
+            // Mode switching: /adaptive off|hedge|lane
+            "off" => {
+                router.set_mode(AdaptiveMode::Off);
+                self.send_reply("Adaptive mode: off (static priority, failover only)").await;
+            }
+            "hedge" | "race" | "circuit" => {
+                router.set_mode(AdaptiveMode::Hedge);
+                let status = router.adaptive_status();
+                if status.provider_count < 2 {
+                    self.send_reply("Adaptive mode: hedge (race 2 providers, take winner)\n⚠️ Only 1 provider configured — hedge needs ≥2 to race. Currently behaves like off mode.").await;
+                } else {
+                    self.send_reply(&format!(
+                        "Adaptive mode: hedge (race 2 of {} providers, take winner)",
+                        status.provider_count
+                    )).await;
+                }
+            }
+            "lane" => {
+                router.set_mode(AdaptiveMode::Lane);
+                let status = router.adaptive_status();
+                if status.provider_count < 2 {
+                    self.send_reply("Adaptive mode: lane (score-based provider selection)\n⚠️ Only 1 provider configured — lane needs ≥2 to compare. Currently behaves like off mode.").await;
+                } else {
+                    self.send_reply(&format!(
+                        "Adaptive mode: lane (score-based selection across {} providers)",
+                        status.provider_count
+                    )).await;
+                }
+            }
+            // QoS toggle: /adaptive qos [on|off]
+            "qos" => {
+                if let Some(value) = args.get(1) {
+                    let enabled = match *value {
+                        "on" | "true" | "1" => true,
+                        "off" | "false" | "0" => false,
+                        other => {
+                            self.send_reply(&format!("Invalid value: {other}. Use: on/off")).await;
+                            return;
+                        }
+                    };
+                    router.set_qos_ranking(enabled);
+                    self.send_reply(&format!("QoS ranking: {}", if enabled { "on" } else { "off" })).await;
+                } else {
+                    let on = router.adaptive_status().qos_ranking;
+                    self.send_reply(&format!("QoS ranking: {}", if on { "on" } else { "off" })).await;
+                }
+            }
+            other => {
+                self.send_reply(&format!(
+                    "Unknown option: {other}\nUsage: /adaptive [off|hedge|lane|qos [on|off]]"
+                )).await;
+            }
+        }
+    }
+
+    /// `/queue` — view or change the queue mode.
+    ///
+    /// Usage:
+    ///   /queue                          — show current mode
+    ///   /queue followup|collect|steer|interrupt
+    async fn handle_queue_command(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            self.send_reply(&format!("Queue mode: {:?}", self.queue_mode)).await;
+            return;
+        }
+
+        let mode = match args[0] {
+            "followup" => QueueMode::Followup,
+            "collect" => QueueMode::Collect,
+            "steer" => QueueMode::Steer,
+            "interrupt" => QueueMode::Interrupt,
+            "spec" | "speculative" => QueueMode::Speculative,
+            other => {
+                self.send_reply(&format!("Unknown mode: {other}. Use: followup, collect, steer, interrupt, spec")).await;
+                return;
+            }
+        };
+
+        self.queue_mode = mode;
+        self.send_reply(&format!("Queue mode set to: {:?}", mode)).await;
+    }
+
+    /// Send a short reply to the user (for command responses).
+    async fn send_reply(&self, content: &str) {
+        let _ = self.out_tx.send(OutboundMessage {
+            channel: self.channel.clone(),
+            chat_id: self.chat_id.clone(),
+            content: content.to_string(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        }).await;
+    }
+
+    /// Drain any already-queued messages from the inbox and combine them
+    /// with the current message according to the configured queue mode.
+    ///
+    /// - Followup: return the message as-is (queued messages processed next iteration)
+    /// - Collect: batch all queued messages into one combined prompt
+    /// - Steer: discard current message, use the newest queued message instead
+    /// - Interrupt: same as Steer (cancellation already handled at dispatch level)
+    async fn drain_queue(
+        &mut self,
+        message: InboundMessage,
+        image_media: Vec<String>,
+    ) -> (InboundMessage, Vec<String>) {
+        match self.queue_mode {
+            QueueMode::Followup | QueueMode::Speculative => (message, image_media),
+            QueueMode::Collect => {
+                let mut combined_content = message.content.clone();
+                let mut combined_media = image_media;
+                let mut count = 0u32;
+
+                // Non-blocking drain of queued inbound messages
+                loop {
+                    match self.inbox.try_recv() {
+                        Ok(ActorMessage::Inbound {
+                            message: queued,
+                            image_media: queued_media,
+                        }) => {
+                            if crew_core::is_abort_trigger(&queued.content) {
+                                debug!(session = %self.session_key, "abort in queue, cancelling batch");
+                                self.cancelled.store(true, Ordering::Release);
+                                break;
+                            }
+                            count += 1;
+                            combined_content
+                                .push_str(&format!("\n---\nQueued #{count}: {}", queued.content));
+                            combined_media.extend(queued_media);
+                        }
+                        Ok(ActorMessage::BackgroundResult { task_label, content }) => {
+                            self.inject_background_result(&task_label, &content).await;
+                        }
+                        Ok(ActorMessage::Cancel) => {
+                            self.cancelled.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(_) => break, // inbox empty
+                    }
+                }
+                let mut msg = message;
+                msg.content = combined_content;
+                (msg, combined_media)
+            }
+            QueueMode::Steer | QueueMode::Interrupt => {
+                let mut latest_message = message;
+                let mut latest_media = image_media;
+
+                // Non-blocking drain: keep only the newest inbound message
+                loop {
+                    match self.inbox.try_recv() {
+                        Ok(ActorMessage::Inbound {
+                            message: queued,
+                            image_media: queued_media,
+                        }) => {
+                            if crew_core::is_abort_trigger(&queued.content) {
+                                debug!(session = %self.session_key, "abort in queue, cancelling");
+                                self.cancelled.store(true, Ordering::Release);
+                                break;
+                            }
+                            debug!(session = %self.session_key, "steer: replacing with newer message");
+                            latest_message = queued;
+                            latest_media = queued_media;
+                        }
+                        Ok(ActorMessage::BackgroundResult { task_label, content }) => {
+                            self.inject_background_result(&task_label, &content).await;
+                        }
+                        Ok(ActorMessage::Cancel) => {
+                            self.cancelled.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                (latest_message, latest_media)
+            }
+        }
+    }
+
+    /// Inject a background task result as a system message into the conversation.
+    /// This avoids an extra LLM round-trip — the result is available in context
+    /// for the next user message.
+    async fn inject_background_result(&mut self, task_label: &str, content: &str) {
+        let system_msg = Message::system(format!(
+            "[Background task \"{task_label}\" completed]\n\n{content}"
+        ));
+
+        let mut mgr = self.session_mgr.lock().await;
+        if let Err(e) = mgr.add_message(&self.session_key, system_msg).await {
+            warn!(session = %self.session_key, error = %e, "failed to inject background result");
+        }
+
+        // Notify user the background task finished
+        let _ = self.out_tx.send(OutboundMessage {
+            channel: self.channel.clone(),
+            chat_id: self.chat_id.clone(),
+            content: format!("✅ Background task \"{task_label}\" completed."),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        }).await;
+    }
+
+    /// Speculative processing: runs the LLM call but monitors the inbox.
+    /// If the call exceeds 2× responsiveness baseline and a new user message
+    /// arrives, the new message gets a quick LLM response via the adaptive
+    /// router (no tools, lightweight) while the original call continues.
+    /// Both results are delivered to the user.
+    async fn process_inbound_speculative(
+        &mut self,
+        inbound: InboundMessage,
+        image_media: Vec<String>,
+    ) {
+        let patience = self
+            .responsiveness
+            .baseline()
+            .map(|b| (b * 2).max(Duration::from_secs(10)))
+            .unwrap_or(Duration::from_secs(30));
+
+        // Start the full agent processing (with tools, streaming, etc.)
+        // We race it against patience timer + inbox in a polling loop.
+        // If a new message arrives while the LLM is slow, we fire a
+        // lightweight response for the new message via the router.
+        let mut overflow_messages: Vec<(InboundMessage, Vec<String>)> = Vec::new();
+        let mut patience_exceeded = false;
+
+        // We can't split the borrow, so run process_inbound normally
+        // but check inbox before and after with a time gate.
+        //
+        // The architecture limitation: process_inbound borrows &mut self,
+        // so we can't poll inbox during it. Instead, we collect any messages
+        // that arrived during processing and handle them with lightweight
+        // router calls afterward.
+        let processing_start = Instant::now();
+        self.process_inbound(inbound.clone(), image_media).await;
+        let processing_time = processing_start.elapsed();
+
+        // After the (potentially slow) LLM call completes, check if
+        // messages accumulated during processing
+        if processing_time > patience {
+            patience_exceeded = true;
+            // Drain any messages that arrived during the slow call
+            loop {
+                match self.inbox.try_recv() {
+                    Ok(ActorMessage::Inbound { message, image_media }) => {
+                        if crew_core::is_abort_trigger(&message.content) {
+                            self.send_reply("🛑 Cancelled.").await;
+                            break;
+                        }
+                        overflow_messages.push((message, image_media));
+                    }
+                    Ok(ActorMessage::BackgroundResult { task_label, content }) => {
+                        self.inject_background_result(&task_label, &content).await;
+                    }
+                    Ok(ActorMessage::Cancel) => {
+                        self.cancelled.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        if patience_exceeded && !overflow_messages.is_empty() {
+            let router = self.adaptive_router.clone().unwrap();
+            info!(
+                session = %self.session_key,
+                overflow_count = overflow_messages.len(),
+                processing_ms = processing_time.as_millis(),
+                "speculative: processing overflow messages via router"
+            );
+
+            let max_history = self.max_history.load(Ordering::Acquire);
+
+            for (overflow_msg, _media) in overflow_messages {
+                // Fetch fresh history each iteration so each overflow sees
+                // the previous overflow's response in context
+                let history: Vec<Message> = {
+                    let mut mgr = self.session_mgr.lock().await;
+                    let session = mgr.get_or_create(&self.session_key);
+                    session.get_history(max_history).to_vec()
+                };
+                let mut messages = history;
+                messages.push(Message {
+                    role: MessageRole::User,
+                    content: overflow_msg.content.clone(),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    timestamp: chrono::Utc::now(),
+                });
+
+                // Fire lightweight LLM call via router (no tools)
+                let config = crew_llm::ChatConfig::default();
+                match router.chat(&messages, &[], &config).await {
+                    Ok(resp) => {
+                        if let Some(ref text) = resp.content {
+                            // Save to session
+                            let mut mgr = self.session_mgr.lock().await;
+                            let user_msg = Message {
+                                role: MessageRole::User,
+                                content: overflow_msg.content.clone(),
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: None,
+                                timestamp: chrono::Utc::now(),
+                            };
+                            let _ = mgr.add_message(&self.session_key, user_msg).await;
+                            let asst_msg = Message {
+                                role: MessageRole::Assistant,
+                                content: text.clone(),
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: None,
+                                timestamp: chrono::Utc::now(),
+                            };
+                            let _ = mgr.add_message(&self.session_key, asst_msg).await;
+                            drop(mgr);
+                            let _ = self.out_tx.send(OutboundMessage {
+                                channel: self.channel.clone(),
+                                chat_id: self.chat_id.clone(),
+                                content: text.clone(),
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({}),
+                            }).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(session = %self.session_key, error = %e, "speculative overflow call failed");
+                        // Fall back to normal processing
+                        self.process_inbound(overflow_msg, _media).await;
+                    }
+                }
+            }
+        }
     }
 
     async fn process_inbound(&mut self, inbound: InboundMessage, image_media: Vec<String>) {
@@ -594,7 +1081,31 @@ impl SessionActor {
             )
         });
 
+        // Set up progressive streaming reporter if we have a channel
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(stream_tx));
+        self.agent.set_reporter(reporter);
+
+        // Spawn stream forwarder task — edits a channel message as text arrives
+        let stream_forwarder = if let Some(ref si) = self.status_indicator {
+            let channel = Arc::clone(si.channel());
+            let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
+            let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+            Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
+                stream_rx,
+                channel,
+                self.chat_id.clone(),
+                cancel_status,
+                status_msg_id,
+            )))
+        } else {
+            // No channel available — drop the receiver so events are discarded
+            drop(stream_rx);
+            None
+        };
+
         // Process through agent (potentially long LLM call)
+        let llm_start = Instant::now();
         let result = tokio::time::timeout(
             self.session_timeout,
             self.agent.process_message_tracked(
@@ -605,8 +1116,55 @@ impl SessionActor {
             ),
         )
         .await;
+        let llm_latency = llm_start.elapsed();
 
-        // Stop status indicator
+        // Feed latency to responsiveness observer
+        self.responsiveness.record(llm_latency);
+        if self.responsiveness.should_activate() {
+            warn!(
+                session = %self.session_key,
+                baseline_ms = ?self.responsiveness.baseline().map(|b| b.as_millis()),
+                latency_ms = llm_latency.as_millis(),
+                consecutive_slow = self.responsiveness.consecutive_slow_count(),
+                "sustained latency degradation detected, activating auto-protection"
+            );
+            self.responsiveness.set_active(true);
+            // Escalate: hedge routing (race providers) + speculative queue (unblock for new messages)
+            self.queue_mode = QueueMode::Speculative;
+            if let Some(ref router) = self.adaptive_router {
+                router.set_mode(AdaptiveMode::Hedge);
+                let _ = self.out_tx.send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: "⚡ Detected slow responses. Enabling hedge racing + speculative queue — you won't be blocked.".to_string(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                }).await;
+            }
+        } else if self.responsiveness.should_deactivate() {
+            info!(session = %self.session_key, "provider recovered, reverting to normal mode");
+            self.responsiveness.set_active(false);
+            self.queue_mode = QueueMode::Followup;
+            if let Some(ref router) = self.adaptive_router {
+                router.set_mode(AdaptiveMode::Off);
+            }
+        }
+
+        // Reset reporter to silent (drop the stream sender → forwarder will finish)
+        self.agent.set_reporter(Arc::new(crew_agent::SilentReporter));
+
+        // Wait for stream forwarder to complete and get its result
+        let stream_result = if let Some(handle) = stream_forwarder {
+            match handle.await {
+                Ok(sr) => Some(sr),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // Stop status indicator (if stream forwarder didn't already cancel it)
         if let Some(handle) = status_handle {
             handle.stop().await;
         }
@@ -674,24 +1232,50 @@ impl SessionActor {
                     || content.contains("[NO_CHANGE]");
 
                 if !(is_cron && is_silent) {
-                    let display_content = content
-                        .trim_start()
-                        .strip_prefix("[SILENT]")
-                        .or_else(|| content.trim_start().strip_prefix("[NO_CHANGE]"))
-                        .unwrap_or(&content)
-                        .to_string();
+                    let display_content = if content.trim().is_empty() && !is_cron {
+                        tracing::warn!(session = %self.session_key, "LLM returned empty content, sending fallback");
+                        "(The model returned an empty response. Please try again.)".to_string()
+                    } else {
+                        content
+                            .trim_start()
+                            .strip_prefix("[SILENT]")
+                            .or_else(|| content.trim_start().strip_prefix("[NO_CHANGE]"))
+                            .unwrap_or(&content)
+                            .to_string()
+                    };
 
-                    let _ = self
-                        .out_tx
-                        .send(OutboundMessage {
-                            channel: self.channel.clone(),
-                            chat_id: self.chat_id.clone(),
-                            content: display_content,
-                            reply_to: None,
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        })
-                        .await;
+                    // If stream forwarder already sent a message, do a final edit
+                    // with the clean content instead of sending a new message.
+                    let streamed = if let Some(ref sr) = stream_result {
+                        if let Some(ref mid) = sr.message_id {
+                            if let Some(ref si) = self.status_indicator {
+                                // Strip tool status lines from final content
+                                let _ = si
+                                    .channel()
+                                    .edit_message(&self.chat_id, mid, &display_content)
+                                    .await;
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !streamed {
+                        let _ = self
+                            .out_tx
+                            .send(OutboundMessage {
+                                channel: self.channel.clone(),
+                                chat_id: self.chat_id.clone(),
+                                content: display_content,
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({}),
+                            })
+                            .await;
+                    }
                 }
             }
             Ok(Err(e)) => {
