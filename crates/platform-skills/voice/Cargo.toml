@@ -1,12 +1,12 @@
 [package]
-name = "asr"
+name = "voice"
 version = "1.0.0"
 edition = "2021"
-description = "ASR/TTS skill binary using ominix-api (Qwen3 models on Apple Silicon)"
+description = "Voice skill binary (ASR/TTS/model management) using ominix-api on Apple Silicon"
 authors = ["hagency"]
 
 [[bin]]
-name = "asr"
+name = "voice"
 path = "src/main.rs"
 
 [dependencies]

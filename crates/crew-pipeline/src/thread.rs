@@ -176,8 +176,14 @@ mod tests {
     #[tokio::test]
     async fn should_track_thread_ids() {
         let registry = ThreadRegistry::new();
-        registry.append("t1", vec![Message::user("a")]).await.unwrap();
-        registry.append("t2", vec![Message::user("b")]).await.unwrap();
+        registry
+            .append("t1", vec![Message::user("a")])
+            .await
+            .unwrap();
+        registry
+            .append("t2", vec![Message::user("b")])
+            .await
+            .unwrap();
 
         let ids = registry.thread_ids().await;
         assert_eq!(ids.len(), 2);

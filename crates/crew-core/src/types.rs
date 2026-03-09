@@ -95,6 +95,19 @@ impl Message {
             timestamp: Utc::now(),
         }
     }
+
+    /// Create a system message (used for injecting background results, provider switches, etc.).
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::System,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: Utc::now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

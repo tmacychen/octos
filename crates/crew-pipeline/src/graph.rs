@@ -135,13 +135,13 @@ impl HandlerKind {
     /// Resolve handler from DOT `shape` attribute (Attractor spec mapping).
     pub fn from_shape(shape: &str) -> Option<Self> {
         match shape {
-            "Mdiamond" => Some(Self::Noop),             // start node
-            "Msquare" => Some(Self::Noop),              // exit node
-            "box" => Some(Self::Codergen),              // LLM task (default)
-            "hexagon" => Some(Self::Gate),              // human gate / conditional
-            "diamond" => Some(Self::Gate),              // conditional routing
-            "component" => Some(Self::Parallel),        // parallel fan-out
-            "parallelogram" => Some(Self::Shell),       // external tool/command
+            "Mdiamond" => Some(Self::Noop),       // start node
+            "Msquare" => Some(Self::Noop),        // exit node
+            "box" => Some(Self::Codergen),        // LLM task (default)
+            "hexagon" => Some(Self::Gate),        // human gate / conditional
+            "diamond" => Some(Self::Gate),        // conditional routing
+            "component" => Some(Self::Parallel),  // parallel fan-out
+            "parallelogram" => Some(Self::Shell), // external tool/command
             _ => None,
         }
     }
@@ -188,7 +188,10 @@ pub fn validate_pipeline_id(id: &str) -> eyre::Result<()> {
         eyre::bail!("pipeline identifier must not be empty");
     }
     if id.len() > 128 {
-        eyre::bail!("pipeline identifier too long (max 128 chars): {}", &id[..32]);
+        eyre::bail!(
+            "pipeline identifier too long (max 128 chars): {}",
+            &id[..32]
+        );
     }
     if id.contains('/') || id.contains('\\') || id.contains('\0') || id.contains("..") {
         eyre::bail!("pipeline identifier contains unsafe characters: {id}");

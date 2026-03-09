@@ -170,11 +170,8 @@ impl ExecEnvironment for DockerEnvironment {
             cmd.arg("--env").arg(format!("{k}={v}"));
         }
         cmd.arg(&self.container_id).arg("sh").arg("-c").arg(command);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            cmd.output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => Ok(ExecOutput {
@@ -194,7 +191,10 @@ impl ExecEnvironment for DockerEnvironment {
             .output()
             .await?;
         if !output.status.success() {
-            eyre::bail!("docker read_file failed: {}", String::from_utf8_lossy(&output.stderr));
+            eyre::bail!(
+                "docker read_file failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
@@ -219,7 +219,10 @@ impl ExecEnvironment for DockerEnvironment {
         }
         let status = child.wait().await?;
         if !status.success() {
-            eyre::bail!("docker write_file failed with exit code {:?}", status.code());
+            eyre::bail!(
+                "docker write_file failed with exit code {:?}",
+                status.code()
+            );
         }
         Ok(())
     }
@@ -336,10 +339,7 @@ mod tests {
     #[test]
     fn should_report_env_name() {
         assert_eq!(LocalEnvironment.name(), "local");
-        assert_eq!(
-            DockerEnvironment::new("abc123", "/app").name(),
-            "docker"
-        );
+        assert_eq!(DockerEnvironment::new("abc123", "/app").name(), "docker");
     }
 
     #[test]

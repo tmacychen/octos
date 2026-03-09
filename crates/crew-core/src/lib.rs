@@ -6,6 +6,7 @@
 //! - Message protocol between agents
 //! - Context and result types
 
+pub mod abort;
 mod error;
 pub mod gateway;
 mod message;
@@ -13,6 +14,7 @@ mod task;
 mod types;
 mod utils;
 
+pub use abort::is_abort_trigger;
 pub use error::{Error, ErrorKind, Result};
 pub use gateway::{InboundMessage, OutboundMessage};
 pub use message::AgentMessage;

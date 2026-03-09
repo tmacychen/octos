@@ -37,9 +37,10 @@ pub(crate) fn find_recent_boundary(messages: &[Message], budget: u32, system_tok
         split = i;
     }
 
-    // Don't split inside a tool-call pair: if split points to a Tool message,
-    // include the preceding Assistant message in the recent zone too.
-    if split > 1 && messages[split].role == MessageRole::Tool {
+    // Don't split inside a tool-call group: if split points to a Tool message,
+    // walk back past all consecutive Tool messages and the preceding Assistant
+    // message (which may have multiple parallel tool_calls).
+    while split > 1 && messages[split].role == MessageRole::Tool {
         split -= 1;
     }
 

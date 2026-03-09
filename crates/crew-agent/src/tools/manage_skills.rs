@@ -163,7 +163,11 @@ fn do_list(skills_dir: &std::path::Path) -> Result<ToolResult> {
     }
 
     Ok(ToolResult {
-        output: format!("Installed skills ({}):\n{}", entries.len(), lines.join("\n")),
+        output: format!(
+            "Installed skills ({}):\n{}",
+            entries.len(),
+            lines.join("\n")
+        ),
         success: true,
         ..Default::default()
     })
@@ -178,7 +182,7 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
                     .into(),
                 success: false,
                 ..Default::default()
-            })
+            });
         }
     };
     let branch = input.branch.as_deref().unwrap_or("main");
@@ -187,7 +191,9 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
     let segments: Vec<&str> = repo.trim_matches('/').split('/').collect();
     if segments.len() < 2 {
         return Ok(ToolResult {
-            output: format!("Invalid repo path: '{repo}'. Expected user/repo or user/repo/skill-name"),
+            output: format!(
+                "Invalid repo path: '{repo}'. Expected user/repo or user/repo/skill-name"
+            ),
             success: false,
             ..Default::default()
         });
@@ -231,7 +237,10 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
         let src = clone_dir.join(sub);
         if !src.is_dir() {
             return Ok(ToolResult {
-                output: format!("Subdirectory '{sub}' not found in {}/{}", segments[0], segments[1]),
+                output: format!(
+                    "Subdirectory '{sub}' not found in {}/{}",
+                    segments[0], segments[1]
+                ),
                 success: false,
                 ..Default::default()
             });
@@ -329,12 +338,16 @@ fn do_remove(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult> 
                 output: "name is required for remove".into(),
                 success: false,
                 ..Default::default()
-            })
+            });
         }
     };
 
     // Reject path traversal
-    if name.contains('/') || name.contains('\\') || name == ".." || name == "." || name.contains('\0')
+    if name.contains('/')
+        || name.contains('\\')
+        || name == ".."
+        || name == "."
+        || name.contains('\0')
     {
         return Ok(ToolResult {
             output: format!("Invalid skill name: {name}"),
@@ -433,7 +446,7 @@ fn do_search(input: &Input) -> Result<ToolResult> {
                 "\n  Install: manage_skills(action=\"install\", repo=\"{repo}\")"
             ));
         } else {
-            block.push_str(&format!("\n  Skills (install individually):"));
+            block.push_str("\n  Skills (install individually):");
             for skill in &skills {
                 block.push_str(&format!(
                     "\n    - {skill}: manage_skills(action=\"install\", repo=\"{repo}/{skill}\")"
@@ -444,7 +457,11 @@ fn do_search(input: &Input) -> Result<ToolResult> {
     }
 
     Ok(ToolResult {
-        output: format!("Available packages ({}):\n{}", filtered.len(), lines.join("\n\n")),
+        output: format!(
+            "Available packages ({}):\n{}",
+            filtered.len(),
+            lines.join("\n\n")
+        ),
         success: true,
         ..Default::default()
     })

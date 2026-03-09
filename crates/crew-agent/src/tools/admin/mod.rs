@@ -156,6 +156,11 @@ pub fn register_admin_api_tools(registry: &mut ToolRegistry, ctx: Arc<AdminApiCo
     registry.register(system::ProviderMetricsTool::new(ctx.clone()));
     registry.register(system::ManageWatchdogTool::new(ctx.clone()));
 
+    // Diagnostics
+    registry.register(system::ViewSessionsTool::new(ctx.clone()));
+    registry.register(system::CronStatusTool::new(ctx.clone()));
+    registry.register(system::CheckConfigTool::new(ctx.clone()));
+
     // Sub-accounts
     registry.register(sub_accounts::ListSubAccountsTool::new(ctx.clone()));
     registry.register(sub_accounts::CreateSubAccountTool::new(ctx.clone()));
@@ -235,6 +240,9 @@ mod tests {
             "admin_system_metrics",
             "admin_provider_metrics",
             "admin_manage_watchdog",
+            "admin_view_sessions",
+            "admin_cron_status",
+            "admin_check_config",
             "admin_list_sub_accounts",
             "admin_create_sub_account",
             "admin_manage_skills",

@@ -31,6 +31,9 @@ pub enum StopReason {
     MaxTokens,
     /// Hit a stop sequence.
     StopSequence,
+    /// Content was blocked by safety/moderation filters.
+    /// OpenAI: `content_filter`, Gemini: `SAFETY`/`RECITATION`/`OTHER`.
+    ContentFiltered,
 }
 
 /// Token usage statistics.

@@ -64,7 +64,9 @@ mod tests {
         };
         tx.send(SteeringMessage::FollowUp(msg)).await.unwrap();
         let received = rx.recv().await.unwrap();
-        assert!(matches!(received, SteeringMessage::FollowUp(m) if m.content == "stop and focus on tests"));
+        assert!(
+            matches!(received, SteeringMessage::FollowUp(m) if m.content == "stop and focus on tests")
+        );
     }
 
     #[tokio::test]

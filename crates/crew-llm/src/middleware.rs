@@ -30,11 +30,7 @@ pub trait LlmMiddleware: Send + Sync {
     }
 
     /// Called after a successful LLM response. Can inspect or transform.
-    async fn after(
-        &self,
-        _messages: &[Message],
-        response: ChatResponse,
-    ) -> Result<ChatResponse> {
+    async fn after(&self, _messages: &[Message], response: ChatResponse) -> Result<ChatResponse> {
         Ok(response)
     }
 
@@ -154,11 +150,7 @@ impl LlmMiddleware for LoggingMiddleware {
         Ok(None)
     }
 
-    async fn after(
-        &self,
-        _messages: &[Message],
-        response: ChatResponse,
-    ) -> Result<ChatResponse> {
+    async fn after(&self, _messages: &[Message], response: ChatResponse) -> Result<ChatResponse> {
         tracing::debug!(
             input_tokens = response.usage.input_tokens,
             output_tokens = response.usage.output_tokens,
@@ -199,7 +191,8 @@ impl CostTracker {
     }
 
     pub fn request_count(&self) -> u64 {
-        self.request_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.request_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -211,11 +204,7 @@ impl Default for CostTracker {
 
 #[async_trait]
 impl LlmMiddleware for CostTracker {
-    async fn after(
-        &self,
-        _messages: &[Message],
-        response: ChatResponse,
-    ) -> Result<ChatResponse> {
+    async fn after(&self, _messages: &[Message], response: ChatResponse) -> Result<ChatResponse> {
         use std::sync::atomic::Ordering::Relaxed;
         self.total_input
             .fetch_add(u64::from(response.usage.input_tokens), Relaxed);
@@ -266,10 +255,7 @@ mod tests {
     #[tokio::test]
     async fn should_pass_through_without_middleware() {
         let stack = MiddlewareStack::new(Arc::new(FakeProvider));
-        let resp = stack
-            .chat(&[], &[], &ChatConfig::default())
-            .await
-            .unwrap();
+        let resp = stack.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.as_deref(), Some("hello"));
     }
 
@@ -308,13 +294,9 @@ mod tests {
             }
         }
 
-        let stack =
-            MiddlewareStack::new(Arc::new(FakeProvider)).with(Arc::new(CacheHit));
+        let stack = MiddlewareStack::new(Arc::new(FakeProvider)).with(Arc::new(CacheHit));
 
-        let resp = stack
-            .chat(&[], &[], &ChatConfig::default())
-            .await
-            .unwrap();
+        let resp = stack.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.as_deref(), Some("cached"));
     }
 
@@ -336,13 +318,9 @@ mod tests {
             }
         }
 
-        let stack =
-            MiddlewareStack::new(Arc::new(FakeProvider)).with(Arc::new(Uppercaser));
+        let stack = MiddlewareStack::new(Arc::new(FakeProvider)).with(Arc::new(Uppercaser));
 
-        let resp = stack
-            .chat(&[], &[], &ChatConfig::default())
-            .await
-            .unwrap();
+        let resp = stack.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.as_deref(), Some("HELLO"));
     }
 

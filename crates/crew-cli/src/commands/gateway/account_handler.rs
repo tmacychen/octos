@@ -280,9 +280,12 @@ fn handle_account_update(
                         .insert(secret_env.clone(), val.to_string());
                 }
                 // Ensure Feishu channel exists
-                if !profile.config.channels.iter().any(|ch| {
-                    matches!(ch, crate::profiles::ChannelCredentials::Feishu { .. })
-                }) {
+                if !profile
+                    .config
+                    .channels
+                    .iter()
+                    .any(|ch| matches!(ch, crate::profiles::ChannelCredentials::Feishu { .. }))
+                {
                     profile
                         .config
                         .channels

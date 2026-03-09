@@ -29,7 +29,6 @@ pub enum FidelityMode {
     Summary { max_lines: usize },
 }
 
-
 impl FidelityMode {
     /// Parse a fidelity mode from a DOT attribute string.
     ///
@@ -40,14 +39,20 @@ impl FidelityMode {
             "full" => Some(Self::Full),
             "compact" => Some(Self::Compact),
             _ if s.starts_with("truncate:") => {
-                s["truncate:".len()..].parse::<usize>().ok().map(|n| {
-                    Self::Truncate { max_chars: n.min(MAX_TRUNCATE_CHARS) }
-                })
+                s["truncate:".len()..]
+                    .parse::<usize>()
+                    .ok()
+                    .map(|n| Self::Truncate {
+                        max_chars: n.min(MAX_TRUNCATE_CHARS),
+                    })
             }
             _ if s.starts_with("summary:") => {
-                s["summary:".len()..].parse::<usize>().ok().map(|n| {
-                    Self::Summary { max_lines: n.min(MAX_SUMMARY_LINES) }
-                })
+                s["summary:".len()..]
+                    .parse::<usize>()
+                    .ok()
+                    .map(|n| Self::Summary {
+                        max_lines: n.min(MAX_SUMMARY_LINES),
+                    })
             }
             _ => None,
         }

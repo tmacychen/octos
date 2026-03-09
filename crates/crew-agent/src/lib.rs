@@ -12,41 +12,40 @@ pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
 mod compaction;
-pub mod loop_detect;
+pub mod event_bus;
+pub mod exec_env;
 pub mod hooks;
+pub mod loop_detect;
 pub mod mcp;
 pub mod plugins;
 pub mod policy;
 pub mod progress;
 pub mod prompt_guard;
 pub mod prompt_layer;
+pub mod provider_tools;
 pub mod sandbox;
 mod sanitize;
 pub mod session;
 pub mod skills;
-pub mod event_bus;
-pub mod exec_env;
-pub mod provider_tools;
 pub mod steering;
-pub mod turn;
 pub mod tools;
+pub mod turn;
 
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
     DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, TokenTracker,
 };
+pub use event_bus::{EventBus, EventSubscriber};
+pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use hooks::{HookConfig, HookContext, HookEvent, HookExecutor};
 pub use mcp::{McpClient, McpServerConfig};
 pub use plugins::PluginLoader;
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use prompt_layer::PromptLayerBuilder;
+pub use provider_tools::{ProviderToolsets, ToolAdjustment};
 pub use sandbox::{Sandbox, SandboxConfig, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
-pub use event_bus::{EventBus, EventSubscriber};
-pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
-pub use provider_tools::{ProviderToolsets, ToolAdjustment};
-pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use tools::{
     BrowserTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool, GlobTool, GrepTool,
@@ -56,6 +55,7 @@ pub use tools::{
     WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
 };
+pub use turn::{Turn, TurnKind, turns_to_messages};
 
 #[cfg(test)]
 mod tests {

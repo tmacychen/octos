@@ -143,9 +143,7 @@ impl<'a> DotParser<'a> {
     /// as belonging to the subgraph.
     fn parse_subgraph(&mut self, graph: &mut PipelineGraph) -> Result<()> {
         self.skip_ws();
-        let subgraph_id = self
-            .parse_identifier()
-            .wrap_err("expected subgraph name")?;
+        let subgraph_id = self.parse_identifier().wrap_err("expected subgraph name")?;
         self.skip_ws();
         self.expect_char('{')
             .wrap_err("expected '{' after subgraph name")?;
@@ -219,7 +217,11 @@ impl<'a> DotParser<'a> {
 
     /// Parse an edge chain: `a -> b -> c [attrs]`.
     /// Returns all node IDs in the chain.
-    fn parse_edge_chain(&mut self, graph: &mut PipelineGraph, first: String) -> Result<Vec<String>> {
+    fn parse_edge_chain(
+        &mut self,
+        graph: &mut PipelineGraph,
+        first: String,
+    ) -> Result<Vec<String>> {
         let mut chain = vec![first];
 
         loop {
@@ -466,7 +468,10 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
     } else if let Some(n) = s.strip_suffix('m') {
         n.trim().parse::<u64>().ok().and_then(|v| v.checked_mul(60))
     } else if let Some(n) = s.strip_suffix('h') {
-        n.trim().parse::<u64>().ok().and_then(|v| v.checked_mul(3600))
+        n.trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|v| v.checked_mul(3600))
     } else {
         s.parse::<u64>().ok()
     }
@@ -502,12 +507,17 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         model: attrs.get("model").cloned(),
         context_window: attrs.get("context_window").and_then(|s| s.parse().ok()),
         tools,
-        goal_gate: attrs.get("goal_gate").and_then(|s| parse_bool(s)).unwrap_or(false),
+        goal_gate: attrs
+            .get("goal_gate")
+            .and_then(|s| parse_bool(s))
+            .unwrap_or(false),
         max_retries: attrs
             .get("max_retries")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
-        timeout_secs: attrs.get("timeout_secs").and_then(|s| parse_duration_secs(s)),
+        timeout_secs: attrs
+            .get("timeout_secs")
+            .and_then(|s| parse_duration_secs(s)),
         suggested_next: attrs.get("suggested_next").cloned(),
         converge: attrs.get("converge").cloned(),
         worker_prompt: attrs.get("worker_prompt").cloned(),

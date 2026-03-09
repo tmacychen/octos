@@ -204,18 +204,24 @@ pub struct EmailConfig {
     pub smtp_port: Option<u16>,
     #[serde(default)]
     pub username: Option<String>,
-    /// Environment variable holding the SMTP password.
+    /// Environment variable holding the SMTP password (legacy).
     #[serde(default)]
     pub password_env: Option<String>,
+    /// SMTP password (literal value, preferred over password_env).
+    #[serde(default)]
+    pub password: Option<String>,
     #[serde(default)]
     pub from_address: Option<String>,
 
     // -- Feishu/Lark fields --
     #[serde(default)]
     pub feishu_app_id: Option<String>,
-    /// Environment variable holding the Feishu app secret.
+    /// Environment variable holding the Feishu app secret (legacy).
     #[serde(default)]
     pub feishu_app_secret_env: Option<String>,
+    /// Feishu app secret (literal value, preferred over feishu_app_secret_env).
+    #[serde(default)]
+    pub feishu_app_secret: Option<String>,
     #[serde(default)]
     pub feishu_from_address: Option<String>,
     /// "cn" (default) or "global".
@@ -264,6 +270,29 @@ fn default_voice_preset() -> String {
     "vivian".to_string()
 }
 
+/// Adaptive routing mode (config-level, maps to `AdaptiveMode` at runtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AdaptiveRoutingMode {
+    /// Static priority order, failover only on circuit-broken.
+    #[default]
+    Off,
+    /// Hedged racing: fire to 2 providers, take winner, cancel loser.
+    Hedge,
+    /// Score-based lane changing: dynamically pick the best single provider.
+    Lane,
+}
+
+impl From<AdaptiveRoutingMode> for crew_llm::AdaptiveMode {
+    fn from(m: AdaptiveRoutingMode) -> Self {
+        match m {
+            AdaptiveRoutingMode::Off => Self::Off,
+            AdaptiveRoutingMode::Hedge => Self::Hedge,
+            AdaptiveRoutingMode::Lane => Self::Lane,
+        }
+    }
+}
+
 /// Adaptive routing configuration for dynamic LLM provider selection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdaptiveRoutingConfig {
@@ -271,7 +300,7 @@ pub struct AdaptiveRoutingConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Latency threshold (ms) above which a soft penalty is applied. Default: 30000.
+    /// Latency threshold (ms) above which a soft penalty is applied. Default: 10000.
     #[serde(default = "default_latency_threshold_ms")]
     pub latency_threshold_ms: u64,
 
@@ -290,6 +319,18 @@ pub struct AdaptiveRoutingConfig {
     /// Consecutive failures before circuit breaker opens. Default: 3.
     #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u32,
+
+    /// Adaptive mode: "off" (default), "hedge" (race 2 providers, take winner),
+    /// or "lane" (score-based single-provider selection). Mutually exclusive.
+    /// The ResponsivenessObserver can auto-escalate to "hedge" on degradation.
+    #[serde(default)]
+    pub mode: AdaptiveRoutingMode,
+
+    /// Enable quality-of-service ranking that factors in response quality
+    /// (not just latency/errors) when scoring providers. Orthogonal to mode.
+    /// Default: false.
+    #[serde(default)]
+    pub qos_ranking: bool,
 }
 
 impl Default for AdaptiveRoutingConfig {
@@ -301,6 +342,8 @@ impl Default for AdaptiveRoutingConfig {
             probe_probability: default_probe_probability(),
             probe_interval_secs: default_probe_interval_secs(),
             failure_threshold: default_failure_threshold(),
+            mode: AdaptiveRoutingMode::Off,
+            qos_ranking: false,
         }
     }
 }
@@ -319,7 +362,7 @@ impl From<&AdaptiveRoutingConfig> for crew_llm::AdaptiveConfig {
 }
 
 fn default_latency_threshold_ms() -> u64 {
-    30_000
+    10_000
 }
 fn default_error_rate_threshold() -> f64 {
     0.3
@@ -402,10 +445,7 @@ impl Config {
         if bundled.exists() {
             dirs.push(bundled);
         }
-        let platform = crew_dir.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR);
-        if platform.exists() {
-            dirs.push(platform);
-        }
+        // Note: platform-skills/ (voice, etc.) are admin-only — loaded explicitly in serve.rs
         if let Some(home) = dirs::home_dir() {
             let global_plugins = home.join(".crew").join("plugins");
             if global_plugins.exists() {
@@ -434,14 +474,22 @@ impl Config {
 }
 
 /// Message queue mode for handling messages arriving during active agent runs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum QueueMode {
-    /// Process queued messages one at a time (FIFO). Default behavior.
-    #[default]
+    /// Process queued messages one at a time (FIFO).
     Followup,
     /// Concatenate queued messages from the same session into one before processing.
     Collect,
+    /// Keep only the latest message, discard older queued messages.
+    Steer,
+    /// Cancel the current run and process the new message immediately.
+    Interrupt,
+    /// If the current LLM call exceeds the patience threshold and a new message
+    /// arrives, spawn a full agent task for the new message concurrently.
+    /// Both results are delivered to the user. Default behavior.
+    #[default]
+    Speculative,
 }
 
 /// Gateway mode configuration.

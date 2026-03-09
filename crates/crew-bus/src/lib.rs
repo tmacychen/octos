@@ -6,6 +6,7 @@ pub mod cli_channel;
 pub mod coalesce;
 pub mod cron_service;
 pub mod cron_types;
+pub mod dedup;
 pub mod heartbeat;
 pub mod markdown_html;
 pub mod media;
@@ -29,10 +30,11 @@ pub mod wecom_channel;
 pub mod whatsapp_channel;
 
 pub use bus::{AgentHandle, BusPublisher, create_bus};
-pub use channel::{Channel, ChannelManager};
+pub use channel::{Channel, ChannelHealth, ChannelManager};
 pub use cli_channel::CliChannel;
 pub use cron_service::CronService;
 pub use cron_types::{CronJob, CronPayload, CronSchedule, CronStore};
+pub use dedup::MessageDedup;
 pub use heartbeat::HeartbeatService;
 pub use session::{
     ActiveSessionStore, Session, SessionListEntry, SessionManager, validate_topic_name,

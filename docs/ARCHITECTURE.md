@@ -1414,8 +1414,15 @@ Each profile has its own LLM provider, API keys, channels, data directory, and `
 
 ## Testing
 
-316+ tests across all crates:
+1300+ tests across all crates. See [TESTING.md](./TESTING.md) for the full inventory and CI guide.
+
 - **Unit**: type serde round-trips, tool arg parsing, config validation, provider detection, tool policies, compaction, coalescing, BM25 scoring, L2 normalization, SSE parsing
-- **Integration**: CLI commands, file tools, session persistence, cron jobs, session forking, plugin loading
+- **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing (19 tests)
+- **Responsiveness**: baseline learning, degradation detection, recovery, threshold boundaries (8 tests)
+- **Queue modes**: Followup, Collect, Steer, Speculative overflow, auto-escalation/deescalation (9 tests)
+- **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access (28 tests)
+- **Integration**: CLI commands, file tools, cron jobs, session forking, plugin loading
 - **Security**: sandbox path injection, env sanitization, SSRF blocking, symlink rejection (O_NOFOLLOW), private IP detection, dedup overflow, tool argument size limits, session file size limits, circuit breaker threshold edge cases, MCP schema validation
 - **Channel**: allowed_senders, message parsing, dedup logic, email address extraction
+
+Local CI: `./scripts/ci.sh` (mirrors GitHub Actions + focused subsystem tests). See [TESTING.md](./TESTING.md).

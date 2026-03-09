@@ -42,6 +42,8 @@ pub struct ProcessManager {
     serve_port: Option<u16>,
     /// Admin token for API access (passed to admin mode gateways).
     admin_token: Option<String>,
+    /// Weak self-reference for auto-restart from spawned tasks.
+    self_ref: std::sync::Mutex<Option<std::sync::Weak<ProcessManager>>>,
 }
 
 struct GatewayProcess {
@@ -120,7 +122,14 @@ impl ProcessManager {
             alert_tx: std::sync::Mutex::new(None),
             serve_port: None,
             admin_token: None,
+            self_ref: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Store a weak self-reference for auto-restart from spawned monitor tasks.
+    /// Must be called after wrapping in `Arc`.
+    pub fn set_self_ref(self: &Arc<Self>) {
+        *self.self_ref.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(self));
     }
 
     /// Set the serve port and admin token (for admin mode gateways).
@@ -247,6 +256,19 @@ impl ProcessManager {
             }
         }
 
+        // Inject email config as env vars for the send_email plugin.
+        // The dashboard sets email config in the profile JSON, but the
+        // send_email app-skill reads SMTP_HOST / SMTP_PASSWORD / etc.
+        // from env vars. Bridge the gap here.
+        if let Some(ref email) = profile.config.email {
+            for (key, value) in email.to_env_vars(&profile.config.env_vars) {
+                // Don't override if already set explicitly in env_vars
+                if !profile.config.env_vars.contains_key(&key) {
+                    cmd.env(&key, &value);
+                }
+            }
+        }
+
         // Pass env vars from profile config, filtering out dangerous ones.
         for (key, value) in &profile.config.env_vars {
             if BLOCKED_ENV_VARS
@@ -342,6 +364,12 @@ impl ProcessManager {
         // Spawn task to wait for process exit or stop signal.
         let profile_id = profile.id.clone();
         let processes = Arc::clone(&self.processes);
+        let profile_store_for_restart = Arc::clone(&self.profile_store);
+        let pm_weak = self
+            .self_ref
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         #[cfg(feature = "api")]
         let alert_tx = self
             .alert_tx
@@ -372,6 +400,30 @@ impl ProcessManager {
                         });
                     }
                     let _ = exit_code; // suppress unused warning without admin-bot
+
+                    // Auto-restart: if the gateway exited unexpectedly (not via
+                    // stop signal), restart it after a brief delay. The Monitor
+                    // (if configured) handles smarter restart logic with
+                    // max-attempts; this is a basic fallback so gateways never
+                    // stay down when there is no Monitor.
+                    if let Some(weak) = pm_weak.clone() {
+                        let pid2 = profile_id.clone();
+                        let ps2 = profile_store_for_restart.clone();
+                        let handle = tokio::runtime::Handle::current();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            handle.block_on(async {
+                                if let Some(pm) = weak.upgrade() {
+                                    if let Ok(Some(profile)) = ps2.get(&pid2) {
+                                        tracing::info!(profile = %pid2, "auto-restarting crashed gateway");
+                                        if let Err(e) = pm.start(&profile).await {
+                                            tracing::error!(profile = %pid2, error = %e, "auto-restart failed");
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                    }
                 }
                 _ = stop_rx.changed() => {
                     let _ = child.kill().await;
@@ -528,6 +580,11 @@ impl ProcessManager {
             tracing::info!(profile = %id, pid = proc.pid, "gateway killed");
         }
         count
+    }
+
+    /// Get a reference to the underlying profile store.
+    pub fn profile_store(&self) -> &Arc<ProfileStore> {
+        &self.profile_store
     }
 
     /// Get the data directory path for a profile.

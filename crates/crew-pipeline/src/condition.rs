@@ -67,11 +67,7 @@ pub fn evaluate(expr: &CondExpr, outcome: &NodeOutcome) -> bool {
 }
 
 /// Evaluate with an explicit context map for `context.*` variables.
-pub fn evaluate_with_context(
-    expr: &CondExpr,
-    outcome: &NodeOutcome,
-    ctx: &EvalContext,
-) -> bool {
+pub fn evaluate_with_context(expr: &CondExpr, outcome: &NodeOutcome, ctx: &EvalContext) -> bool {
     match expr {
         CondExpr::StatusEq(s) => status_str(outcome) == s.as_str(),
         CondExpr::StatusNe(s) => status_str(outcome) != s.as_str(),
@@ -307,7 +303,10 @@ impl<'a> ExprParser<'a> {
                 other => eyre::bail!("expected == or != after context.{key}, got {:?}", other),
             }
         } else {
-            eyre::bail!("expected 'outcome', 'context', or '(', got {:?}", self.peek())
+            eyre::bail!(
+                "expected 'outcome', 'context', or '(', got {:?}",
+                self.peek()
+            )
         }
     }
 
@@ -426,10 +425,8 @@ mod tests {
 
     #[test]
     fn test_context_combined_with_outcome() {
-        let expr = parse_condition(
-            r#"outcome.status == "pass" && context.tests_passed == "true""#,
-        )
-        .unwrap();
+        let expr = parse_condition(r#"outcome.status == "pass" && context.tests_passed == "true""#)
+            .unwrap();
         let o = outcome(OutcomeStatus::Pass, "");
         let mut ctx = EvalContext::new();
         ctx.insert("tests_passed".into(), "true".into());

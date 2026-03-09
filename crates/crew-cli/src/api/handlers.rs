@@ -6,17 +6,24 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use crew_core::{Message, MessageRole, SessionKey};
+use axum::response::{IntoResponse, Response};
+use crew_agent::Agent;
+use crew_core::{AgentId, Message, SessionKey};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
+use super::metrics::MetricsReporter;
+use super::sse::ChannelReporter;
 
 /// POST /api/chat -- send a message, get a response.
+/// When `stream: true`, returns SSE events. Otherwise returns JSON.
 #[derive(Deserialize)]
 pub struct ChatRequest {
     pub message: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub stream: bool,
 }
 
 #[derive(Serialize)]
@@ -29,10 +36,30 @@ pub struct ChatResponse {
 /// Maximum message length (1MB).
 const MAX_MESSAGE_LEN: usize = 1_048_576;
 
-pub async fn chat(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+pub async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> Response {
+    if req.stream {
+        match chat_streaming(state, req).await {
+            Ok(sse) => sse.into_response(),
+            Err((status, msg)) => (status, msg).into_response(),
+        }
+    } else {
+        match chat_sync(state, req).await {
+            Ok(json) => json.into_response(),
+            Err((status, msg)) => (status, msg).into_response(),
+        }
+    }
+}
+
+fn validate_chat_request(
+    state: &AppState,
+    req: &ChatRequest,
+) -> Result<
+    (
+        Arc<Agent>,
+        Arc<tokio::sync::Mutex<crew_bus::SessionManager>>,
+    ),
+    (StatusCode, String),
+> {
     let agent = state.agent.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "No LLM provider configured. Set up a profile with an API key first.".into(),
@@ -49,6 +76,15 @@ pub async fn chat(
             format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
         ));
     }
+
+    Ok((agent.clone(), sessions.clone()))
+}
+
+async fn chat_sync(
+    state: Arc<AppState>,
+    req: ChatRequest,
+) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+    let (agent, sessions) = validate_chat_request(&state, &req)?;
 
     tracing::info!(
         session = req.session_id.as_deref().unwrap_or("default"),
@@ -78,29 +114,12 @@ pub async fn chat(
         "chat: response generated"
     );
 
-    // Save to session
+    // Save all conversation messages to session
     {
         let mut sess = sessions.lock().await;
-        let user_msg = Message {
-            role: MessageRole::User,
-            content: req.message,
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            timestamp: chrono::Utc::now(),
-        };
-        let _ = sess.add_message(&session_key, user_msg).await;
-        let assistant_msg = Message {
-            role: MessageRole::Assistant,
-            content: response.content.clone(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            timestamp: chrono::Utc::now(),
-        };
-        let _ = sess.add_message(&session_key, assistant_msg).await;
+        for msg in &response.messages {
+            let _ = sess.add_message(&session_key, msg.clone()).await;
+        }
     }
 
     Ok(Json(ChatResponse {
@@ -110,7 +129,110 @@ pub async fn chat(
     }))
 }
 
-/// GET /api/chat/stream -- SSE stream of progress events.
+async fn chat_streaming(
+    state: Arc<AppState>,
+    req: ChatRequest,
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, String),
+> {
+    let (base_agent, sessions) = validate_chat_request(&state, &req)?;
+
+    let session_id = req.session_id.clone().unwrap_or_else(|| "default".into());
+    tracing::info!(
+        session = %session_id,
+        msg_len = req.message.len(),
+        "chat: streaming message"
+    );
+
+    let session_key = SessionKey::new("api", &session_id);
+
+    // Load history before spawning
+    let history: Vec<Message> = {
+        let mut sess = sessions.lock().await;
+        let session = sess.get_or_create(&session_key);
+        session.get_history(50).to_vec()
+    };
+
+    // Create per-request channel and reporter
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let reporter: Arc<dyn crew_agent::ProgressReporter> = Arc::new(MetricsReporter::new(Arc::new(
+        ChannelReporter::new(tx.clone()),
+    )));
+
+    // Build per-request agent sharing resources with the base agent
+    let request_agent = Agent::new_shared(
+        AgentId::new(format!("api-{}", uuid::Uuid::now_v7())),
+        base_agent.llm_provider(),
+        base_agent.tool_registry().clone(),
+        base_agent.memory_store(),
+    )
+    .with_config(base_agent.agent_config())
+    .with_system_prompt(base_agent.system_prompt_snapshot())
+    .with_reporter(reporter);
+
+    let message = req.message;
+
+    // Spawn the agent task
+    tokio::spawn(async move {
+        let result = request_agent
+            .process_message(&message, &history, vec![])
+            .await;
+
+        match result {
+            Ok(response) => {
+                tracing::info!(
+                    session = %session_id,
+                    input_tokens = response.token_usage.input_tokens,
+                    output_tokens = response.token_usage.output_tokens,
+                    "chat: streaming response complete"
+                );
+
+                // Save all conversation messages (user, assistant iterations, tool calls/results)
+                {
+                    let mut sess = sessions.lock().await;
+                    for msg in &response.messages {
+                        let _ = sess.add_message(&session_key, msg.clone()).await;
+                    }
+                }
+
+                // Send final done event
+                let done = serde_json::json!({
+                    "type": "done",
+                    "content": response.content,
+                    "input_tokens": response.token_usage.input_tokens,
+                    "output_tokens": response.token_usage.output_tokens,
+                });
+                let _ = tx.send(done.to_string());
+            }
+            Err(e) => {
+                tracing::error!(session = %session_id, error = %e, "chat: streaming failed");
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": e.to_string(),
+                });
+                let _ = tx.send(err.to_string());
+            }
+        }
+        // tx drops here, closing the stream
+    });
+
+    // Return SSE stream from receiver
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(data) => {
+                let event: Result<Event, std::convert::Infallible> =
+                    Ok(Event::default().data(data));
+                Some((event, rx))
+            }
+            None => None,
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// GET /api/chat/stream -- SSE stream of progress events (legacy broadcast).
 pub async fn chat_stream(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
@@ -151,9 +273,14 @@ pub async fn list_sessions(
     let list = sess
         .list_sessions()
         .into_iter()
-        .map(|(id, count)| SessionInfo {
-            id,
-            message_count: count,
+        .filter_map(|(id, count)| {
+            // Only return API sessions, stripping the "api:" prefix so the
+            // frontend can use the raw chat_id with other endpoints.
+            let chat_id = id.strip_prefix("api:")?;
+            Some(SessionInfo {
+                id: chat_id.to_string(),
+                message_count: count,
+            })
         })
         .collect();
     Ok(Json(list))
@@ -212,6 +339,24 @@ pub struct MessageInfo {
     pub timestamp: String,
 }
 
+/// DELETE /api/sessions/:id -- delete a session.
+pub async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let sessions = state.sessions.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sessions not available".into(),
+    ))?;
+    let key = SessionKey::new("api", &id);
+    let mut sess = sessions.lock().await;
+    sess.clear(&key).await.map_err(|e| {
+        tracing::error!(error = %e, "delete session failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// GET /api/status -- server status.
 #[derive(Serialize)]
 pub struct StatusResponse {
@@ -250,6 +395,7 @@ mod tests {
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.message, "hello");
         assert!(req.session_id.is_none());
+        assert!(!req.stream);
     }
 
     #[test]
@@ -258,6 +404,13 @@ mod tests {
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.message, "hi");
         assert_eq!(req.session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn chat_request_with_stream() {
+        let json = r#"{"message": "hi", "stream": true}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.stream);
     }
 
     #[test]

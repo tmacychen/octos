@@ -94,6 +94,10 @@ pub struct OpenAIProvider {
     model: String,
     base_url: String,
     hints: ModelHints,
+    /// Label for logs/failover. Defaults to `"openai"` but overridden by
+    /// registry entries (e.g. `"moonshot"`, `"deepseek"`) so providers are
+    /// distinguishable in failover chains.
+    provider_label: String,
 }
 
 impl OpenAIProvider {
@@ -110,6 +114,7 @@ impl OpenAIProvider {
             hints,
             model,
             base_url: "https://api.openai.com/v1".to_string(),
+            provider_label: "openai".to_string(),
         }
     }
 
@@ -135,6 +140,14 @@ impl OpenAIProvider {
     /// Replace the HTTP client with one using custom timeouts (in seconds).
     pub fn with_http_timeout(mut self, timeout_secs: u64, connect_timeout_secs: u64) -> Self {
         self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
+        self
+    }
+
+    /// Set a custom provider label for logs and failover identification.
+    /// By default this is `"openai"`, but registry entries override it
+    /// (e.g. `"moonshot"`, `"deepseek"`) so providers are distinguishable.
+    pub fn with_provider_label(mut self, label: impl Into<String>) -> Self {
+        self.provider_label = label.into();
         self
     }
 
@@ -326,6 +339,7 @@ impl LlmProvider for OpenAIProvider {
             "stop" => StopReason::EndTurn,
             "tool_calls" => StopReason::ToolUse,
             "length" => StopReason::MaxTokens,
+            "content_filter" => StopReason::ContentFiltered,
             _ => StopReason::EndTurn,
         };
 
@@ -414,7 +428,7 @@ impl LlmProvider for OpenAIProvider {
     }
 
     fn provider_name(&self) -> &str {
-        "openai"
+        &self.provider_label
     }
 }
 
@@ -666,6 +680,7 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
                     "stop" => StopReason::EndTurn,
                     "tool_calls" => StopReason::ToolUse,
                     "length" => StopReason::MaxTokens,
+                    "content_filter" => StopReason::ContentFiltered,
                     _ => StopReason::EndTurn,
                 }));
             }

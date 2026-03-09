@@ -127,7 +127,10 @@ pub trait PipelineServer: Send + Sync {
     async fn cancel(&self, request: CancelRequest) -> eyre::Result<()>;
 
     /// List all pipeline runs (optionally filtered by status).
-    async fn list_runs(&self, status_filter: Option<RunStatus>) -> eyre::Result<Vec<RunStatusResponse>>;
+    async fn list_runs(
+        &self,
+        status_filter: Option<RunStatus>,
+    ) -> eyre::Result<Vec<RunStatusResponse>>;
 }
 
 #[cfg(test)]
@@ -189,7 +192,9 @@ mod tests {
 
     #[test]
     fn should_roundtrip_cancel_request() {
-        let req = CancelRequest { run_id: "run-42".into() };
+        let req = CancelRequest {
+            run_id: "run-42".into(),
+        };
         let json = serde_json::to_string(&req).unwrap();
         let back: CancelRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.run_id, "run-42");

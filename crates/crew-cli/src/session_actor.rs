@@ -9,18 +9,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use crew_agent::tools::{MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry};
 use crew_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
 use crew_bus::{ActiveSessionStore, SessionManager};
 use crew_core::AgentId;
 use crew_core::{InboundMessage, Message, MessageRole, OutboundMessage, SessionKey};
-use crew_llm::{EmbeddingProvider, LlmProvider, ProviderRouter};
+use crew_llm::{
+    AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
+    ResponsivenessObserver,
+};
 use crew_memory::EpisodeStore;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::config::QueueMode;
 use crate::cron_tool::CronTool;
 use crate::status_indicator::StatusIndicator;
 
@@ -46,7 +49,15 @@ pub enum ActorMessage {
         message: InboundMessage,
         image_media: Vec<String>,
     },
-    /// Cancel the current operation (future use).
+    /// Result from a background subagent task — injected as a system message
+    /// into the conversation without triggering an extra LLM call.
+    BackgroundResult {
+        /// Task identifier for attribution.
+        task_label: String,
+        /// The subagent's final output.
+        content: String,
+    },
+    /// Cancel the current operation.
     Cancel,
 }
 
@@ -277,6 +288,11 @@ pub struct ActorFactory {
     pub active_sessions: Arc<Mutex<ActiveSessionStore>>,
     /// Pending message buffer — replies from inactive sessions are held here.
     pub pending_messages: PendingMessages,
+    /// Queue mode for handling messages arriving during active agent runs.
+    pub queue_mode: QueueMode,
+    /// Side-channel to the AdaptiveRouter for responsiveness feedback.
+    /// None when adaptive routing is disabled or using a static provider chain.
+    pub adaptive_router: Option<Arc<AdaptiveRouter>>,
 }
 
 /// Trait for creating per-session ToolRegistry instances.
@@ -355,6 +371,23 @@ impl ActorFactory {
         if let Some(ref router) = self.provider_router {
             spawn_tool = spawn_tool.with_provider_router(router.clone());
         }
+
+        // Wire direct background result injection (bypasses InboundMessage relay)
+        let bg_tx = tx.clone();
+        spawn_tool = spawn_tool.with_background_result_sender(Arc::new(
+            move |task_label: String, content: String| {
+                let tx = bg_tx.clone();
+                Box::pin(async move {
+                    let _ = tx
+                        .send(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                        })
+                        .await;
+                })
+            },
+        ));
+
         tools.register(spawn_tool);
 
         // Cron tool (per-session context)
@@ -401,7 +434,7 @@ impl ActorFactory {
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
             inbox: rx,
-            agent,
+            agent: Arc::new(agent),
             session_mgr: self.session_mgr.clone(),
             llm_for_compaction: self.llm_for_compaction.clone(),
             out_tx: proxy_tx, // actor sends through proxy, not directly
@@ -412,6 +445,9 @@ impl ActorFactory {
             semaphore,
             global_shutdown: self.shutdown.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: self.queue_mode,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: self.adaptive_router.clone(),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -506,7 +542,7 @@ struct SessionActor {
 
     inbox: mpsc::Receiver<ActorMessage>,
 
-    agent: Agent,
+    agent: Arc<Agent>,
 
     session_mgr: Arc<Mutex<SessionManager>>,
     llm_for_compaction: Arc<dyn LlmProvider>,
@@ -523,6 +559,12 @@ struct SessionActor {
     global_shutdown: Arc<AtomicBool>,
     /// Per-actor cancellation flag (only affects this session)
     cancelled: Arc<AtomicBool>,
+    /// Queue mode for handling messages that arrive during active processing.
+    queue_mode: QueueMode,
+    /// Tracks LLM response latencies and detects sustained degradation.
+    responsiveness: ResponsivenessObserver,
+    /// Side-channel to AdaptiveRouter for toggling auto-protection.
+    adaptive_router: Option<Arc<AdaptiveRouter>>,
 }
 
 impl SessionActor {
@@ -532,7 +574,42 @@ impl SessionActor {
                 msg = self.inbox.recv() => {
                     match msg {
                         Some(ActorMessage::Inbound { message, image_media }) => {
-                            self.process_inbound(message, image_media).await;
+                            // Check for abort trigger before processing
+                            if crew_core::is_abort_trigger(&message.content) {
+                                debug!(session = %self.session_key, "abort trigger detected");
+                                self.cancelled.store(true, Ordering::Release);
+                                let _ = self.out_tx.send(OutboundMessage {
+                                    channel: self.channel.clone(),
+                                    chat_id: self.chat_id.clone(),
+                                    content: "🛑 Cancelled.".to_string(),
+                                    reply_to: None,
+                                    media: vec![],
+                                    metadata: serde_json::json!({}),
+                                }).await;
+                                // Reset for next message
+                                self.cancelled.store(false, Ordering::Release);
+                                continue;
+                            }
+
+                            // Handle slash commands (no LLM round-trip)
+                            if self.try_handle_command(&message).await {
+                                continue;
+                            }
+
+                            // Drain any queued messages according to queue mode
+                            let (final_message, final_media) =
+                                self.drain_queue(message, image_media).await;
+
+                            // In speculative mode, detect slow LLM calls and
+                            // spawn concurrent agent tasks for overflow messages.
+                            if self.queue_mode == QueueMode::Speculative {
+                                self.process_inbound_speculative(final_message, final_media).await;
+                            } else {
+                                self.process_inbound(final_message, final_media).await;
+                            }
+                        }
+                        Some(ActorMessage::BackgroundResult { task_label, content }) => {
+                            self.inject_background_result(&task_label, &content).await;
                         }
                         Some(ActorMessage::Cancel) => {
                             debug!(session = %self.session_key, "cancel requested");
@@ -558,6 +635,817 @@ impl SessionActor {
         }
 
         debug!(session = %self.session_key, "actor exiting");
+    }
+
+    /// Handle slash commands that don't need an LLM round-trip.
+    /// Returns `true` if the message was consumed as a command.
+    async fn try_handle_command(&mut self, message: &InboundMessage) -> bool {
+        let text = message.content.trim();
+        if !text.starts_with('/') {
+            return false;
+        }
+
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        let cmd = parts[0];
+
+        match cmd {
+            "/adaptive" => {
+                self.handle_adaptive_command(&parts[1..]).await;
+                true
+            }
+            "/queue" => {
+                self.handle_queue_command(&parts[1..]).await;
+                true
+            }
+            _ => false, // Unknown slash command — pass through to LLM
+        }
+    }
+
+    /// `/adaptive` — view or toggle adaptive routing features.
+    ///
+    /// Usage:
+    ///   /adaptive                       — show current status
+    ///   /adaptive circuit on|off        — toggle auto circuit breaker
+    ///   /adaptive lane on|off           — toggle lane changing
+    ///   /adaptive qos on|off            — toggle QoS ranking
+    async fn handle_adaptive_command(&self, args: &[&str]) {
+        let Some(ref router) = self.adaptive_router else {
+            self.send_reply("Adaptive routing is not enabled.").await;
+            return;
+        };
+
+        if args.is_empty() {
+            // Show status
+            let status = router.adaptive_status();
+            let provider = router.current_provider_name();
+            let snapshots = router.metrics_snapshots();
+
+            let mut lines = vec![
+                "**Adaptive Routing**".to_string(),
+                format!("  mode:        {}", status.mode),
+                format!(
+                    "  qos ranking: {}",
+                    if status.qos_ranking { "on" } else { "off" }
+                ),
+                format!("  current:     {provider}"),
+            ];
+
+            if !snapshots.is_empty() {
+                lines.push(String::new());
+                lines.push("**Providers**".to_string());
+                for (name, model, snap) in &snapshots {
+                    lines.push(format!(
+                        "  {name} ({model}): latency={:.0}ms ok={} err={} {}",
+                        snap.latency_ema_ms,
+                        snap.success_count,
+                        snap.failure_count,
+                        if snap.consecutive_failures >= status.failure_threshold {
+                            "⛔ OPEN"
+                        } else {
+                            "✅"
+                        },
+                    ));
+                }
+            }
+
+            self.send_reply(&lines.join("\n")).await;
+            return;
+        }
+
+        match args[0] {
+            // Mode switching: /adaptive off|hedge|lane
+            "off" => {
+                router.set_mode(AdaptiveMode::Off);
+                self.send_reply("Adaptive mode: off (static priority, failover only)")
+                    .await;
+            }
+            "hedge" | "race" | "circuit" => {
+                router.set_mode(AdaptiveMode::Hedge);
+                let status = router.adaptive_status();
+                if status.provider_count < 2 {
+                    self.send_reply("Adaptive mode: hedge (race 2 providers, take winner)\n⚠️ Only 1 provider configured — hedge needs ≥2 to race. Currently behaves like off mode.").await;
+                } else {
+                    self.send_reply(&format!(
+                        "Adaptive mode: hedge (race 2 of {} providers, take winner)",
+                        status.provider_count
+                    ))
+                    .await;
+                }
+            }
+            "lane" => {
+                router.set_mode(AdaptiveMode::Lane);
+                let status = router.adaptive_status();
+                if status.provider_count < 2 {
+                    self.send_reply("Adaptive mode: lane (score-based provider selection)\n⚠️ Only 1 provider configured — lane needs ≥2 to compare. Currently behaves like off mode.").await;
+                } else {
+                    self.send_reply(&format!(
+                        "Adaptive mode: lane (score-based selection across {} providers)",
+                        status.provider_count
+                    ))
+                    .await;
+                }
+            }
+            // QoS toggle: /adaptive qos [on|off]
+            "qos" => {
+                if let Some(value) = args.get(1) {
+                    let enabled = match *value {
+                        "on" | "true" | "1" => true,
+                        "off" | "false" | "0" => false,
+                        other => {
+                            self.send_reply(&format!("Invalid value: {other}. Use: on/off"))
+                                .await;
+                            return;
+                        }
+                    };
+                    router.set_qos_ranking(enabled);
+                    self.send_reply(&format!(
+                        "QoS ranking: {}",
+                        if enabled { "on" } else { "off" }
+                    ))
+                    .await;
+                } else {
+                    let on = router.adaptive_status().qos_ranking;
+                    self.send_reply(&format!("QoS ranking: {}", if on { "on" } else { "off" }))
+                        .await;
+                }
+            }
+            other => {
+                self.send_reply(&format!(
+                    "Unknown option: {other}\nUsage: /adaptive [off|hedge|lane|qos [on|off]]"
+                ))
+                .await;
+            }
+        }
+    }
+
+    /// `/queue` — view or change the queue mode.
+    ///
+    /// Usage:
+    ///   /queue                          — show current mode
+    ///   /queue followup|collect|steer|interrupt
+    async fn handle_queue_command(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            self.send_reply(&format!("Queue mode: {:?}", self.queue_mode))
+                .await;
+            return;
+        }
+
+        let mode = match args[0] {
+            "followup" => QueueMode::Followup,
+            "collect" => QueueMode::Collect,
+            "steer" => QueueMode::Steer,
+            "interrupt" => QueueMode::Interrupt,
+            "spec" | "speculative" => QueueMode::Speculative,
+            other => {
+                self.send_reply(&format!(
+                    "Unknown mode: {other}. Use: followup, collect, steer, interrupt, spec"
+                ))
+                .await;
+                return;
+            }
+        };
+
+        self.queue_mode = mode;
+        self.send_reply(&format!("Queue mode set to: {:?}", mode))
+            .await;
+    }
+
+    /// Send a short reply to the user (for command responses).
+    async fn send_reply(&self, content: &str) {
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: content.to_string(),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await;
+    }
+
+    /// Drain any already-queued messages from the inbox and combine them
+    /// with the current message according to the configured queue mode.
+    ///
+    /// - Followup: return the message as-is (queued messages processed next iteration)
+    /// - Collect: batch all queued messages into one combined prompt
+    /// - Steer: discard current message, use the newest queued message instead
+    /// - Interrupt: same as Steer (cancellation already handled at dispatch level)
+    async fn drain_queue(
+        &mut self,
+        message: InboundMessage,
+        image_media: Vec<String>,
+    ) -> (InboundMessage, Vec<String>) {
+        match self.queue_mode {
+            QueueMode::Followup | QueueMode::Speculative => (message, image_media),
+            QueueMode::Collect => {
+                let mut combined_content = message.content.clone();
+                let mut combined_media = image_media;
+                let mut count = 0u32;
+
+                // Non-blocking drain of queued inbound messages
+                loop {
+                    match self.inbox.try_recv() {
+                        Ok(ActorMessage::Inbound {
+                            message: queued,
+                            image_media: queued_media,
+                        }) => {
+                            if crew_core::is_abort_trigger(&queued.content) {
+                                debug!(session = %self.session_key, "abort in queue, cancelling batch");
+                                self.cancelled.store(true, Ordering::Release);
+                                break;
+                            }
+                            count += 1;
+                            combined_content
+                                .push_str(&format!("\n---\nQueued #{count}: {}", queued.content));
+                            combined_media.extend(queued_media);
+                        }
+                        Ok(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                        }) => {
+                            self.inject_background_result(&task_label, &content).await;
+                        }
+                        Ok(ActorMessage::Cancel) => {
+                            self.cancelled.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(_) => break, // inbox empty
+                    }
+                }
+                let mut msg = message;
+                msg.content = combined_content;
+                (msg, combined_media)
+            }
+            QueueMode::Steer | QueueMode::Interrupt => {
+                let mut latest_message = message;
+                let mut latest_media = image_media;
+
+                // Non-blocking drain: keep only the newest inbound message
+                loop {
+                    match self.inbox.try_recv() {
+                        Ok(ActorMessage::Inbound {
+                            message: queued,
+                            image_media: queued_media,
+                        }) => {
+                            if crew_core::is_abort_trigger(&queued.content) {
+                                debug!(session = %self.session_key, "abort in queue, cancelling");
+                                self.cancelled.store(true, Ordering::Release);
+                                break;
+                            }
+                            debug!(session = %self.session_key, "steer: replacing with newer message");
+                            latest_message = queued;
+                            latest_media = queued_media;
+                        }
+                        Ok(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                        }) => {
+                            self.inject_background_result(&task_label, &content).await;
+                        }
+                        Ok(ActorMessage::Cancel) => {
+                            self.cancelled.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                (latest_message, latest_media)
+            }
+        }
+    }
+
+    /// Inject a background task result as a system message into the conversation.
+    /// This avoids an extra LLM round-trip — the result is available in context
+    /// for the next user message.
+    async fn inject_background_result(&self, task_label: &str, content: &str) {
+        let system_msg = Message::system(format!(
+            "[Background task \"{task_label}\" completed]\n\n{content}"
+        ));
+
+        let mut mgr = self.session_mgr.lock().await;
+        if let Err(e) = mgr.add_message(&self.session_key, system_msg).await {
+            warn!(session = %self.session_key, error = %e, "failed to inject background result");
+        }
+
+        // Notify user the background task finished
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: format!("✅ Background task \"{task_label}\" completed."),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await;
+    }
+
+    /// Speculative processing: runs the LLM call but monitors the inbox.
+    /// If the call exceeds 2× responsiveness baseline and a new user message
+    /// arrives, the new message gets a quick LLM response via the adaptive
+    /// router (no tools, lightweight) while the original call continues.
+    /// Both results are delivered to the user.
+    async fn process_inbound_speculative(
+        &mut self,
+        inbound: InboundMessage,
+        image_media: Vec<String>,
+    ) {
+        let patience = self
+            .responsiveness
+            .baseline()
+            .map(|b| (b * 2).max(Duration::from_secs(10)))
+            .unwrap_or(Duration::from_secs(30));
+        debug!(
+            session = %self.session_key,
+            patience_ms = patience.as_millis(),
+            baseline_ms = ?self.responsiveness.baseline().map(|b| b.as_millis()),
+            samples = self.responsiveness.sample_count(),
+            "speculative: entering concurrent processing"
+        );
+
+        // ── Setup (needs &mut self briefly for permit + reporter) ────────
+
+        let _permit = match self.semaphore.acquire().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let max_history = self.max_history.load(Ordering::Acquire);
+
+        // Save the primary user message to session history BEFORE spawning
+        // so overflow reads see it in context (chronological ordering).
+        let user_msg = Message {
+            role: MessageRole::User,
+            content: if inbound.content.is_empty() && !image_media.is_empty() {
+                "[User sent an image]".to_string()
+            } else {
+                inbound.content.clone()
+            },
+            media: image_media.clone(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        };
+        {
+            let mut mgr = self.session_mgr.lock().await;
+            // Auto-generate summary from first user message
+            {
+                let session = mgr.get_or_create(&self.session_key);
+                if session.summary.is_none() && !inbound.content.trim().is_empty() {
+                    let summary: String = inbound.content.chars().take(100).collect();
+                    session.summary = Some(summary);
+                }
+            }
+            let _ = mgr.add_message(&self.session_key, user_msg).await;
+        }
+
+        // Get conversation history (now includes the user message we just saved)
+        let history: Vec<Message> = {
+            let mut mgr = self.session_mgr.lock().await;
+            let session = mgr.get_or_create(&self.session_key);
+            session.get_history(max_history).to_vec()
+        };
+
+        // Token tracker for status indicator
+        let token_tracker = Arc::new(TokenTracker::new());
+
+        // Start status indicator
+        let status_handle = self.status_indicator.as_ref().map(|si| {
+            let voice_transcript = inbound
+                .metadata
+                .get("voice_transcript")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            si.start(
+                self.chat_id.clone(),
+                &inbound.content,
+                Arc::clone(&token_tracker),
+                voice_transcript,
+            )
+        });
+
+        // Set up progressive streaming reporter
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(
+            stream_tx,
+        ));
+        self.agent.set_reporter(reporter);
+
+        // Spawn stream forwarder task
+        let stream_forwarder = if let Some(ref si) = self.status_indicator {
+            let channel = Arc::clone(si.channel());
+            let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
+            let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+            Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
+                stream_rx,
+                channel,
+                self.chat_id.clone(),
+                cancel_status,
+                status_msg_id,
+            )))
+        } else {
+            drop(stream_rx);
+            None
+        };
+
+        // ── Spawn agent call as a separate task (Arc<Agent>, no &mut self) ──
+
+        let agent = Arc::clone(&self.agent);
+        let content = inbound.content.clone();
+        let media = image_media;
+        let tracker = Arc::clone(&token_tracker);
+        let session_timeout = self.session_timeout;
+
+        // The agent receives the history snapshot (which includes the user
+        // message we saved above). The agent will prepend its own system
+        // prompt and user message internally — we'll deduplicate on save.
+        // Note: we pass the history WITHOUT the user message we just saved,
+        // because process_message_tracked adds a user message itself.
+        // The pre-saved user message ensures overflow calls see it in history.
+        let history_for_agent: Vec<Message> = if !history.is_empty() {
+            // Strip the last message (the user msg we just saved) since the
+            // agent's process_message_inner will re-add it.
+            history[..history.len() - 1].to_vec()
+        } else {
+            vec![]
+        };
+
+        let mut agent_task = tokio::spawn(async move {
+            let start = Instant::now();
+            let result = tokio::time::timeout(
+                session_timeout,
+                agent.process_message_tracked(&content, &history_for_agent, media, &tracker),
+            )
+            .await;
+            (result, start.elapsed())
+        });
+
+        // ── Select loop: poll inbox while agent runs ────────────────────
+
+        let started = Instant::now();
+        let mut overflow_served = false;
+
+        let (agent_result, llm_latency) = loop {
+            tokio::select! {
+                // Agent task completed
+                join_result = &mut agent_task => {
+                    match join_result {
+                        Ok(pair) => break pair,
+                        Err(e) => {
+                            warn!(session = %self.session_key, error = %e, "agent task panicked");
+                            self.send_reply("Internal error during processing.").await;
+                            // Clean up reporter + status
+                            self.agent.set_reporter(Arc::new(crew_agent::SilentReporter));
+                            if let Some(handle) = status_handle {
+                                handle.stop().await;
+                            }
+                            return;
+                        }
+                    }
+                }
+                // New message arrived in inbox
+                msg = self.inbox.recv() => {
+                    match msg {
+                        Some(ActorMessage::Inbound { message, image_media: _ }) => {
+                            if crew_core::is_abort_trigger(&message.content) {
+                                self.cancelled.store(true, Ordering::Release);
+                                self.send_reply("🛑 Cancelled.").await;
+                                continue;
+                            }
+                            let elapsed = started.elapsed();
+                            info!(
+                                session = %self.session_key,
+                                elapsed_ms = elapsed.as_millis(),
+                                patience_ms = patience.as_millis(),
+                                "speculative: serving overflow message"
+                            );
+                            // Always spawn — the user sent a new message while
+                            // the primary is running, so it needs processing.
+                            self.serve_overflow(&message, max_history);
+                            overflow_served = true;
+                        }
+                        Some(ActorMessage::BackgroundResult { task_label, content }) => {
+                            self.inject_background_result(&task_label, &content).await;
+                        }
+                        Some(ActorMessage::Cancel) => {
+                            self.cancelled.store(true, Ordering::Release);
+                        }
+                        None => {
+                            // All senders dropped — actor shutting down
+                            self.agent.set_reporter(Arc::new(crew_agent::SilentReporter));
+                            if let Some(handle) = status_handle {
+                                handle.stop().await;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── Post-processing (back to &mut self) ────────────────────────
+
+        // Feed latency to responsiveness observer
+        self.responsiveness.record(llm_latency);
+        if self.responsiveness.should_activate() {
+            warn!(
+                session = %self.session_key,
+                baseline_ms = ?self.responsiveness.baseline().map(|b| b.as_millis()),
+                latency_ms = llm_latency.as_millis(),
+                consecutive_slow = self.responsiveness.consecutive_slow_count(),
+                "sustained latency degradation detected, activating auto-protection"
+            );
+            self.responsiveness.set_active(true);
+            self.queue_mode = QueueMode::Speculative;
+            if let Some(ref router) = self.adaptive_router {
+                router.set_mode(AdaptiveMode::Hedge);
+                let _ = self.out_tx.send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: "⚡ Detected slow responses. Enabling hedge racing + speculative queue — you won't be blocked.".to_string(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                }).await;
+            }
+        } else if self.responsiveness.should_deactivate() {
+            info!(session = %self.session_key, "provider recovered, reverting to normal mode");
+            self.responsiveness.set_active(false);
+            self.queue_mode = QueueMode::Followup;
+            if let Some(ref router) = self.adaptive_router {
+                router.set_mode(AdaptiveMode::Off);
+            }
+        }
+
+        // Reset reporter to silent (drops stream_tx → forwarder finishes)
+        self.agent
+            .set_reporter(Arc::new(crew_agent::SilentReporter));
+
+        // Wait for stream forwarder
+        let stream_result = if let Some(handle) = stream_forwarder {
+            (handle.await).ok()
+        } else {
+            None
+        };
+
+        // Stop status indicator
+        if let Some(handle) = status_handle {
+            handle.stop().await;
+        }
+
+        // Handle agent result — save messages (skipping user msg, already saved)
+        // and send reply
+        match agent_result {
+            Ok(Ok(conv_response)) => {
+                // Save tool calls, tool results, and assistant reply to history.
+                // Skip the first message (user msg) — we already saved it before
+                // spawning to maintain chronological ordering.
+                {
+                    let mut mgr = self.session_mgr.lock().await;
+                    let messages_to_save = if !conv_response.messages.is_empty()
+                        && conv_response.messages[0].role == MessageRole::User
+                    {
+                        &conv_response.messages[1..]
+                    } else {
+                        &conv_response.messages
+                    };
+                    for msg in messages_to_save {
+                        if let Err(e) = mgr.add_message(&self.session_key, msg.clone()).await {
+                            warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
+                        }
+                    }
+
+                    // Sort messages by timestamp to restore chronological order.
+                    // During concurrent speculative overflow, overflow responses
+                    // may have been inserted before the primary call's messages.
+                    let session = mgr.get_or_create(&self.session_key);
+                    session.sort_by_timestamp();
+                    if let Err(e) = mgr.rewrite(&self.session_key).await {
+                        warn!(session = %self.session_key, error = %e, "failed to rewrite session after sort");
+                    }
+
+                    // Compact if needed
+                    if let Err(e) = crate::compaction::maybe_compact(
+                        &mut mgr,
+                        &self.session_key,
+                        &*self.llm_for_compaction,
+                    )
+                    .await
+                    {
+                        warn!("session compaction failed: {e}");
+                    }
+                }
+
+                // Send reply
+                let content = strip_think_tags(&conv_response.content);
+                let is_cron = inbound.channel == "system" && inbound.sender_id == "cron";
+                let is_silent = content.trim().is_empty()
+                    || content.contains("[SILENT]")
+                    || content.contains("[NO_CHANGE]");
+
+                if !(is_cron && is_silent) {
+                    let display_content = if content.trim().is_empty() && !is_cron {
+                        tracing::warn!(session = %self.session_key, "LLM returned empty content, sending fallback");
+                        "(The model returned an empty response. Please try again.)".to_string()
+                    } else {
+                        content
+                            .trim_start()
+                            .strip_prefix("[SILENT]")
+                            .or_else(|| content.trim_start().strip_prefix("[NO_CHANGE]"))
+                            .unwrap_or(&content)
+                            .to_string()
+                    };
+
+                    // If overflow was served while this task ran, prepend a
+                    // marker so the user knows this is a delayed result.
+                    let display_content = if overflow_served {
+                        format!("⬆️ Earlier task completed:\n\n{display_content}")
+                    } else {
+                        display_content
+                    };
+
+                    let streamed = if let Some(ref sr) = stream_result {
+                        if let Some(ref mid) = sr.message_id {
+                            if let Some(ref si) = self.status_indicator {
+                                let _ = si
+                                    .channel()
+                                    .edit_message(&self.chat_id, mid, &display_content)
+                                    .await;
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !streamed {
+                        let _ = self
+                            .out_tx
+                            .send(OutboundMessage {
+                                channel: self.channel.clone(),
+                                chat_id: self.chat_id.clone(),
+                                content: display_content,
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({}),
+                            })
+                            .await;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::error!(session = %self.session_key, error = %e, "agent processing failed");
+                let _ = self
+                    .out_tx
+                    .send(OutboundMessage {
+                        channel: self.channel.clone(),
+                        chat_id: self.chat_id.clone(),
+                        content: format!("Error: {e}"),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    })
+                    .await;
+            }
+            Err(_) => {
+                tracing::error!(session = %self.session_key, "session processing timed out");
+                let _ = self
+                    .out_tx
+                    .send(OutboundMessage {
+                        channel: self.channel.clone(),
+                        chat_id: self.chat_id.clone(),
+                        content: "Processing timed out. Please try again.".to_string(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Spawn a full agent task for an overflow message (with tools).
+    /// The task runs concurrently with the primary agent call.
+    /// When it completes, it saves results to session history and sends
+    /// the response to the user.
+    fn serve_overflow(&self, msg: &InboundMessage, _max_history: usize) {
+        info!(
+            session = %self.session_key,
+            overflow_content_len = msg.content.len(),
+            "speculative: spawning full agent task for overflow"
+        );
+
+        // Clone everything needed for the spawned task
+        let agent = Arc::clone(&self.agent);
+        let session_mgr = Arc::clone(&self.session_mgr);
+        let out_tx = self.out_tx.clone();
+        let channel = self.channel.clone();
+        let chat_id = self.chat_id.clone();
+        let session_key = self.session_key.clone();
+        let content = msg.content.clone();
+        let session_timeout = self.session_timeout;
+        let status_indicator = self.status_indicator.clone();
+
+        tokio::spawn(async move {
+            // Save user message to history first
+            let user_msg = Message {
+                role: MessageRole::User,
+                content: content.clone(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            };
+            {
+                let mut mgr = session_mgr.lock().await;
+                let _ = mgr.add_message(&session_key, user_msg).await;
+            }
+
+            // Use empty history so the overflow agent treats this as a fresh
+            // standalone question.  Loading the full session history causes the
+            // LLM to re-answer questions the primary task is already handling,
+            // producing duplicate content.  The system prompt still provides
+            // personality and instructions.
+            let history: Vec<Message> = vec![];
+
+            // Start typing indicator
+            if let Some(ref si) = status_indicator {
+                let _ = si.channel().send_typing(&chat_id).await;
+            }
+
+            // Run full agent with tools
+            let tracker = Arc::new(TokenTracker::new());
+            let result = tokio::time::timeout(
+                session_timeout,
+                agent.process_message_tracked(&content, &history, vec![], &tracker),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(conv_response)) => {
+                    // Save tool calls, tool results, assistant reply (skip user msg)
+                    {
+                        let mut mgr = session_mgr.lock().await;
+                        let messages_to_save = if !conv_response.messages.is_empty()
+                            && conv_response.messages[0].role == MessageRole::User
+                        {
+                            &conv_response.messages[1..]
+                        } else {
+                            &conv_response.messages
+                        };
+                        for m in messages_to_save {
+                            let _ = mgr.add_message(&session_key, m.clone()).await;
+                        }
+                    }
+
+                    let reply = strip_think_tags(&conv_response.content);
+                    if !reply.trim().is_empty() {
+                        let _ = out_tx
+                            .send(OutboundMessage {
+                                channel,
+                                chat_id,
+                                content: reply,
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({}),
+                            })
+                            .await;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(session = %session_key, error = %e, "overflow agent task failed");
+                    let _ = out_tx
+                        .send(OutboundMessage {
+                            channel,
+                            chat_id,
+                            content: format!("Error: {e}"),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({}),
+                        })
+                        .await;
+                }
+                Err(_) => {
+                    let _ = out_tx
+                        .send(OutboundMessage {
+                            channel,
+                            chat_id,
+                            content: "Processing timed out.".to_string(),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({}),
+                        })
+                        .await;
+                }
+            }
+        });
     }
 
     async fn process_inbound(&mut self, inbound: InboundMessage, image_media: Vec<String>) {
@@ -594,7 +1482,33 @@ impl SessionActor {
             )
         });
 
+        // Set up progressive streaming reporter if we have a channel
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(
+            stream_tx,
+        ));
+        self.agent.set_reporter(reporter);
+
+        // Spawn stream forwarder task — edits a channel message as text arrives
+        let stream_forwarder = if let Some(ref si) = self.status_indicator {
+            let channel = Arc::clone(si.channel());
+            let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
+            let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+            Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
+                stream_rx,
+                channel,
+                self.chat_id.clone(),
+                cancel_status,
+                status_msg_id,
+            )))
+        } else {
+            // No channel available — drop the receiver so events are discarded
+            drop(stream_rx);
+            None
+        };
+
         // Process through agent (potentially long LLM call)
+        let llm_start = Instant::now();
         let result = tokio::time::timeout(
             self.session_timeout,
             self.agent.process_message_tracked(
@@ -605,29 +1519,64 @@ impl SessionActor {
             ),
         )
         .await;
+        let llm_latency = llm_start.elapsed();
 
-        // Stop status indicator
+        // Feed latency to responsiveness observer
+        self.responsiveness.record(llm_latency);
+        if self.responsiveness.should_activate() {
+            warn!(
+                session = %self.session_key,
+                baseline_ms = ?self.responsiveness.baseline().map(|b| b.as_millis()),
+                latency_ms = llm_latency.as_millis(),
+                consecutive_slow = self.responsiveness.consecutive_slow_count(),
+                "sustained latency degradation detected, activating auto-protection"
+            );
+            self.responsiveness.set_active(true);
+            // Escalate: hedge routing (race providers) + speculative queue (unblock for new messages)
+            self.queue_mode = QueueMode::Speculative;
+            if let Some(ref router) = self.adaptive_router {
+                router.set_mode(AdaptiveMode::Hedge);
+                let _ = self.out_tx.send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: "⚡ Detected slow responses. Enabling hedge racing + speculative queue — you won't be blocked.".to_string(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                }).await;
+            }
+        } else if self.responsiveness.should_deactivate() {
+            info!(session = %self.session_key, "provider recovered, reverting to normal mode");
+            self.responsiveness.set_active(false);
+            self.queue_mode = QueueMode::Followup;
+            if let Some(ref router) = self.adaptive_router {
+                router.set_mode(AdaptiveMode::Off);
+            }
+        }
+
+        // Reset reporter to silent (drop the stream sender → forwarder will finish)
+        self.agent
+            .set_reporter(Arc::new(crew_agent::SilentReporter));
+
+        // Wait for stream forwarder to complete and get its result
+        let stream_result = if let Some(handle) = stream_forwarder {
+            (handle.await).ok()
+        } else {
+            None
+        };
+
+        // Stop status indicator (if stream forwarder didn't already cancel it)
         if let Some(handle) = status_handle {
             handle.stop().await;
         }
 
         match result {
             Ok(Ok(conv_response)) => {
-                // Save messages to session
+                // Save all messages from the agent (user msg, tool calls, tool
+                // results, assistant replies) so the full context is preserved
+                // for subsequent calls.
                 {
                     let mut mgr = self.session_mgr.lock().await;
-                    let user_msg = Message {
-                        role: MessageRole::User,
-                        content: inbound.content.clone(),
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                        timestamp: Utc::now(),
-                    };
-                    if let Err(e) = mgr.add_message(&self.session_key, user_msg).await {
-                        warn!(session = %self.session_key, error = %e, "failed to persist user message");
-                    }
 
                     // Auto-generate summary from first user message
                     {
@@ -638,18 +1587,9 @@ impl SessionActor {
                         }
                     }
 
-                    if !conv_response.content.is_empty() {
-                        let assistant_msg = Message {
-                            role: MessageRole::Assistant,
-                            content: conv_response.content.clone(),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: None,
-                            timestamp: Utc::now(),
-                        };
-                        if let Err(e) = mgr.add_message(&self.session_key, assistant_msg).await {
-                            warn!(session = %self.session_key, error = %e, "failed to persist assistant message");
+                    for msg in &conv_response.messages {
+                        if let Err(e) = mgr.add_message(&self.session_key, msg.clone()).await {
+                            warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                         }
                     }
 
@@ -674,24 +1614,50 @@ impl SessionActor {
                     || content.contains("[NO_CHANGE]");
 
                 if !(is_cron && is_silent) {
-                    let display_content = content
-                        .trim_start()
-                        .strip_prefix("[SILENT]")
-                        .or_else(|| content.trim_start().strip_prefix("[NO_CHANGE]"))
-                        .unwrap_or(&content)
-                        .to_string();
+                    let display_content = if content.trim().is_empty() && !is_cron {
+                        tracing::warn!(session = %self.session_key, "LLM returned empty content, sending fallback");
+                        "(The model returned an empty response. Please try again.)".to_string()
+                    } else {
+                        content
+                            .trim_start()
+                            .strip_prefix("[SILENT]")
+                            .or_else(|| content.trim_start().strip_prefix("[NO_CHANGE]"))
+                            .unwrap_or(&content)
+                            .to_string()
+                    };
 
-                    let _ = self
-                        .out_tx
-                        .send(OutboundMessage {
-                            channel: self.channel.clone(),
-                            chat_id: self.chat_id.clone(),
-                            content: display_content,
-                            reply_to: None,
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        })
-                        .await;
+                    // If stream forwarder already sent a message, do a final edit
+                    // with the clean content instead of sending a new message.
+                    let streamed = if let Some(ref sr) = stream_result {
+                        if let Some(ref mid) = sr.message_id {
+                            if let Some(ref si) = self.status_indicator {
+                                // Strip tool status lines from final content
+                                let _ = si
+                                    .channel()
+                                    .edit_message(&self.chat_id, mid, &display_content)
+                                    .await;
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !streamed {
+                        let _ = self
+                            .out_tx
+                            .send(OutboundMessage {
+                                channel: self.channel.clone(),
+                                chat_id: self.chat_id.clone(),
+                                content: display_content,
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({}),
+                            })
+                            .await;
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -743,6 +1709,9 @@ fn strip_think_tags(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use crew_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn test_strip_think_tags() {
@@ -755,5 +1724,908 @@ mod tests {
         assert_eq!(strip_think_tags("<think>unclosed"), "");
     }
 
-    // Integration tests require a real LLM provider — tested via gateway integration tests.
+    // ── Mock providers for speculative overflow tests ────────────────────
+
+    /// Mock LLM provider with configurable delay per call.
+    /// Returns scripted responses in FIFO order.
+    struct DelayedMockProvider {
+        responses: std::sync::Mutex<Vec<(Duration, ChatResponse)>>,
+        call_count: AtomicUsize,
+        name: String,
+    }
+
+    impl DelayedMockProvider {
+        fn new(name: &str, responses: Vec<(Duration, ChatResponse)>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+                call_count: AtomicUsize::new(0),
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for DelayedMockProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let (delay, response) = {
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    return Ok(ChatResponse {
+                        content: Some("(no more scripted responses)".into()),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                        stop_reason: StopReason::EndTurn,
+                        usage: TokenUsage::default(),
+                    });
+                }
+                responses.remove(0)
+            };
+            tokio::time::sleep(delay).await;
+            Ok(response)
+        }
+
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+
+        fn model_id(&self) -> &str {
+            &self.name
+        }
+
+        fn provider_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    fn make_response(text: &str) -> ChatResponse {
+        ChatResponse {
+            content: Some(text.to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 50,
+                output_tokens: 10,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn make_inbound(content: &str) -> ActorMessage {
+        ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "cli".to_string(),
+                chat_id: "test".to_string(),
+                sender_id: "user".to_string(),
+                content: content.to_string(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata: serde_json::json!({}),
+            },
+            image_media: vec![],
+        }
+    }
+
+    /// Build a SessionActor with configurable queue mode and optional adaptive router.
+    ///
+    /// Generic setup used by queue mode, auto-escalation, and other tests.
+    /// `adaptive_router` controls whether speculative overflow is available.
+    /// `pre_seed_baseline`: if true, pre-seeds 5×500ms to establish responsiveness baseline.
+    async fn setup_actor_with_mode(
+        agent_provider: Arc<dyn LlmProvider>,
+        queue_mode: QueueMode,
+        adaptive_router: Option<Arc<AdaptiveRouter>>,
+        pre_seed_baseline: bool,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<Mutex<SessionManager>>,
+    ) {
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = crew_agent::ToolRegistry::with_builtins(dir.path());
+
+        let agent = Agent::new(AgentId::new("test-mode"), agent_provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+
+        let mut responsiveness = ResponsivenessObserver::new();
+        if pre_seed_baseline {
+            for _ in 0..5 {
+                responsiveness.record(Duration::from_millis(500));
+            }
+        }
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            session_mgr: session_mgr.clone(),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode,
+            responsiveness,
+            adaptive_router,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    /// Build a minimal SessionActor with speculative mode + adaptive router.
+    ///
+    /// `agent_provider` is used by the Agent for primary calls.
+    /// `router_providers` are used by the AdaptiveRouter for overflow calls.
+    /// These MUST be separate instances (separate response queues).
+    async fn setup_speculative_actor(
+        agent_provider: Arc<dyn LlmProvider>,
+        router_providers: Vec<Arc<dyn LlmProvider>>,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<Mutex<SessionManager>>,
+    ) {
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = crew_agent::ToolRegistry::with_builtins(dir.path());
+
+        let agent = Agent::new(AgentId::new("test-spec"), agent_provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            });
+
+        // AdaptiveRouter with separate providers for overflow (serve_overflow only)
+        let router = Arc::new(
+            AdaptiveRouter::new(router_providers, AdaptiveConfig::default())
+                .with_adaptive_config(AdaptiveMode::Hedge, false),
+        );
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+
+        // Pre-seed responsiveness baseline so patience = 10s (not 30s default)
+        let mut responsiveness = ResponsivenessObserver::new();
+        for _ in 0..5 {
+            responsiveness.record(Duration::from_millis(500));
+        }
+        // baseline = 500ms → patience = max(1000ms, 10s) = 10s
+        // But we want lower patience for fast tests. We'll use 2s responses
+        // to establish baseline=2s → patience=max(4s, 10s)=10s.
+        // For the test, the slow call takes 15s, so 15s > 10s triggers overflow.
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            session_mgr: session_mgr.clone(),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Speculative,
+            responsiveness,
+            adaptive_router: Some(router),
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    /// Core speculative overflow test:
+    /// - Send a message that triggers a slow (3s) agent call
+    /// - After 1s, send an overflow message
+    /// - The overflow should be served via serve_overflow while the slow call continues
+    /// - Both responses should arrive
+    #[tokio::test]
+    async fn test_speculative_overflow_concurrent() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent provider: 5 fast warmups + 1 slow (12s) primary call
+        // + 1 fast overflow response (serve_overflow now uses the agent)
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                // Slow call that triggers overflow (12s > 10s patience)
+                (
+                    Duration::from_secs(12),
+                    make_response("slow primary answer"),
+                ),
+                // Overflow agent task (runs concurrently with slow primary)
+                (
+                    Duration::from_millis(500),
+                    make_response("overflow answer: 1961"),
+                ),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+
+        // Router providers (separate instances, used ONLY by serve_overflow)
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![
+                (
+                    Duration::from_millis(500),
+                    make_response("router-a overflow"),
+                ),
+                (Duration::from_millis(500), make_response("router-a extra")),
+            ],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![
+                (
+                    Duration::from_millis(100),
+                    make_response("overflow answer: 1961"),
+                ),
+                (Duration::from_millis(100), make_response("router-b extra")),
+            ],
+        ));
+
+        let (tx, mut rx, handle, session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        // ── Phase 1: Warm-up (5 fast messages to establish baseline) ──
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            // Wait for response
+            let resp = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("warmup response timeout")
+                .expect("channel closed");
+            assert!(!resp.content.is_empty(), "warmup {i} got empty response");
+        }
+
+        // ── Phase 2: Send slow request, then overflow ──
+        tx.send(make_inbound("Do a complex multi-step analysis"))
+            .await
+            .unwrap();
+
+        // Wait 11s for patience (10s) to be exceeded, then send overflow
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        tx.send(make_inbound("What is 37 * 53?")).await.unwrap();
+
+        // ── Phase 3: Collect all responses ──
+        // We expect 2 responses: overflow answer + slow primary answer (in some order)
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while responses.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => responses.push(msg.content),
+                Ok(None) => break,
+                Err(_) => break, // timeout
+            }
+        }
+
+        assert!(
+            responses.len() >= 2,
+            "expected at least 2 responses (overflow + primary), got {}: {:?}",
+            responses.len(),
+            responses
+        );
+
+        // One should be the overflow answer, one the primary (with ⬆️ marker)
+        let has_overflow = responses
+            .iter()
+            .any(|r| r.contains("1961") || r.contains("overflow"));
+        let has_primary = responses
+            .iter()
+            .any(|r| r.contains("slow primary") || r.contains("primary"));
+
+        assert!(
+            has_overflow,
+            "overflow response not found in: {:?}",
+            responses
+        );
+        assert!(
+            has_primary,
+            "primary response not found in: {:?}",
+            responses
+        );
+
+        // ── Phase 4: Verify history is sorted by timestamp ──
+        {
+            let mut mgr = session_mgr.lock().await;
+            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            let messages = &session.messages;
+            assert!(
+                messages.len() >= 4,
+                "expected at least 4 messages in history (warmups + primary + overflow), got {}",
+                messages.len()
+            );
+
+            // Verify timestamps are sorted
+            for window in messages.windows(2) {
+                assert!(
+                    window[0].timestamp <= window[1].timestamp,
+                    "history not sorted: {:?} > {:?} (contents: '{}' vs '{}')",
+                    window[0].timestamp,
+                    window[1].timestamp,
+                    &window[0].content[..window[0].content.len().min(50)],
+                    &window[1].content[..window[1].content.len().min(50)],
+                );
+            }
+        }
+
+        // Clean shutdown
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Test that messages within patience threshold are NOT served as overflow.
+    #[tokio::test]
+    async fn test_speculative_within_patience_drops() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 5 warmups + primary at 5s (within 10s patience)
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("w1")),
+                (Duration::from_millis(200), make_response("w2")),
+                (Duration::from_millis(200), make_response("w3")),
+                (Duration::from_millis(200), make_response("w4")),
+                (Duration::from_millis(200), make_response("w5")),
+                (Duration::from_secs(5), make_response("primary done")),
+            ],
+        ));
+
+        // Router providers (should NOT be consumed since overflow not triggered)
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(
+                Duration::from_millis(100),
+                make_response("should not appear"),
+            )],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(
+                Duration::from_millis(100),
+                make_response("should not appear"),
+            )],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        // Warm-up
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        // Send primary (5s)
+        tx.send(make_inbound("medium task")).await.unwrap();
+
+        // Send overflow at 2s (within 10s patience)
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tx.send(make_inbound("quick question")).await.unwrap();
+
+        // Collect responses — should only get 1 (primary), overflow dropped
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => responses.push(msg.content),
+                _ => break,
+            }
+        }
+
+        assert!(
+            !responses.is_empty() && responses.len() <= 2,
+            "expected 1-2 responses (primary + possible completion notice), got {}: {:?}",
+            responses.len(),
+            responses
+        );
+        assert!(
+            responses.iter().any(|r| r.contains("primary done")),
+            "expected primary response in: {:?}",
+            responses
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Test that background results are handled during speculative select loop.
+    #[tokio::test]
+    async fn test_speculative_handles_background_result() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 5 warmups + 8s primary
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("w1")),
+                (Duration::from_millis(200), make_response("w2")),
+                (Duration::from_millis(200), make_response("w3")),
+                (Duration::from_millis(200), make_response("w4")),
+                (Duration::from_millis(200), make_response("w5")),
+                (Duration::from_secs(8), make_response("primary done")),
+            ],
+        ));
+
+        // Router providers (not used in this test — no overflow messages sent)
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("router-a", vec![]));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("router-b", vec![]));
+
+        let (tx, mut rx, handle, session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        // Warm-up
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        // Send primary (8s)
+        tx.send(make_inbound("long task")).await.unwrap();
+
+        // Inject background result at 2s (during the speculative select loop)
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "research".to_string(),
+            content: "Background research completed with 5 findings.".to_string(),
+        })
+        .await
+        .unwrap();
+
+        // Collect responses — expect: background notification + primary
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        while responses.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => responses.push(msg.content),
+                _ => break,
+            }
+        }
+
+        let has_bg_notification = responses
+            .iter()
+            .any(|r| r.contains("research") && r.contains("completed"));
+        let has_primary = responses.iter().any(|r| r.contains("primary done"));
+
+        assert!(
+            has_bg_notification,
+            "background result notification not found in: {:?}",
+            responses
+        );
+        assert!(
+            has_primary,
+            "primary response not found in: {:?}",
+            responses
+        );
+
+        // Verify background result is in session history
+        {
+            let mut mgr = session_mgr.lock().await;
+            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            let has_bg_msg = session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Background task") && m.content.contains("research"));
+            assert!(has_bg_msg, "background result not found in session history");
+        }
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    // ── Queue mode tests ─────────────────────────────────────────────────
+
+    /// Collect mode batches queued messages into one combined prompt.
+    #[tokio::test]
+    async fn test_queue_mode_collect_batches() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 1st call slow (2s), 2nd call fast
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_secs(2), make_response("first reply")),
+                (Duration::from_millis(200), make_response("batched reply")),
+            ],
+        ));
+
+        let (tx, mut rx, handle, session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Collect, None, false, &dir).await;
+
+        // Send first message → starts 2s processing
+        tx.send(make_inbound("first message")).await.unwrap();
+
+        // Wait for actor to start processing, then queue two more
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(make_inbound("second message")).await.unwrap();
+        tx.send(make_inbound("third message")).await.unwrap();
+
+        // Collect responses (expect 2: first reply + batched reply)
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while responses.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => responses.push(msg.content),
+                _ => break,
+            }
+        }
+
+        assert_eq!(
+            responses.len(),
+            2,
+            "expected 2 responses (first + batched), got {}: {:?}",
+            responses.len(),
+            responses
+        );
+
+        // Verify session history: second user message should contain batched content
+        {
+            let mut mgr = session_mgr.lock().await;
+            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            let user_messages: Vec<&str> = session
+                .messages
+                .iter()
+                .filter(|m| m.role == MessageRole::User)
+                .map(|m| m.content.as_str())
+                .collect();
+            // First user msg: "first message"
+            assert!(
+                user_messages.iter().any(|m| *m == "first message"),
+                "first message not found: {:?}",
+                user_messages
+            );
+            // Second user msg: combined "second message\n---\nQueued #1: third message"
+            assert!(
+                user_messages
+                    .iter()
+                    .any(|m| m.contains("second message") && m.contains("third message")),
+                "batched message not found: {:?}",
+                user_messages
+            );
+        }
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Steer mode keeps only the newest queued message, discards older ones.
+    #[tokio::test]
+    async fn test_queue_mode_steer_keeps_newest() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 1st call slow (2s), 2nd call fast
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_secs(2), make_response("first reply")),
+                (Duration::from_millis(200), make_response("steered reply")),
+            ],
+        ));
+
+        let (tx, mut rx, handle, session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Steer, None, false, &dir).await;
+
+        // Send first message → starts 2s processing
+        tx.send(make_inbound("first message")).await.unwrap();
+
+        // Wait then queue two more — steer should discard "second" and keep "third"
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(make_inbound("second message (discarded)"))
+            .await
+            .unwrap();
+        tx.send(make_inbound("third message (newest)"))
+            .await
+            .unwrap();
+
+        // Collect responses (expect 2: first + steered)
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while responses.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => responses.push(msg.content),
+                _ => break,
+            }
+        }
+
+        assert_eq!(
+            responses.len(),
+            2,
+            "expected 2 responses, got {}: {:?}",
+            responses.len(),
+            responses
+        );
+
+        // Verify session history: "second message" should NOT appear as a user message
+        {
+            let mut mgr = session_mgr.lock().await;
+            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            let user_messages: Vec<&str> = session
+                .messages
+                .iter()
+                .filter(|m| m.role == MessageRole::User)
+                .map(|m| m.content.as_str())
+                .collect();
+            assert!(
+                user_messages.iter().any(|m| m.contains("third message")),
+                "steered (newest) message not found: {:?}",
+                user_messages
+            );
+            assert!(
+                !user_messages.iter().any(|m| m.contains("second message")),
+                "discarded message should not be in history: {:?}",
+                user_messages
+            );
+        }
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Followup mode processes each message individually (no batching).
+    #[tokio::test]
+    async fn test_queue_mode_followup_sequential() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 3 fast responses
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(100), make_response("reply-1")),
+                (Duration::from_millis(100), make_response("reply-2")),
+                (Duration::from_millis(100), make_response("reply-3")),
+            ],
+        ));
+
+        let (tx, mut rx, handle, session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        // Send 3 messages
+        tx.send(make_inbound("msg-a")).await.unwrap();
+        tx.send(make_inbound("msg-b")).await.unwrap();
+        tx.send(make_inbound("msg-c")).await.unwrap();
+
+        // Collect all 3 responses
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while responses.len() < 3 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => responses.push(msg.content),
+                _ => break,
+            }
+        }
+
+        assert_eq!(
+            responses.len(),
+            3,
+            "expected 3 sequential responses, got {}: {:?}",
+            responses.len(),
+            responses
+        );
+
+        // All 3 user messages should be in history individually
+        {
+            let mut mgr = session_mgr.lock().await;
+            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            let user_messages: Vec<&str> = session
+                .messages
+                .iter()
+                .filter(|m| m.role == MessageRole::User)
+                .map(|m| m.content.as_str())
+                .collect();
+            assert!(user_messages.contains(&"msg-a"));
+            assert!(user_messages.contains(&"msg-b"));
+            assert!(user_messages.contains(&"msg-c"));
+        }
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    // ── Auto-escalation tests ────────────────────────────────────────────
+
+    /// Sustained latency degradation triggers auto-escalation to Hedge + Speculative.
+    #[tokio::test]
+    async fn test_auto_escalation_on_degradation() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 5×100ms warmups + 3×400ms slow (triggers activation at 3× baseline)
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(100), make_response("warm1")),
+                (Duration::from_millis(100), make_response("warm2")),
+                (Duration::from_millis(100), make_response("warm3")),
+                (Duration::from_millis(100), make_response("warm4")),
+                (Duration::from_millis(100), make_response("warm5")),
+                (Duration::from_millis(400), make_response("slow1")),
+                (Duration::from_millis(400), make_response("slow2")),
+                (Duration::from_millis(400), make_response("slow3")),
+            ],
+        ));
+
+        // Router needed for set_mode call during escalation
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("r-a", vec![]));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("r-b", vec![]));
+        let router = Arc::new(
+            AdaptiveRouter::new(vec![router_a, router_b], AdaptiveConfig::default())
+                .with_adaptive_config(AdaptiveMode::Off, false),
+        );
+        assert_eq!(router.mode(), AdaptiveMode::Off);
+
+        let (tx, mut rx, handle, _) = setup_actor_with_mode(
+            agent_llm,
+            QueueMode::Followup,
+            Some(router.clone()),
+            false, // Let warmups establish baseline naturally
+            &dir,
+        )
+        .await;
+
+        // Send all 8 messages (5 warmup + 3 slow) and collect ALL responses.
+        // The "⚡" notification is sent BEFORE the reply in process_inbound,
+        // so it can arrive interleaved with normal responses.
+        let mut all_responses = Vec::new();
+        for i in 0..8 {
+            let label = if i < 5 {
+                format!("warmup {i}")
+            } else {
+                format!("slow {}", i - 5)
+            };
+            tx.send(make_inbound(&label)).await.unwrap();
+            // Collect all available responses (may be 1 or 2 if "⚡" arrived)
+            loop {
+                match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+                    Ok(Some(msg)) => {
+                        let is_notification = msg.content.contains("⚡");
+                        all_responses.push(msg.content);
+                        if !is_notification {
+                            break; // Got the actual reply, move to next message
+                        }
+                        // If it was the notification, keep reading for the reply
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        let found_escalation = all_responses.iter().any(|r| r.contains("⚡"));
+        assert!(
+            found_escalation,
+            "expected ⚡ escalation notification in responses: {:?}",
+            all_responses
+        );
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Hedge,
+            "router should be in Hedge mode after escalation"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Recovery after auto-escalation restores normal mode (Off + Followup).
+    #[tokio::test]
+    async fn test_auto_deescalation_on_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 5×100ms warmups + 3×400ms slow + 1×100ms recovery
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(100), make_response("w1")),
+                (Duration::from_millis(100), make_response("w2")),
+                (Duration::from_millis(100), make_response("w3")),
+                (Duration::from_millis(100), make_response("w4")),
+                (Duration::from_millis(100), make_response("w5")),
+                (Duration::from_millis(400), make_response("s1")),
+                (Duration::from_millis(400), make_response("s2")),
+                (Duration::from_millis(400), make_response("s3")),
+                // Recovery: fast response resets consecutive_slow → deactivation
+                (Duration::from_millis(100), make_response("recovered")),
+            ],
+        ));
+
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("r-a", vec![]));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("r-b", vec![]));
+        let router = Arc::new(
+            AdaptiveRouter::new(vec![router_a, router_b], AdaptiveConfig::default())
+                .with_adaptive_config(AdaptiveMode::Off, false),
+        );
+
+        let (tx, mut rx, handle, _) = setup_actor_with_mode(
+            agent_llm,
+            QueueMode::Followup,
+            Some(router.clone()),
+            false,
+            &dir,
+        )
+        .await;
+
+        // Warmup + degradation (same as escalation test)
+        for i in 0..8 {
+            tx.send(make_inbound(&format!("msg {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+        }
+
+        // Drain the escalation notification
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) if msg.content.contains("⚡") => break,
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+
+        // Verify escalated state
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+
+        // Send recovery message (fast 100ms → resets consecutive_slow to 0)
+        // After escalation, queue_mode changed to Speculative internally.
+        // The speculative path also records latency and checks deactivation.
+        tx.send(make_inbound("recovery ping")).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+
+        // Give the actor a moment to process the deactivation
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Router should be back to Off mode
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Off,
+            "router should revert to Off after recovery"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
 }

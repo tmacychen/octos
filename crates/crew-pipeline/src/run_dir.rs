@@ -34,8 +34,7 @@ pub struct NodeStatus {
 impl RunDir {
     /// Create a new run directory under `{working_dir}/.crew/runs/{run_id}/`.
     pub fn new(working_dir: &Path, run_id: &str) -> std::io::Result<Self> {
-        validate_pipeline_id(run_id)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        validate_pipeline_id(run_id).map_err(|e| std::io::Error::other(e.to_string()))?;
         let base = working_dir.join(".crew/runs").join(run_id);
         std::fs::create_dir_all(&base)?;
         Ok(Self { base: Some(base) })
@@ -57,13 +56,11 @@ impl RunDir {
             return Ok(());
         };
 
-        validate_pipeline_id(&status.node_id)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        validate_pipeline_id(&status.node_id).map_err(|e| std::io::Error::other(e.to_string()))?;
         let node_dir = base.join(&status.node_id);
         std::fs::create_dir_all(&node_dir)?;
 
-        let json = serde_json::to_string_pretty(status)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(status).map_err(std::io::Error::other)?;
 
         std::fs::write(node_dir.join("status.json"), json)?;
         Ok(())
@@ -83,8 +80,7 @@ impl RunDir {
             return Ok(None);
         }
 
-        validate_pipeline_id(node_id)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        validate_pipeline_id(node_id).map_err(|e| std::io::Error::other(e.to_string()))?;
         let node_dir = base.join(node_id);
         std::fs::create_dir_all(&node_dir)?;
 
@@ -99,8 +95,7 @@ impl RunDir {
             return Ok(());
         };
 
-        let json = serde_json::to_string_pretty(summary)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(summary).map_err(std::io::Error::other)?;
 
         std::fs::write(base.join("summary.json"), json)?;
         Ok(())

@@ -84,6 +84,37 @@ pub trait Channel: Send + Sync {
     ) -> Result<()> {
         self.edit_message(chat_id, message_id, new_content).await
     }
+
+    /// Format outbound text for this channel's platform.
+    ///
+    /// Called by the outbound dispatcher before chunking. Channels that need
+    /// platform-specific formatting (e.g. Markdown → HTML for Telegram) should
+    /// override this. Default: returns content unchanged.
+    fn format_outbound(&self, content: &str) -> String {
+        content.to_string()
+    }
+
+    /// Check channel health. Returns Ok(healthy) or Err with diagnosis.
+    ///
+    /// Used by the admin dashboard to show per-channel status. Default: unknown
+    /// (returns Ok — assumed healthy if no probe implemented).
+    async fn health_check(&self) -> Result<ChannelHealth> {
+        Ok(ChannelHealth::Unknown)
+    }
+}
+
+/// Health status reported by a channel's `health_check()`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", content = "detail")]
+pub enum ChannelHealth {
+    /// Channel is connected and operational.
+    Healthy,
+    /// Channel is partially working (e.g. rate-limited).
+    Degraded(String),
+    /// Channel is not reachable.
+    Down(String),
+    /// Channel does not implement health checks.
+    Unknown,
 }
 
 /// Manages registered channels and dispatches outbound messages.
@@ -148,11 +179,12 @@ impl ChannelManager {
                             );
                         }
                     } else {
-                        // Text message: chunk and send
+                        // Text message: format for platform, then chunk and send
+                        let formatted = channel.format_outbound(&msg.content);
                         let config = ChunkConfig {
                             max_chars: channel.max_message_length(),
                         };
-                        let chunks = split_message(&msg.content, &config);
+                        let chunks = split_message(&formatted, &config);
                         let total = chunks.len();
                         for (i, chunk) in chunks.into_iter().enumerate() {
                             let mut chunk_msg = msg.clone();

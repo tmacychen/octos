@@ -159,6 +159,7 @@ impl LlmProvider for OpenRouterProvider {
             "stop" => StopReason::EndTurn,
             "tool_calls" => StopReason::ToolUse,
             "length" => StopReason::MaxTokens,
+            "content_filter" => StopReason::ContentFiltered,
             _ => StopReason::EndTurn,
         };
 

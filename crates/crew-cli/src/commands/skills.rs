@@ -1257,10 +1257,7 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
                 serde_json::from_str::<crew_agent::plugins::manifest::PluginManifest>(&manifest_str)
             {
                 if let Some(info) = manifest.binaries.get(&key) {
-                    println!(
-                        "  Downloading binary for {} from manifest...",
-                        key.cyan()
-                    );
+                    println!("  Downloading binary for {} from manifest...", key.cyan());
                     if download_binary_from_url(dir, &info.url, info.sha256.as_deref())? {
                         // Also install to ~/.cargo/bin/ for PATH access
                         install_main_to_cargo_bin(dir, &manifest.name);
@@ -1426,10 +1423,7 @@ fn install_main_to_cargo_bin(dir: &Path, name: &str) {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &dest,
-                        std::fs::Permissions::from_mode(0o755),
-                    );
+                    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
                 }
                 println!(
                     "  {} Installed '{}' to {}",
