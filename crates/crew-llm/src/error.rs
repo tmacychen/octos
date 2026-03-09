@@ -57,10 +57,7 @@ impl LlmError {
         }
     }
 
-    pub fn with_source(
-        mut self,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
         self.source = Some(Box::new(source));
         self
     }
@@ -139,7 +136,9 @@ impl fmt::Display for LlmError {
 
 impl std::error::Error for LlmError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+        self.source
+            .as_ref()
+            .map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -164,7 +163,10 @@ mod tests {
     #[test]
     fn should_classify_500_as_server_error() {
         let err = LlmError::from_status(500, "Internal Server Error");
-        assert!(matches!(err.kind, LlmErrorKind::ServerError { status: 500 }));
+        assert!(matches!(
+            err.kind,
+            LlmErrorKind::ServerError { status: 500 }
+        ));
         assert!(err.is_retryable());
     }
 
@@ -201,7 +203,10 @@ mod tests {
         // Multi-byte UTF-8 characters that would panic with byte-level slicing
         let body = "あ".repeat(100); // 300 bytes, 100 chars
         let err = LlmError::from_status(500, &body);
-        assert!(matches!(err.kind, LlmErrorKind::ServerError { status: 500 }));
+        assert!(matches!(
+            err.kind,
+            LlmErrorKind::ServerError { status: 500 }
+        ));
         // Should not panic — truncates at char boundary
         let _ = err.to_string();
     }

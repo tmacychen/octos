@@ -91,10 +91,7 @@ impl PromptLayerBuilder {
         }
 
         if let Some(agents) = self.agents_md {
-            parts.push(format!(
-                "\n\n## Available Agents\n\n{}",
-                agents.trim()
-            ));
+            parts.push(format!("\n\n## Available Agents\n\n{}", agents.trim()));
         }
 
         for layer in self.extra_layers {

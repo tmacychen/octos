@@ -99,13 +99,27 @@ pub struct ChannelInputProvider {
 }
 
 impl ChannelInputProvider {
-    pub fn new() -> (Self, mpsc::Receiver<(HumanRequest, oneshot::Sender<HumanResponse>)>) {
+    pub fn new() -> (
+        Self,
+        mpsc::Receiver<(HumanRequest, oneshot::Sender<HumanResponse>)>,
+    ) {
         let (tx, rx) = mpsc::channel(8);
-        (Self { tx, timeout: DEFAULT_INPUT_TIMEOUT }, rx)
+        (
+            Self {
+                tx,
+                timeout: DEFAULT_INPUT_TIMEOUT,
+            },
+            rx,
+        )
     }
 
     /// Create with a custom timeout for human responses.
-    pub fn with_timeout(timeout: Duration) -> (Self, mpsc::Receiver<(HumanRequest, oneshot::Sender<HumanResponse>)>) {
+    pub fn with_timeout(
+        timeout: Duration,
+    ) -> (
+        Self,
+        mpsc::Receiver<(HumanRequest, oneshot::Sender<HumanResponse>)>,
+    ) {
         let (tx, rx) = mpsc::channel(8);
         (Self { tx, timeout }, rx)
     }
@@ -199,9 +213,7 @@ mod tests {
         // Simulate human responding
         let (req, resp_tx) = rx.recv().await.unwrap();
         assert_eq!(req.id, "req_2");
-        resp_tx
-            .send(HumanResponse::approve(&req.id))
-            .unwrap();
+        resp_tx.send(HumanResponse::approve(&req.id)).unwrap();
 
         let resp = handle.await.unwrap();
         assert!(resp.is_positive());

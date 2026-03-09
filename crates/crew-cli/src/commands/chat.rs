@@ -586,9 +586,7 @@ pub(crate) fn create_provider_with_api_type(
     // This forces the Responses API even for models not auto-detected.
     if api_type == Some("responses") {
         let key = api_key.ok_or_else(|| eyre::eyre!("API key required for responses api_type"))?;
-        let m = model.unwrap_or_else(|| {
-            entry.default_model.unwrap_or("gpt-4o").into()
-        });
+        let m = model.unwrap_or_else(|| entry.default_model.unwrap_or("gpt-4o").into());
         let mut provider = crew_llm::openai_responses::OpenAIResponsesProvider::new(&key, &m);
         if let Some(url) = base_url {
             provider = provider.with_base_url(&url);

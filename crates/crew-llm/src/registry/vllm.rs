@@ -30,7 +30,9 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let url = p
         .base_url
         .ok_or_else(|| eyre::eyre!("vllm provider requires --base-url to be specified"))?;
-    let mut provider = OpenAIProvider::new(&key, &model).with_base_url(&url);
+    let mut provider = OpenAIProvider::new(&key, &model)
+        .with_base_url(&url)
+        .with_provider_label("vllm");
     if let Some(hints) = p.model_hints {
         provider = provider.with_hints(hints);
     }

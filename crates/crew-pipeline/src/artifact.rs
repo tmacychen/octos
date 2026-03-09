@@ -44,8 +44,7 @@ impl ArtifactStore {
 
     /// Store an artifact for a node. Automatically chooses memory vs disk.
     pub fn put(&mut self, node_id: &str, content: &str) -> std::io::Result<()> {
-        validate_pipeline_id(node_id)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        validate_pipeline_id(node_id).map_err(|e| std::io::Error::other(e.to_string()))?;
         if content.len() > SPILL_THRESHOLD {
             if let Some(ref dir) = self.run_dir {
                 let artifact_dir = dir.join("artifacts");

@@ -309,7 +309,10 @@ mod tests {
         // Should NOT trigger RestartRequired for provider-only change
         match change {
             Some(ConfigChange::RestartRequired(fields)) => {
-                panic!("provider change should not require restart, got fields: {:?}", fields);
+                panic!(
+                    "provider change should not require restart, got fields: {:?}",
+                    fields
+                );
             }
             _ => {} // None or HotReload is fine
         }

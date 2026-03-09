@@ -42,6 +42,10 @@ pub struct TelegramChannel {
     shutdown: Arc<AtomicBool>,
     media_dir: PathBuf,
     http: Client,
+    /// Bot username (without @) for mention-gating in groups.
+    bot_username: Option<String>,
+    /// If true, only respond in group chats when @mentioned or replied to.
+    require_mention: bool,
 }
 
 impl TelegramChannel {
@@ -57,6 +61,50 @@ impl TelegramChannel {
             shutdown,
             media_dir,
             http: Client::new(),
+            bot_username: None,
+            require_mention: false,
+        }
+    }
+
+    /// Enable mention-gating: bot only responds in groups when @mentioned or replied to.
+    pub fn with_mention_gating(mut self, bot_username: Option<String>) -> Self {
+        if let Some(username) = bot_username {
+            self.bot_username = Some(username);
+            self.require_mention = true;
+        }
+        self
+    }
+
+    /// Check if the bot is mentioned in group messages.
+    /// Returns `true` if the message should be processed, `false` if it should be ignored.
+    fn should_respond_in_group(&self, text: &str, is_group: bool, is_reply_to_bot: bool) -> bool {
+        if !is_group || !self.require_mention {
+            return true; // DMs always respond; non-gated groups respond to all
+        }
+        if is_reply_to_bot {
+            return true; // Replies to the bot always trigger
+        }
+        // Check for @mention
+        if let Some(ref username) = self.bot_username {
+            let mention = format!("@{username}");
+            if text.contains(&mention) {
+                return true;
+            }
+        }
+        // Check for bot commands (start with /)
+        if text.starts_with('/') {
+            return true;
+        }
+        false
+    }
+
+    /// Strip the bot @mention from message text.
+    fn strip_mention(&self, text: &str) -> String {
+        if let Some(ref username) = self.bot_username {
+            let mention = format!("@{username}");
+            text.replace(&mention, "").trim().to_string()
+        } else {
+            text.to_string()
         }
     }
 
@@ -132,6 +180,14 @@ impl TelegramChannel {
             BotCommand::new("sessions", "List and switch sessions"),
             BotCommand::new("back", "Switch to previous session"),
             BotCommand::new("delete", "Delete a named session"),
+            BotCommand::new(
+                "adaptive",
+                "View/change adaptive routing (off|hedge|lane|qos)",
+            ),
+            BotCommand::new(
+                "queue",
+                "View/change queue mode (followup|collect|steer|interrupt|spec)",
+            ),
         ];
         match self.bot.set_my_commands(commands).await {
             Ok(_) => info!("Telegram bot commands registered"),
@@ -225,7 +281,20 @@ impl Channel for TelegramChannel {
                 match update.kind {
                     UpdateKind::Message(msg) => {
                         // Extract text: plain text or caption (for photos/documents)
-                        let text = msg.text().or(msg.caption()).unwrap_or("").to_string();
+                        let mut text = msg.text().or(msg.caption()).unwrap_or("").to_string();
+
+                        // Mention-gating: in groups, only respond to @mentions, replies, or commands
+                        let is_group = msg.chat.is_group() || msg.chat.is_supergroup();
+                        let is_reply_to_bot = msg
+                            .reply_to_message()
+                            .is_some_and(|r| r.from.as_ref().is_some_and(|u| u.is_bot));
+                        if !self.should_respond_in_group(&text, is_group, is_reply_to_bot) {
+                            continue;
+                        }
+                        // Strip @mention from text so the LLM sees clean input
+                        if is_group {
+                            text = self.strip_mention(&text);
+                        }
 
                         // Download media attachments with timeout so we don't block polling
                         let mut media = Vec::new();
@@ -608,6 +677,17 @@ impl Channel for TelegramChannel {
         }
         Ok(())
     }
+
+    // NOTE: Telegram's send() already converts Markdown → HTML internally,
+    // so format_outbound() is intentionally not overridden here (uses default pass-through).
+    // This avoids double-conversion when the dispatcher calls format_outbound() + send().
+
+    async fn health_check(&self) -> Result<crate::channel::ChannelHealth> {
+        match self.bot.get_me().await {
+            Ok(_) => Ok(crate::channel::ChannelHealth::Healthy),
+            Err(e) => Ok(crate::channel::ChannelHealth::Down(e.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -621,6 +701,20 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             media_dir: PathBuf::from("/tmp/test-media"),
             http: Client::new(),
+            bot_username: None,
+            require_mention: false,
+        }
+    }
+
+    fn make_channel_with_mention_gating(allowed: Vec<&str>, bot_username: &str) -> TelegramChannel {
+        TelegramChannel {
+            bot: Bot::new("test:token"),
+            allowed_senders: allowed.into_iter().map(String::from).collect(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            media_dir: PathBuf::from("/tmp/test-media"),
+            http: Client::new(),
+            bot_username: Some(bot_username.to_string()),
+            require_mention: true,
         }
     }
 
@@ -735,5 +829,51 @@ mod tests {
         let truncated = TelegramChannel::truncate_caption(&text);
         assert_eq!(truncated.chars().count(), CAPTION_MAX_CHARS);
         assert!(truncated.ends_with('\u{2026}')); // ellipsis
+    }
+
+    // ── Mention-gating tests ───────────────────────────────────────────
+
+    #[test]
+    fn should_respond_in_dm_without_mention() {
+        let ch = make_channel_with_mention_gating(vec![], "MyBot");
+        assert!(ch.should_respond_in_group("hello", false, false));
+    }
+
+    #[test]
+    fn should_ignore_group_message_without_mention() {
+        let ch = make_channel_with_mention_gating(vec![], "MyBot");
+        assert!(!ch.should_respond_in_group("hello everyone", true, false));
+    }
+
+    #[test]
+    fn should_respond_in_group_when_mentioned() {
+        let ch = make_channel_with_mention_gating(vec![], "MyBot");
+        assert!(ch.should_respond_in_group("@MyBot what is this?", true, false));
+    }
+
+    #[test]
+    fn should_respond_in_group_when_replied_to() {
+        let ch = make_channel_with_mention_gating(vec![], "MyBot");
+        assert!(ch.should_respond_in_group("yes please", true, true));
+    }
+
+    #[test]
+    fn should_respond_in_group_for_commands() {
+        let ch = make_channel_with_mention_gating(vec![], "MyBot");
+        assert!(ch.should_respond_in_group("/new topic", true, false));
+    }
+
+    #[test]
+    fn should_respond_in_group_when_gating_disabled() {
+        let ch = make_channel(vec![]);
+        assert!(ch.should_respond_in_group("random message", true, false));
+    }
+
+    #[test]
+    fn should_strip_mention_from_text() {
+        let ch = make_channel_with_mention_gating(vec![], "MyBot");
+        assert_eq!(ch.strip_mention("@MyBot summarize this"), "summarize this");
+        assert_eq!(ch.strip_mention("hello @MyBot"), "hello");
+        assert_eq!(ch.strip_mention("no mention here"), "no mention here");
     }
 }

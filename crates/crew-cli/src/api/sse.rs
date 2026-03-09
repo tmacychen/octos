@@ -32,7 +32,29 @@ impl ProgressReporter for SseBroadcaster {
     }
 }
 
-fn event_to_json(event: &ProgressEvent) -> serde_json::Value {
+/// Per-request reporter that sends serialized SSE events through an mpsc channel.
+/// Used by the streaming POST /api/chat handler to isolate events per request.
+pub(crate) struct ChannelReporter {
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl ChannelReporter {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
+        Self { tx }
+    }
+}
+
+impl ProgressReporter for ChannelReporter {
+    fn report(&self, event: ProgressEvent) {
+        let json = match serde_json::to_string(&event_to_json(&event)) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+        let _ = self.tx.send(json);
+    }
+}
+
+pub(crate) fn event_to_json(event: &ProgressEvent) -> serde_json::Value {
     match event {
         ProgressEvent::ToolStarted { name, .. } => {
             serde_json::json!({"type": "tool_start", "tool": name})

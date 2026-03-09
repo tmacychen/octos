@@ -23,7 +23,6 @@ pub struct ToolAdjustment {
     pub extras: Vec<String>,
 }
 
-
 /// Registry of provider-specific tool adjustments.
 pub struct ProviderToolsets {
     adjustments: HashMap<String, ToolAdjustment>,
@@ -63,11 +62,7 @@ impl ProviderToolsets {
         registry.register(
             "anthropic",
             ToolAdjustment {
-                prefer: vec![
-                    "edit_file".into(),
-                    "diff_edit".into(),
-                    "read_file".into(),
-                ],
+                prefer: vec!["edit_file".into(), "diff_edit".into(), "read_file".into()],
                 demote: vec![],
                 aliases: HashMap::new(),
                 extras: vec![],

@@ -53,7 +53,10 @@ impl Checkpoint {
 
     /// Count completed nodes by status.
     pub fn count_by_status(&self, status: OutcomeStatus) -> usize {
-        self.completed.values().filter(|o| o.status == status).count()
+        self.completed
+            .values()
+            .filter(|o| o.status == status)
+            .count()
     }
 }
 
@@ -72,8 +75,7 @@ impl CheckpointStore {
 
     /// Save checkpoint to disk (atomic write-then-rename).
     pub fn save(&self, checkpoint: &Checkpoint) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(checkpoint)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(checkpoint).map_err(std::io::Error::other)?;
         let tmp_path = self.path.with_extension("json.tmp");
         std::fs::write(&tmp_path, json)?;
         std::fs::rename(&tmp_path, &self.path)
@@ -85,8 +87,7 @@ impl CheckpointStore {
             return Ok(None);
         }
         let data = std::fs::read_to_string(&self.path)?;
-        let checkpoint: Checkpoint = serde_json::from_str(&data)
-            .map_err(std::io::Error::other)?;
+        let checkpoint: Checkpoint = serde_json::from_str(&data).map_err(std::io::Error::other)?;
         Ok(Some(checkpoint))
     }
 

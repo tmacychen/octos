@@ -56,7 +56,11 @@ impl Turn {
     }
 
     /// Create a tool result turn.
-    pub fn tool_result(tool_name: impl Into<String>, content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
+    pub fn tool_result(
+        tool_name: impl Into<String>,
+        content: impl Into<String>,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
         Self {
             message: Message {
                 role: MessageRole::Tool,
@@ -108,10 +112,7 @@ impl Turn {
 
     /// Check if this is a user-originated turn (input or steering).
     pub fn is_user_originated(&self) -> bool {
-        matches!(
-            self.kind,
-            TurnKind::UserInput | TurnKind::SteeringFollowUp
-        )
+        matches!(self.kind, TurnKind::UserInput | TurnKind::SteeringFollowUp)
     }
 
     /// Check if this is a tool result.

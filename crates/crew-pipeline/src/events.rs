@@ -246,7 +246,10 @@ mod tests {
         let events = handler.events();
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], PipelineEvent::PipelineStarted { .. }));
-        assert!(matches!(&events[1], PipelineEvent::PipelineCompleted { .. }));
+        assert!(matches!(
+            &events[1],
+            PipelineEvent::PipelineCompleted { .. }
+        ));
     }
 
     #[test]

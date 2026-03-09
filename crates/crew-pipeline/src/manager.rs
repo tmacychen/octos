@@ -51,7 +51,6 @@ pub enum SupervisionStrategy {
     RetryFailed { max_retries: u32 },
 }
 
-
 /// Trait for executing child pipelines.
 #[async_trait]
 pub trait ChildExecutor: Send + Sync {
@@ -217,8 +216,16 @@ mod tests {
     #[tokio::test]
     async fn should_succeed_when_all_pass() {
         let executor = Arc::new(MockExecutor::new(vec![
-            ChildResult { name: "a".into(), success: true, output: "ok".into() },
-            ChildResult { name: "b".into(), success: true, output: "ok".into() },
+            ChildResult {
+                name: "a".into(),
+                success: true,
+                output: "ok".into(),
+            },
+            ChildResult {
+                name: "b".into(),
+                success: true,
+                output: "ok".into(),
+            },
         ]));
         let mgr = PipelineManager::new(SupervisionStrategy::AllOrNothing, executor);
         let outcome = mgr.run(vec![make_spec("a"), make_spec("b")]).await.unwrap();
@@ -229,8 +236,16 @@ mod tests {
     #[tokio::test]
     async fn should_fail_on_first_failure_all_or_nothing() {
         let executor = Arc::new(MockExecutor::new(vec![
-            ChildResult { name: "a".into(), success: false, output: "err".into() },
-            ChildResult { name: "b".into(), success: true, output: "ok".into() },
+            ChildResult {
+                name: "a".into(),
+                success: false,
+                output: "err".into(),
+            },
+            ChildResult {
+                name: "b".into(),
+                success: true,
+                output: "ok".into(),
+            },
         ]));
         let mgr = PipelineManager::new(SupervisionStrategy::AllOrNothing, executor);
         let outcome = mgr.run(vec![make_spec("a"), make_spec("b")]).await.unwrap();
@@ -243,8 +258,16 @@ mod tests {
     #[tokio::test]
     async fn should_continue_on_failure_best_effort() {
         let executor = Arc::new(MockExecutor::new(vec![
-            ChildResult { name: "a".into(), success: false, output: "err".into() },
-            ChildResult { name: "b".into(), success: true, output: "ok".into() },
+            ChildResult {
+                name: "a".into(),
+                success: false,
+                output: "err".into(),
+            },
+            ChildResult {
+                name: "b".into(),
+                success: true,
+                output: "ok".into(),
+            },
         ]));
         let mgr = PipelineManager::new(SupervisionStrategy::BestEffort, executor);
         let outcome = mgr.run(vec![make_spec("a"), make_spec("b")]).await.unwrap();
@@ -256,9 +279,11 @@ mod tests {
     async fn should_convert_to_node_outcome() {
         let outcome = ManagerOutcome {
             success: true,
-            results: vec![
-                ChildResult { name: "a".into(), success: true, output: "done".into() },
-            ],
+            results: vec![ChildResult {
+                name: "a".into(),
+                success: true,
+                output: "done".into(),
+            }],
             failures: vec![],
         };
         let node = outcome.to_node_outcome("manager_node");
@@ -269,6 +294,9 @@ mod tests {
 
     #[test]
     fn should_default_to_all_or_nothing() {
-        assert_eq!(SupervisionStrategy::default(), SupervisionStrategy::AllOrNothing);
+        assert_eq!(
+            SupervisionStrategy::default(),
+            SupervisionStrategy::AllOrNothing
+        );
     }
 }

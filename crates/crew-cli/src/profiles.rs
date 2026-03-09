@@ -95,23 +95,74 @@ pub struct EmailSettings {
     pub smtp_port: Option<u16>,
     #[serde(default)]
     pub username: Option<String>,
-    /// Env var name holding the SMTP password.
+    /// Env var name holding the SMTP password (legacy).
     #[serde(default)]
     pub password_env: Option<String>,
+    /// SMTP password (literal value, preferred over password_env).
+    #[serde(default)]
+    pub password: Option<String>,
     #[serde(default)]
     pub from_address: Option<String>,
 
     // -- Feishu/Lark fields --
     #[serde(default)]
     pub feishu_app_id: Option<String>,
-    /// Env var name holding the Feishu app secret.
+    /// Env var name holding the Feishu app secret (legacy).
     #[serde(default)]
     pub feishu_app_secret_env: Option<String>,
+    /// Feishu app secret (literal value, preferred over feishu_app_secret_env).
+    #[serde(default)]
+    pub feishu_app_secret: Option<String>,
     #[serde(default)]
     pub feishu_from_address: Option<String>,
     /// "cn" (default) or "global".
     #[serde(default)]
     pub feishu_region: Option<String>,
+}
+
+impl EmailSettings {
+    /// Return env var pairs that the `send_email` plugin expects.
+    /// `env_vars` is the profile's env_vars map used to resolve `password_env`.
+    pub fn to_env_vars(&self, env_vars: &HashMap<String, String>) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(ref h) = self.smtp_host {
+            out.push(("SMTP_HOST".into(), h.clone()));
+        }
+        if let Some(p) = self.smtp_port {
+            out.push(("SMTP_PORT".into(), p.to_string()));
+        }
+        if let Some(ref u) = self.username {
+            out.push(("SMTP_USERNAME".into(), u.clone()));
+        }
+        if let Some(ref f) = self.from_address {
+            out.push(("SMTP_FROM".into(), f.clone()));
+        }
+        // Resolve password: direct `password` field preferred, then `password_env` lookup
+        if let Some(ref pw) = self.password {
+            out.push(("SMTP_PASSWORD".into(), pw.clone()));
+        } else if let Some(ref pw_env) = self.password_env {
+            if let Some(pw_val) = env_vars.get(pw_env) {
+                out.push(("SMTP_PASSWORD".into(), pw_val.clone()));
+            }
+        }
+        if let Some(ref id) = self.feishu_app_id {
+            out.push(("LARK_APP_ID".into(), id.clone()));
+        }
+        if let Some(ref secret) = self.feishu_app_secret {
+            out.push(("LARK_APP_SECRET".into(), secret.clone()));
+        } else if let Some(ref secret_env) = self.feishu_app_secret_env {
+            if let Some(secret_val) = env_vars.get(secret_env) {
+                out.push(("LARK_APP_SECRET".into(), secret_val.clone()));
+            }
+        }
+        if let Some(ref f) = self.feishu_from_address {
+            out.push(("LARK_FROM_ADDRESS".into(), f.clone()));
+        }
+        if let Some(ref r) = self.feishu_region {
+            out.push(("LARK_REGION".into(), r.clone()));
+        }
+        out
+    }
 }
 
 /// A fallback model entry for the provider failover chain.
@@ -629,9 +680,11 @@ pub(crate) fn config_from_profile(
                 smtp_port: e.smtp_port,
                 username: e.username.clone(),
                 password_env: e.password_env.clone(),
+                password: e.password.clone(),
                 from_address: e.from_address.clone(),
                 feishu_app_id: e.feishu_app_id.clone(),
                 feishu_app_secret_env: e.feishu_app_secret_env.clone(),
+                feishu_app_secret: e.feishu_app_secret.clone(),
                 feishu_from_address: e.feishu_from_address.clone(),
                 feishu_region: e.feishu_region.clone(),
             }),

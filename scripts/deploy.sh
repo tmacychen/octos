@@ -15,7 +15,7 @@ PW_2="vbasx129"
 TARGET="${1:-all}"
 REMOTE_BIN="/Users/cloud/.cargo/bin"
 PLIST="io.ominix.crew-serve"
-BINARIES=(crew news_fetch deep-search deep_crawl send_email account_manager asr clock weather)
+BINARIES=(crew news_fetch deep-search deep_crawl send_email account_manager voice clock weather)
 
 ssh_cmd() {
     local idx=$1; shift
@@ -43,8 +43,8 @@ esac
 
 # --- Build ---
 echo "==> Building release binaries..."
-cargo build --release -p crew-cli --features telegram,whatsapp,feishu,twilio,api
-cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p asr -p clock -p weather
+cargo build --release -p crew-cli --features telegram,whatsapp,feishu,twilio,wecom,api
+cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather
 
 # Build ominix-api if source is available
 OMINIX_DIR="${OMINIX_DIR:-$HOME/home/ominix-api}"
@@ -102,9 +102,34 @@ for idx in $TARGETS; do
         if ssh_cmd "$idx" "[ -f /tmp/mlx.metallib.new ]" 2>/dev/null; then
             ssh_cmd "$idx" "mv /tmp/mlx.metallib.new ${REMOTE_BIN}/mlx.metallib"
         fi
-        # Create launchd plist for ominix-api if it doesn't exist
-        ssh_cmd "$idx" 'if [ ! -f ~/Library/LaunchAgents/io.ominix.ominix-api.plist ]; then
-cat > ~/Library/LaunchAgents/io.ominix.ominix-api.plist << '"'"'PEOF'"'"'
+    fi
+
+    # (Re)generate ominix-api launchd plist with auto-detected models
+    echo "==> Configuring ominix-api service..."
+    ssh_cmd "$idx" 'bash -c '"'"'mkdir -p ~/.ominix
+# Find ominix-api binary (prefer ~/.cargo/bin)
+OMINIX_BIN="$(command -v ominix-api 2>/dev/null || echo /Users/cloud/.cargo/bin/ominix-api)"
+# Find models dir (prefer ~/.ominix/models, fallback ~/.OminiX/models)
+if [ -d ~/.ominix/models ]; then MODELS_DIR=~/.ominix/models
+elif [ -d ~/.OminiX/models ]; then MODELS_DIR=~/.OminiX/models
+else MODELS_DIR=~/.ominix/models; mkdir -p "$MODELS_DIR"; fi
+# Auto-detect ASR model (use find to avoid zsh glob errors)
+ASR_MODEL="$(find "$MODELS_DIR" -maxdepth 1 -type d \( -name "Qwen3-ASR-*" -o -name "qwen3-asr-*" \) 2>/dev/null | head -1)"
+# Auto-detect TTS model
+TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 -type d \( -name "Qwen3-TTS-*" -o -name "qwen3-tts-*" \) 2>/dev/null | head -1)"
+# Build ProgramArguments
+ARGS="        <string>$OMINIX_BIN</string>
+        <string>--port</string>
+        <string>8080</string>
+        <string>--models-dir</string>
+        <string>$MODELS_DIR</string>"
+[ -n "$ASR_MODEL" ] && ARGS="$ARGS
+        <string>--asr-model</string>
+        <string>$ASR_MODEL</string>"
+[ -n "$TTS_MODEL" ] && ARGS="$ARGS
+        <string>--tts-model</string>
+        <string>$TTS_MODEL</string>"
+cat > ~/Library/LaunchAgents/io.ominix.ominix-api.plist << PEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -113,11 +138,7 @@ cat > ~/Library/LaunchAgents/io.ominix.ominix-api.plist << '"'"'PEOF'"'"'
     <string>io.ominix.ominix-api</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/cloud/.cargo/bin/ominix-api</string>
-        <string>--port</string>
-        <string>8080</string>
-        <string>--models-dir</string>
-        <string>/Users/cloud/.OminiX/models</string>
+$ARGS
     </array>
     <key>KeepAlive</key>
     <true/>
@@ -130,33 +151,49 @@ cat > ~/Library/LaunchAgents/io.ominix.ominix-api.plist << '"'"'PEOF'"'"'
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/cloud/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/cloud/.local/bin:/Users/cloud/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 </dict>
 </plist>
 PEOF
-echo "  ominix-api plist created"
-fi'
-        ssh_cmd "$idx" "launchctl load ~/Library/LaunchAgents/io.ominix.ominix-api.plist"
-        echo "    ominix-api service started"
-    fi
+echo "  ASR model: ${ASR_MODEL:-NOT FOUND}"
+echo "  TTS model: ${TTS_MODEL:-NOT FOUND}"
+echo "  ominix-api plist generated"'"'"
+    ssh_cmd "$idx" "launchctl load ~/Library/LaunchAgents/io.ominix.ominix-api.plist 2>/dev/null || true"
+    echo "    ominix-api service started"
 
-    echo "==> Ensuring ffmpeg is installed..."
-    ssh_cmd "$idx" 'command -v ffmpeg &>/dev/null && echo "  ffmpeg: OK" || {
-        if command -v brew &>/dev/null; then brew install ffmpeg; else echo "  WARN: install ffmpeg manually"; fi
-    }' || echo "  WARN: could not check ffmpeg"
+    echo "==> Ensuring Homebrew and ffmpeg are installed..."
+    ssh_cmd "$idx" 'bash -c '\''
+        if ! command -v brew &>/dev/null; then
+            echo "  Installing Homebrew..."
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        fi
+        if ! command -v ffmpeg &>/dev/null; then
+            echo "  Installing ffmpeg..."
+            brew install ffmpeg
+        else
+            echo "  ffmpeg: OK"
+        fi
+    '\'''
 
     echo "==> Cleaning stale skill dirs (bootstrap recreates them)..."
-    for skill in news deep-search deep-crawl send-email account-manager asr clock weather; do
+    for skill in news deep-search deep-crawl send-email account-manager voice clock weather; do
         ssh_cmd "$idx" "rm -rf /Users/cloud/.crew/skills/${skill}" 2>/dev/null || true
     done
     # Also clean bundled-app-skills and platform-skills so bootstrap picks up new binaries
     ssh_cmd "$idx" "rm -rf /Users/cloud/.crew/bundled-app-skills /Users/cloud/.crew/platform-skills" 2>/dev/null || true
 
-    # Check ASR/TTS models
+    # Verify voice models
     echo "==> Checking voice models..."
-    ssh_cmd "$idx" "ls -d ~/.OminiX/models/qwen3-asr-1.7b 2>/dev/null && echo '  ASR model: OK' || echo '  WARN: ASR model not found'"
-    ssh_cmd "$idx" "ls -d ~/.OminiX/models/qwen3-tts 2>/dev/null && echo '  TTS model: OK' || echo '  WARN: TTS model not found'"
+    ssh_cmd "$idx" 'bash -c '"'"'for d in ~/.ominix/models ~/.OminiX/models; do
+        [ -d "$d" ] || continue
+        ASR="$(find "$d" -maxdepth 1 -type d \( -name "Qwen3-ASR-*" -o -name "qwen3-asr-*" \) 2>/dev/null | head -1)"
+        TTS="$(find "$d" -maxdepth 1 -type d \( -name "Qwen3-TTS-*" -o -name "qwen3-tts-*" \) 2>/dev/null | head -1)"
+        [ -n "$ASR" ] && echo "  ASR: $(basename $ASR)" || echo "  ASR: NOT FOUND"
+        [ -n "$TTS" ] && echo "  TTS: $(basename $TTS)" || echo "  TTS: NOT FOUND"
+        break
+    done'"'"
 
     echo "==> Starting launchd service..."
     ssh_cmd "$idx" "launchctl load ~/Library/LaunchAgents/${PLIST}.plist"

@@ -98,9 +98,13 @@ impl ServeCommand {
         let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
 
+        let broadcaster = Arc::new(SseBroadcaster::new(256));
+
         // Try to create the LLM provider + agent, but don't fail if no API key.
         // The admin dashboard works without it.
-        let agent_and_sessions = self.try_create_agent(&config, &cwd, &data_dir).await;
+        let agent_and_sessions = self
+            .try_create_agent(&config, &cwd, &data_dir, broadcaster.clone())
+            .await;
 
         let (agent, sessions) = match agent_and_sessions {
             Ok((a, s)) => (Some(Arc::new(a)), Some(s)),
@@ -110,8 +114,6 @@ impl ServeCommand {
                 (None, None)
             }
         };
-
-        let broadcaster = Arc::new(SseBroadcaster::new(256));
         let metrics_handle = Some(init_metrics());
 
         // Security: warn if binding to non-localhost without auth token
@@ -155,6 +157,7 @@ impl ServeCommand {
                 .with_bridge_js(bridge_js_path)
                 .with_serve_config(self.port, auth_token.clone()),
         );
+        process_manager.set_self_ref();
 
         // Initialize user store and auth manager for multi-user support
         let user_store = Arc::new(
@@ -483,6 +486,7 @@ impl ServeCommand {
         config: &Config,
         cwd: &std::path::Path,
         data_dir: &std::path::Path,
+        broadcaster: Arc<crate::api::SseBroadcaster>,
     ) -> Result<(Agent, Arc<tokio::sync::Mutex<SessionManager>>)> {
         let model = self.model.clone().or(config.model.clone());
         let base_url = config.base_url.clone();
@@ -537,14 +541,19 @@ impl ServeCommand {
         crew_agent::bootstrap::bootstrap_bundled_skills(&crew_home);
         crew_agent::bootstrap::bootstrap_platform_skills(&crew_home);
 
-        // Plugins (includes bootstrapped skills from bundled-app-skills/ and platform-skills/)
-        let plugin_dirs = Config::plugin_dirs(cwd);
+        // Plugins (includes bootstrapped skills from bundled-app-skills/)
+        let mut plugin_dirs = Config::plugin_dirs(cwd);
+        // Platform skills are admin-only — add them here (not in Config::plugin_dirs)
+        let platform_dir = crew_home.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR);
+        if platform_dir.exists() {
+            plugin_dirs.push(platform_dir);
+        }
         if !plugin_dirs.is_empty() {
             let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs);
         }
 
         let reporter: Arc<dyn crew_agent::ProgressReporter> =
-            Arc::new(MetricsReporter::new(Arc::new(crew_agent::SilentReporter)));
+            Arc::new(MetricsReporter::new(broadcaster));
 
         let mut agent = Agent::new(AgentId::new("api"), llm, tools, memory)
             .with_config(AgentConfig {

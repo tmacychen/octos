@@ -68,7 +68,11 @@ impl ModelStylesheet {
             }
         }
 
-        for rule in wildcard_rules.iter().chain(&handler_rules).chain(&node_rules) {
+        for rule in wildcard_rules
+            .iter()
+            .chain(&handler_rules)
+            .chain(&node_rules)
+        {
             if let Some(ref m) = rule.model {
                 result.model = Some(m.clone());
             }

@@ -14,6 +14,7 @@ pub mod embedding;
 mod failover;
 pub mod pricing;
 mod provider;
+pub mod responsiveness;
 mod retry;
 pub mod router;
 pub mod sse;
@@ -36,24 +37,25 @@ pub mod openrouter;
 pub mod registry;
 
 pub use adaptive::{
-    AdaptiveConfig, AdaptiveRouter, MetricsSnapshot, SharedMetrics, SharedPolicy,
-    SharedProviderMetrics,
+    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, MetricsSnapshot, SharedMetrics,
+    SharedPolicy, SharedProviderMetrics,
 };
+pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};
 pub use context_override::ContextWindowOverride;
 pub use embedding::{EmbeddingProvider, OpenAIEmbedder};
+pub use error::{LlmError, LlmErrorKind};
 pub use failover::ProviderChain;
+pub use high_level::LlmClient;
+pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use ominix::{OminixClient, PlatformModels};
 pub use provider::{
     DEFAULT_EMBEDDING_CONNECT_TIMEOUT_SECS, DEFAULT_EMBEDDING_TIMEOUT_SECS,
     DEFAULT_LLM_CONNECT_TIMEOUT_SECS, DEFAULT_LLM_TIMEOUT_SECS, LlmProvider, build_http_client,
 };
+pub use responsiveness::ResponsivenessObserver;
 pub use retry::{RetryConfig, RetryProvider};
 pub use router::{ProviderRouter, SubProviderMeta};
-pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
-pub use error::{LlmError, LlmErrorKind};
-pub use high_level::LlmClient;
-pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use stream_accumulator::StreamAccumulator;
 pub use swappable::SwappableProvider;
 pub use types::{

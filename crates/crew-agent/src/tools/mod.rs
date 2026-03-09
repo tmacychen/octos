@@ -9,6 +9,17 @@ use crew_core::TokenUsage;
 use crew_llm::ToolSpec;
 use eyre::Result;
 
+/// Progress update from a long-running tool execution.
+#[derive(Debug, Clone)]
+pub enum ToolProgress {
+    /// Status text update (e.g., "Searching 3 of 10 sources...").
+    Status(String),
+    /// Percentage completion (0..100).
+    Percent(u8),
+    /// Intermediate result available (e.g., partial research findings).
+    Intermediate { summary: String },
+}
+
 /// Result of executing a tool.
 #[derive(Default)]
 pub struct ToolResult {
