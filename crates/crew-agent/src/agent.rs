@@ -18,7 +18,15 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use crate::hooks::{HookContext, HookEvent, HookExecutor, HookPayload, HookResult};
 use crate::loop_detect::LoopDetector;
 use crate::progress::{ProgressEvent, ProgressReporter, SilentReporter};
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolContext, ToolRegistry, TOOL_CTX};
+
+tokio::task_local! {
+    /// Task-local reporter override.  When set (via `TASK_REPORTER.scope()`),
+    /// `Agent::reporter()` returns this instead of the instance-level RwLock
+    /// reporter.  This lets concurrent overflow tasks each have their own
+    /// stream reporter without mutating the shared `Arc<Agent>`.
+    pub static TASK_REPORTER: Arc<dyn ProgressReporter>;
+}
 
 /// Compiled-in default worker prompt (from `prompts/worker.txt`).
 pub const DEFAULT_WORKER_PROMPT: &str = include_str!("prompts/worker.txt");
@@ -42,9 +50,11 @@ pub struct AgentConfig {
 }
 
 /// Default tool execution timeout in seconds.
-pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 600;
+/// Maximum tool timeout the LLM can request (30 minutes).
+pub const MAX_TOOL_TIMEOUT_SECS: u64 = 1800;
 /// Default session processing timeout in seconds.
-pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 600;
+pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 1800;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -218,12 +228,19 @@ impl Agent {
         *self.reporter.write().unwrap_or_else(|e| e.into_inner()) = reporter;
     }
 
-    /// Get a clone of the current reporter (cheap Arc clone through read lock).
+    /// Get a clone of the current reporter.
+    ///
+    /// Checks `TASK_REPORTER` task-local first (set per-overflow-task), then
+    /// falls back to the instance-level RwLock reporter.
     fn reporter(&self) -> Arc<dyn ProgressReporter> {
-        self.reporter
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        TASK_REPORTER
+            .try_with(|r| r.clone())
+            .unwrap_or_else(|_| {
+                self.reporter
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            })
     }
 
     /// Set the shutdown signal.
@@ -422,7 +439,9 @@ impl Agent {
             let tools_spec = self.tools.specs();
             self.trim_to_context_window(&mut messages);
             normalize_system_messages(&mut messages);
+            repair_message_order(&mut messages);
             repair_tool_pairs(&mut messages);
+            truncate_old_tool_results(&mut messages);
 
             tracing::info!(
                 iteration,
@@ -431,9 +450,26 @@ impl Agent {
                 message_bytes = messages.iter().map(|m| m.content.len()).sum::<usize>(),
                 "calling LLM"
             );
-            let (response, streamed) = self
+            let (response, streamed) = match self
                 .call_llm_with_hooks(&messages, &tools_spec, &config, iteration, &total_usage)
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) if e.to_string().contains("empty response after") => {
+                    // Empty response after retries — try once more (adaptive router
+                    // may select a different provider on this second attempt).
+                    warn!(error = %e, "retrying LLM call for adaptive failover");
+                    self.reporter().report(ProgressEvent::LlmStatus {
+                        message: "Switching provider...".to_string(),
+                        iteration,
+                    });
+                    self.call_llm_with_hooks(
+                        &messages, &tools_spec, &config, iteration, &total_usage,
+                    )
+                    .await?
+                }
+                Err(e) => return Err(e),
+            };
             {
                 let tool_names: Vec<&str> = response
                     .tool_calls
@@ -904,7 +940,13 @@ impl Agent {
                         }
                     }
 
-                    let result = tools.execute(&tc_name, &tc_args).await;
+                    let ctx = ToolContext {
+                        tool_id: tc_id.clone(),
+                        reporter: reporter.clone(),
+                    };
+                    let result = TOOL_CTX
+                        .scope(ctx, tools.execute(&tc_name, &tc_args))
+                        .await;
 
                     let duration = tool_start.elapsed();
 
@@ -998,7 +1040,23 @@ impl Agent {
             })
             .collect();
 
-        let tool_timeout_secs = self.config.tool_timeout_secs;
+        // Let the LLM specify per-tool timeout via `timeout_secs` in tool call args.
+        // Use the max of all requested timeouts, clamped to MAX_TOOL_TIMEOUT_SECS.
+        let llm_requested_timeout: u64 = response
+            .tool_calls
+            .iter()
+            .filter_map(|tc| {
+                tc.arguments
+                    .get("timeout_secs")
+                    .and_then(|v| v.as_u64())
+            })
+            .max()
+            .unwrap_or(0);
+        let tool_timeout_secs = if llm_requested_timeout > 0 {
+            llm_requested_timeout.min(MAX_TOOL_TIMEOUT_SECS).max(self.config.tool_timeout_secs)
+        } else {
+            self.config.tool_timeout_secs
+        };
         let tool_timeout = Duration::from_secs(tool_timeout_secs);
         let results: Vec<_> =
             match tokio::time::timeout(tool_timeout, futures::future::join_all(handles)).await {
@@ -1434,11 +1492,16 @@ impl Agent {
 
     /// Check if an LLM response is empty or abnormal and should be retried.
     /// Catches:
-    /// - Empty content with no tool calls (including output_tokens > 0 bug)
+    /// - Empty content with no tool calls and no reasoning (including output_tokens > 0 bug)
     /// - Content filtered by safety/moderation
     fn is_retriable_response(response: &ChatResponse) -> bool {
+        let has_reasoning = response
+            .reasoning_content
+            .as_ref()
+            .is_some_and(|r| !r.is_empty());
         let is_empty = response.content.as_ref().is_none_or(|c| c.is_empty())
-            && response.tool_calls.is_empty();
+            && response.tool_calls.is_empty()
+            && !has_reasoning;
         let is_filtered = response.stop_reason == StopReason::ContentFiltered;
         is_empty || is_filtered
     }
@@ -1523,8 +1586,8 @@ impl Agent {
 
             match call_result {
                 Ok((response, streamed)) => {
-                    if !Self::is_retriable_response(&response) || attempt == Self::LLM_RETRY_MAX {
-                        // Success or final attempt — merge retry usage into response
+                    if !Self::is_retriable_response(&response) {
+                        // Genuine success — merge retry usage into response
                         let mut response = response;
                         response.usage.input_tokens += retry_usage.input_tokens;
                         response.usage.output_tokens += retry_usage.output_tokens;
@@ -1558,6 +1621,28 @@ impl Agent {
                         return Ok((response, streamed));
                     }
 
+                    if attempt == Self::LLM_RETRY_MAX {
+                        // All retries exhausted with empty/filtered response — report
+                        // failure to the adaptive router so it can failover, then
+                        // return error.
+                        let reason = if response.stop_reason == StopReason::ContentFiltered {
+                            "content filtered by safety/moderation"
+                        } else {
+                            "empty response (no content or tool_calls)"
+                        };
+                        self.llm.report_late_failure();
+                        warn!(
+                            attempts = Self::LLM_RETRY_MAX + 1,
+                            reason,
+                            "LLM returned empty response after all retries, triggering failover"
+                        );
+                        return Err(eyre::eyre!(
+                            "LLM returned empty response after {} retries: {}",
+                            Self::LLM_RETRY_MAX + 1,
+                            reason
+                        ));
+                    }
+
                     // Empty or abnormal response — accumulate usage and retry
                     retry_usage.input_tokens += response.usage.input_tokens;
                     retry_usage.output_tokens += response.usage.output_tokens;
@@ -1577,6 +1662,15 @@ impl Agent {
                         reason,
                         "abnormal LLM response, retrying"
                     );
+                    self.reporter().report(ProgressEvent::LlmStatus {
+                        message: format!(
+                            "Retrying ({}/{})... {}",
+                            attempt + 1,
+                            Self::LLM_RETRY_MAX + 1,
+                            reason,
+                        ),
+                        iteration,
+                    });
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
@@ -1590,6 +1684,14 @@ impl Agent {
                             iteration,
                             "retryable stream error, retrying"
                         );
+                        self.reporter().report(ProgressEvent::LlmStatus {
+                            message: format!(
+                                "Retrying ({}/{})... stream error",
+                                attempt + 1,
+                                Self::LLM_RETRY_MAX + 1,
+                            ),
+                            iteration,
+                        });
                         last_error = Some(e);
                         tokio::time::sleep(delay).await;
                     } else {
@@ -1721,7 +1823,23 @@ fn normalize_system_messages(messages: &mut Vec<Message>) {
     if messages.len() <= 1 {
         return;
     }
-    // Find all system messages after the first one
+
+    // Convert context-bearing system messages (background task results,
+    // conversation summaries) to user messages so they don't bloat the
+    // system prompt.  These contain prior conversation content, not
+    // instructions for the model.
+    for m in messages.iter_mut().skip(1) {
+        if m.role == MessageRole::System
+            && (m.content.starts_with("[Background task")
+                || m.content.starts_with("[Conversation summary]"))
+        {
+            m.role = MessageRole::User;
+            m.content = format!("[System note] {}", m.content);
+        }
+    }
+
+    // Merge remaining extra system messages (actual instructions) into
+    // the first system prompt.
     let mut extra_indices = Vec::new();
     for (i, m) in messages.iter().enumerate().skip(1) {
         if m.role == MessageRole::System {
@@ -1731,7 +1849,6 @@ fn normalize_system_messages(messages: &mut Vec<Message>) {
     if extra_indices.is_empty() {
         return;
     }
-    // Collect their content
     let extra_content: Vec<String> = extra_indices
         .iter()
         .filter_map(|&i| {
@@ -1739,7 +1856,6 @@ fn normalize_system_messages(messages: &mut Vec<Message>) {
             if c.is_empty() { None } else { Some(c.clone()) }
         })
         .collect();
-    // Merge into first system message
     if !extra_content.is_empty() {
         let first = &mut messages[0];
         for text in extra_content {
@@ -1747,9 +1863,96 @@ fn normalize_system_messages(messages: &mut Vec<Message>) {
             first.content.push_str(&text);
         }
     }
-    // Remove extra system messages in reverse order
     for &i in extra_indices.iter().rev() {
         messages.remove(i);
+    }
+}
+
+/// Gather scattered tool results to be contiguous with their parent assistant.
+///
+/// OpenAI-compatible APIs require: assistant(tool_calls) → tool(result)*
+/// with no other messages in between.  In speculative/concurrent mode,
+/// multiple conversation threads (primary + overflow) save messages to the
+/// same session, so tool results may be separated from their parent by
+/// user messages, system messages, or other threads' tool_call groups.
+///
+/// Strategy:
+/// 1. For each assistant with tool_calls, extract ALL matching tool results
+///    from the entire message list (both before and after the assistant).
+/// 2. Deduplicate by tool_call_id (keep the latest result for each ID).
+/// 3. Re-insert exactly one result per tool_call right after the assistant.
+///
+/// This handles backward-stranded results (e.g. from overflow tasks saving
+/// results before the assistant message) and duplicate results.
+fn repair_message_order(messages: &mut Vec<Message>) {
+    use std::collections::{HashMap, HashSet};
+
+    let mut i = 0;
+    while i < messages.len() {
+        // Find assistant message with tool_calls
+        let has_tool_calls = messages[i].role == MessageRole::Assistant
+            && messages[i]
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tc| !tc.is_empty());
+        if !has_tool_calls {
+            i += 1;
+            continue;
+        }
+
+        // Collect expected tool_call IDs
+        let expected_ids: HashSet<String> = messages[i]
+            .tool_calls
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tc| tc.id.clone())
+            .collect();
+
+        // Extract ALL matching tool results from the entire message list.
+        // For duplicate tool_call_ids, keep the LAST one (most recent result).
+        let mut collected: HashMap<String, Message> = HashMap::new();
+        let mut j = 0;
+        while j < messages.len() {
+            if j == i {
+                j += 1;
+                continue;
+            }
+            let is_match = messages[j].role == MessageRole::Tool
+                && messages[j]
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| expected_ids.contains(id));
+            if is_match {
+                let msg = messages.remove(j);
+                // Overwrite keeps the last occurrence (latest result)
+                let id = msg.tool_call_id.clone().unwrap();
+                collected.insert(id, msg);
+                // Adjust i if we removed before it
+                if j < i {
+                    i -= 1;
+                }
+                continue; // don't increment j — removal shifted elements
+            }
+            j += 1;
+        }
+
+        // Re-insert one result per tool_call right after the assistant,
+        // in the same order as tool_calls appear in the assistant message.
+        let call_ids: Vec<String> = messages[i]
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().map(|tc| tc.id.clone()).collect())
+            .unwrap_or_default();
+        let mut insert_pos = i + 1;
+        for id in &call_ids {
+            if let Some(msg) = collected.remove(id) {
+                messages.insert(insert_pos, msg);
+                insert_pos += 1;
+            }
+        }
+
+        i = insert_pos;
     }
 }
 
@@ -1816,12 +2019,45 @@ fn repair_tool_pairs(messages: &mut Vec<Message>) {
 
     messages.retain(|m| {
         if m.role == MessageRole::Tool {
-            if let Some(ref id) = m.tool_call_id {
-                return remaining_call_ids.contains(id);
+            match m.tool_call_id {
+                Some(ref id) => return remaining_call_ids.contains(id),
+                None => return false, // Tool messages without tool_call_id are invalid
             }
         }
         true
     });
+}
+
+/// Truncate long tool result messages from prior conversation rounds.
+///
+/// When a session contains multi-round conversations, old tool results
+/// (e.g. a 10,000-word research report from `run_pipeline`) dominate the
+/// context window and cause the LLM to re-engage with prior questions
+/// instead of focusing on the latest user message.
+///
+/// This function finds the last user message (the current question) and
+/// truncates tool result messages that appear BEFORE it if they exceed
+/// `MAX_OLD_TOOL_RESULT_CHARS`.  Tool results in the current conversation
+/// round (after the last user message) are kept intact so the agent can
+/// reference them.
+fn truncate_old_tool_results(messages: &mut Vec<Message>) {
+    const MAX_OLD_TOOL_RESULT_CHARS: usize = 800;
+
+    // Find the last user message — everything before it is "old" context
+    let last_user_idx = messages
+        .iter()
+        .rposition(|m| m.role == MessageRole::User);
+    let boundary = match last_user_idx {
+        Some(idx) => idx,
+        None => return, // no user message, nothing to truncate
+    };
+
+    for msg in messages[..boundary].iter_mut() {
+        if msg.role == MessageRole::Tool && msg.content.len() > MAX_OLD_TOOL_RESULT_CHARS {
+            let truncated: String = msg.content.chars().take(MAX_OLD_TOOL_RESULT_CHARS).collect();
+            msg.content = format!("{truncated}\n\n[... truncated for brevity]");
+        }
+    }
 }
 
 fn sanitize_tool_call_id(id: &str) -> String {
@@ -1851,7 +2087,7 @@ mod tests {
         assert_eq!(cfg.max_tokens, None);
         assert_eq!(cfg.max_timeout, Some(Duration::from_secs(600)));
         assert!(cfg.save_episodes);
-        assert_eq!(cfg.tool_timeout_secs, 300);
+        assert_eq!(cfg.tool_timeout_secs, 600);
         assert!(cfg.worker_prompt.is_none());
     }
 
@@ -2147,6 +2383,131 @@ mod tests {
         ];
         repair_tool_pairs(&mut msgs);
         assert_eq!(msgs.len(), 2); // sys, user
+    }
+
+    // ---------- repair_message_order ----------
+
+    #[test]
+    fn should_gather_scattered_tool_result_past_user_message() {
+        // Speculative mode: user sent a new message while tool was running.
+        // Tool result ended up after the user message.
+        let mut msgs = vec![
+            sys("prompt"),
+            assistant_with_tools(&["tc1"]),
+            user("new question"),       // overflow user msg
+            tool_result_msg("tc1"),     // scattered result
+        ];
+        repair_message_order(&mut msgs);
+        // After repair: tool result gathered next to assistant.
+        // User message stays where it is (not displaced).
+        assert_eq!(msgs[0].role, MessageRole::System);
+        assert_eq!(msgs[1].role, MessageRole::Assistant);
+        assert_eq!(msgs[2].role, MessageRole::Tool);        // gathered
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("tc1"));
+        assert_eq!(msgs[3].role, MessageRole::User);        // stays in place
+        assert_eq!(msgs[3].content, "new question");
+    }
+
+    #[test]
+    fn should_gather_scattered_tool_results_past_system_message() {
+        let mut msgs = vec![
+            assistant_with_tools(&["tc1", "tc2"]),
+            tool_result_msg("tc1"),
+            sys("background task result"),  // injected mid-execution
+            tool_result_msg("tc2"),         // scattered
+        ];
+        repair_message_order(&mut msgs);
+        // Both tool results gathered next to assistant, system stays after
+        assert_eq!(msgs[0].role, MessageRole::Assistant);
+        assert_eq!(msgs[1].role, MessageRole::Tool);
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("tc1"));
+        assert_eq!(msgs[2].role, MessageRole::Tool);
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("tc2"));
+        assert_eq!(msgs[3].role, MessageRole::System);
+    }
+
+    #[test]
+    fn should_handle_concurrent_tool_call_threads() {
+        // Two concurrent threads: primary (tc1) and overflow (tc2).
+        // Messages are interleaved by timestamp.
+        let mut msgs = vec![
+            user("make slides"),
+            assistant_with_tools(&["tc1"]),          // primary tool call
+            user("what time is it"),                 // overflow user
+            assistant_with_tools(&["tc2"]),          // overflow tool call
+            tool_result_msg("tc2"),                  // overflow result (fast)
+            tool_result_msg("tc1"),                  // primary result (slow)
+        ];
+        repair_message_order(&mut msgs);
+        // tc1 result should be gathered next to its parent assistant
+        assert_eq!(msgs[0].role, MessageRole::User);
+        assert_eq!(msgs[1].role, MessageRole::Assistant); // tc1 parent
+        assert_eq!(msgs[2].role, MessageRole::Tool);
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("tc1")); // gathered
+        assert_eq!(msgs[3].role, MessageRole::User);      // overflow stays
+        assert_eq!(msgs[4].role, MessageRole::Assistant);  // tc2 parent
+        assert_eq!(msgs[5].role, MessageRole::Tool);
+        assert_eq!(msgs[5].tool_call_id.as_deref(), Some("tc2")); // stays
+    }
+
+    #[test]
+    fn should_not_modify_valid_message_order() {
+        let mut msgs = vec![
+            sys("prompt"),
+            assistant_with_tools(&["tc1"]),
+            tool_result_msg("tc1"),
+            user("thanks"),
+        ];
+        let original_len = msgs.len();
+        repair_message_order(&mut msgs);
+        assert_eq!(msgs.len(), original_len);
+        assert_eq!(msgs[3].content, "thanks");
+    }
+
+    #[test]
+    fn should_gather_backward_stranded_tool_result() {
+        // Bug scenario: overflow saved a tool result BEFORE its parent assistant.
+        // The same tool_call_id appears both before and after the assistant.
+        let mut msgs = vec![
+            sys("prompt"),
+            user("tts"),
+            tool_result_msg("tc1"),               // backward-stranded duplicate
+            assistant_with_tools(&["tc1"]),
+            tool_result_msg("tc1"),               // correct result
+            user("next question"),
+        ];
+        repair_message_order(&mut msgs);
+        // Duplicate removed, one result gathered after assistant
+        assert_eq!(msgs[0].role, MessageRole::System);
+        assert_eq!(msgs[1].role, MessageRole::User);
+        assert_eq!(msgs[1].content, "tts");
+        assert_eq!(msgs[2].role, MessageRole::Assistant);
+        assert_eq!(msgs[3].role, MessageRole::Tool);
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("tc1"));
+        assert_eq!(msgs[4].role, MessageRole::User);
+        assert_eq!(msgs[4].content, "next question");
+        assert_eq!(msgs.len(), 5); // duplicate removed
+    }
+
+    #[test]
+    fn should_remove_tool_result_with_no_tool_call_id() {
+        let mut msgs = vec![
+            sys("prompt"),
+            assistant_with_tools(&["tc1"]),
+            tool_result_msg("tc1"),
+            Message {
+                role: MessageRole::Tool,
+                content: "Tool task panicked".to_string(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None, // no tool_call_id
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            user("thanks"),
+        ];
+        repair_tool_pairs(&mut msgs);
+        assert_eq!(msgs.len(), 4); // sys, assistant, tool(tc1), user
     }
 
     // ---------- sanitize_tool_call_id ----------

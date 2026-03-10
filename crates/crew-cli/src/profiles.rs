@@ -249,6 +249,12 @@ pub enum ChannelCredentials {
         #[serde(default = "default_twilio_webhook_port")]
         webhook_port: u16,
     },
+    Api {
+        #[serde(default = "default_api_port")]
+        port: u16,
+        #[serde(default)]
+        auth_token: Option<String>,
+    },
 }
 
 fn default_telegram_env() -> String {
@@ -292,6 +298,9 @@ fn default_twilio_token_env() -> String {
 }
 fn default_twilio_webhook_port() -> u16 {
     8090
+}
+fn default_api_port() -> u16 {
+    8091
 }
 
 /// Gateway-specific settings.
@@ -401,13 +410,19 @@ impl ProfileStore {
 
     /// Save a profile, merging masked/empty secret values with the existing profile.
     ///
-    /// For each env var: if the incoming value contains "***" or is empty, the
-    /// existing saved value is preserved. This prevents the masked values
-    /// returned by GET from overwriting the real secrets.
+    /// For each env var: if the incoming value is masked (`***`), the keychain
+    /// display indicator, or empty, the existing saved value is preserved.
+    /// This prevents the masked values returned by GET from overwriting
+    /// real secrets or keychain markers.
     pub fn save_with_merge(&self, profile: &mut UserProfile) -> Result<()> {
         if let Some(existing) = self.get(&profile.id)? {
             for (key, new_val) in profile.config.env_vars.iter_mut() {
-                if new_val.contains("***") || new_val.is_empty() {
+                let is_masked = new_val.contains("***")
+                    || new_val.contains(KEYCHAIN_DISPLAY)
+                    || new_val.is_empty();
+                // Never overwrite the real stored value with a display artifact,
+                // but DO allow explicit "keychain:" marker (it's the real value).
+                if is_masked && new_val != crate::auth::KEYCHAIN_MARKER {
                     if let Some(old_val) = existing.config.env_vars.get(key) {
                         *new_val = old_val.clone();
                     }
@@ -558,13 +573,21 @@ fn slugify(s: &str) -> String {
 /// Return a copy of the profile with secret values in `env_vars` masked.
 /// Shows the first 4 and last 3 characters for keys longer than 12 chars,
 /// otherwise replaces the entire value with `***`.
+/// Keychain-backed values show as a special indicator.
 pub fn mask_secrets(profile: &UserProfile) -> UserProfile {
     let mut masked = profile.clone();
     for value in masked.config.env_vars.values_mut() {
-        *value = mask_value(value);
+        if value == crate::auth::KEYCHAIN_MARKER {
+            *value = KEYCHAIN_DISPLAY.to_string();
+        } else {
+            *value = mask_value(value);
+        }
     }
     masked
 }
+
+/// Display string for keychain-backed values in API responses.
+const KEYCHAIN_DISPLAY: &str = "\u{1f511} (keychain)";
 
 fn mask_value(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -795,6 +818,16 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "webhook_port": webhook_port,
             }
         }),
+        ChannelCredentials::Api { port, auth_token } => {
+            let mut settings = serde_json::json!({"port": port});
+            if let Some(token) = auth_token {
+                settings["auth_token"] = serde_json::json!(token);
+            }
+            serde_json::json!({
+                "type": "api",
+                "settings": settings
+            })
+        }
     }
 }
 
@@ -887,6 +920,16 @@ pub fn feishu_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
             if mode == "webhook" {
                 return Some(*webhook_port);
             }
+        }
+    }
+    None
+}
+
+/// Get the API channel port from a profile, if one is configured.
+pub fn api_channel_port(profile: &UserProfile) -> Option<u16> {
+    for ch in &profile.config.channels {
+        if let ChannelCredentials::Api { port, .. } = ch {
+            return Some(*port);
         }
     }
     None
@@ -1471,5 +1514,163 @@ mod tests {
         let json = serde_json::to_string(&channels).unwrap();
         let parsed: Vec<ChannelCredentials> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.len(), 6);
+    }
+
+    // ── Keychain marker tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_mask_secrets_keychain_marker() {
+        let profile = UserProfile {
+            id: "kc".into(),
+            name: "KC".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                env_vars: [
+                    ("KC_KEY".into(), "keychain:".into()),
+                    ("PLAIN_KEY".into(), "sk-1234567890abcdef".into()),
+                    ("SHORT".into(), "abc".into()),
+                    ("EMPTY".into(), String::new()),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let masked = mask_secrets(&profile);
+        assert_eq!(
+            masked.config.env_vars["KC_KEY"],
+            "\u{1f511} (keychain)",
+            "keychain marker should display as key emoji"
+        );
+        assert_eq!(masked.config.env_vars["PLAIN_KEY"], "sk-1***def");
+        assert_eq!(masked.config.env_vars["SHORT"], "***");
+        assert_eq!(masked.config.env_vars["EMPTY"], "");
+    }
+
+    #[test]
+    fn test_save_with_merge_preserves_keychain_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        // Save profile with keychain marker
+        let original = UserProfile {
+            id: "kc-merge".into(),
+            name: "KC Merge".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                env_vars: [
+                    ("API_KEY".into(), "keychain:".into()),
+                    ("OTHER".into(), "plaintext-value".into()),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&original).unwrap();
+
+        // Simulate dashboard PUT with masked keychain display value
+        let mut updated = original.clone();
+        updated
+            .config
+            .env_vars
+            .insert("API_KEY".into(), "\u{1f511} (keychain)".into());
+        updated
+            .config
+            .env_vars
+            .insert("OTHER".into(), "plai***lue".into());
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("kc-merge").unwrap().unwrap();
+        assert_eq!(
+            loaded.config.env_vars["API_KEY"],
+            "keychain:",
+            "keychain marker must be preserved when dashboard sends masked form"
+        );
+        assert_eq!(
+            loaded.config.env_vars["OTHER"],
+            "plaintext-value",
+            "masked plaintext value must be restored from existing"
+        );
+    }
+
+    #[test]
+    fn test_save_with_merge_allows_setting_keychain_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        // Profile with plaintext secret
+        let original = UserProfile {
+            id: "kc-set".into(),
+            name: "KC Set".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                env_vars: [("API_KEY".into(), "sk-real-secret".into())].into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&original).unwrap();
+
+        // Explicitly setting "keychain:" should NOT be treated as masked
+        let mut updated = original.clone();
+        updated
+            .config
+            .env_vars
+            .insert("API_KEY".into(), "keychain:".into());
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("kc-set").unwrap().unwrap();
+        assert_eq!(
+            loaded.config.env_vars["API_KEY"],
+            "keychain:",
+            "explicit keychain: marker must be stored, not reverted to old value"
+        );
+    }
+
+    #[test]
+    fn test_save_with_merge_empty_does_not_overwrite_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        let original = UserProfile {
+            id: "kc-empty".into(),
+            name: "KC Empty".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                env_vars: [("API_KEY".into(), "keychain:".into())].into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&original).unwrap();
+
+        // Empty value should restore existing (keychain marker)
+        let mut updated = original.clone();
+        updated
+            .config
+            .env_vars
+            .insert("API_KEY".into(), String::new());
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("kc-empty").unwrap().unwrap();
+        assert_eq!(
+            loaded.config.env_vars["API_KEY"],
+            "keychain:",
+            "empty value must not overwrite keychain marker"
+        );
     }
 }

@@ -849,6 +849,7 @@ impl WeComChannel {
                     "agent_id": xml_extract(xml, "AgentID").unwrap_or_default(),
                 }
             }),
+            message_id: None,
         })
     }
 

@@ -170,10 +170,43 @@ impl ServeCommand {
                     "no dashboard_auth.smtp configured — OTP codes will be logged to console only"
                 );
             }
-            Some(Arc::new(crate::otp::AuthManager::new(
-                auth_config,
-                user_store.clone(),
-            )))
+            let mut mgr = crate::otp::AuthManager::new(auth_config.clone(), user_store.clone());
+
+            // Resolve SMTP password from profile env_vars as fallback
+            // (covers nohup startup where LaunchAgent env vars aren't available)
+            if let Some(ref auth_cfg) = auth_config {
+                let pw_env = &auth_cfg.smtp.password_env;
+                if std::env::var(pw_env).is_err() {
+                    let profiles_for_smtp = profile_store.list().unwrap_or_default();
+                    for p in &profiles_for_smtp {
+                        if let Some(pw) = p.config.env_vars.get(pw_env) {
+                            if pw == crate::auth::keychain::KEYCHAIN_MARKER {
+                                // Resolve from keychain
+                                if let Ok(Some(secret)) =
+                                    crate::auth::keychain::get_secret(pw_env)
+                                {
+                                    tracing::info!(
+                                        var = %pw_env,
+                                        "SMTP password resolved from keychain"
+                                    );
+                                    mgr = mgr.with_smtp_password(secret);
+                                    break;
+                                }
+                            } else if !pw.is_empty() {
+                                tracing::info!(
+                                    var = %pw_env,
+                                    profile = %p.id,
+                                    "SMTP password resolved from profile env_vars"
+                                );
+                                mgr = mgr.with_smtp_password(pw.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some(Arc::new(mgr))
         };
 
         // Spawn auth cleanup task if auth manager is active

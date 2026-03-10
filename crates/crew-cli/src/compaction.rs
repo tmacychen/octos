@@ -56,7 +56,35 @@ pub async fn maybe_compact_with_config(
         return Ok(false);
     }
 
-    let to_summarize = total - config.keep_recent;
+    let mut to_summarize = total - config.keep_recent;
+
+    // Don't split inside a tool-call group.  If the boundary falls on a
+    // Tool result message, walk backwards until we reach the assistant
+    // message that owns it (or a non-tool message).
+    while to_summarize > 0
+        && to_summarize < total
+        && session.messages[to_summarize].role == MessageRole::Tool
+    {
+        to_summarize -= 1;
+    }
+
+    // Also avoid orphaning an assistant message with tool_calls whose
+    // results are in the "recent" half.  If `messages[to_summarize - 1]`
+    // is an assistant with tool_calls, include it in the kept portion.
+    if to_summarize > 0 {
+        let prev = &session.messages[to_summarize - 1];
+        if prev.role == MessageRole::Assistant
+            && prev.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+        {
+            to_summarize -= 1;
+        }
+    }
+
+    if to_summarize == 0 {
+        // Nothing to summarize after adjustment
+        return Ok(false);
+    }
+
     debug!(session = %key, total, to_summarize, "compacting session");
 
     // Build structured conversation transcript using JSON to prevent

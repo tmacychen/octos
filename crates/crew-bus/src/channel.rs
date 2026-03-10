@@ -178,6 +178,19 @@ impl ChannelManager {
                                 "Failed to send outbound file message: {e}",
                             );
                         }
+                    } else if msg.content.is_empty() {
+                        // Metadata-only message (e.g., completion signal) — deliver
+                        // directly if metadata is present; skip empty messages otherwise.
+                        if !msg.metadata.is_null()
+                            && msg.metadata != serde_json::json!({})
+                        {
+                            if let Err(e) = channel.send(&msg).await {
+                                error!(
+                                    channel = msg.channel,
+                                    "Failed to send metadata message: {e}",
+                                );
+                            }
+                        }
                     } else {
                         // Text message: format for platform, then chunk and send
                         let formatted = channel.format_outbound(&msg.content);
@@ -413,6 +426,7 @@ mod tests {
             timestamp: Utc::now(),
             media: vec![],
             metadata: serde_json::json!({}),
+            message_id: None,
         })
         .await
         .unwrap();

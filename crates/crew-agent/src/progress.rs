@@ -20,6 +20,13 @@ pub enum ProgressEvent {
     /// Agent is calling a tool.
     ToolStarted { name: String, tool_id: String },
 
+    /// Mid-execution progress from a tool (e.g., stderr line from binary plugin).
+    ToolProgress {
+        name: String,
+        tool_id: String,
+        message: String,
+    },
+
     /// Tool execution completed.
     ToolCompleted {
         name: String,
@@ -56,6 +63,9 @@ pub enum ProgressEvent {
 
     /// Hit wall-clock timeout.
     WallClockTimeoutReached { elapsed: Duration, limit: Duration },
+
+    /// Status update during LLM call (e.g. retry progress, provider switching).
+    LlmStatus { message: String, iteration: u32 },
 
     /// Streaming text chunk from LLM.
     StreamChunk { text: String, iteration: u32 },
@@ -211,6 +221,17 @@ impl ProgressReporter for ConsoleReporter {
                     }
                 }
             }
+            ProgressEvent::ToolProgress { name, message, .. } => {
+                print!(
+                    "\r{} {} {}{}",
+                    self.yellow("⚙"),
+                    self.dim(&name),
+                    self.dim(&message),
+                    " ".repeat(10),
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
             ProgressEvent::ToolStarted { name, tool_id: _ } => {
                 print!(
                     "\r{} {}",
@@ -326,6 +347,15 @@ impl ProgressReporter for ConsoleReporter {
                         limit.as_secs_f64()
                     ))
                 );
+            }
+            ProgressEvent::LlmStatus { message, .. } => {
+                print!(
+                    "\r{} {}",
+                    self.yellow("⟳"),
+                    self.dim(&message)
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
             }
             ProgressEvent::StreamChunk { text, .. } => {
                 use std::io::Write;

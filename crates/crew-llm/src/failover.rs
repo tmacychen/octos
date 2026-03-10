@@ -203,6 +203,11 @@ impl LlmProvider for ProviderChain {
         let idx = self.pick_start();
         self.slots[idx].provider.provider_name()
     }
+
+    fn report_late_failure(&self) {
+        let idx = self.pick_start();
+        self.record_failure(idx);
+    }
 }
 
 #[cfg(test)]
@@ -350,5 +355,30 @@ mod tests {
     #[should_panic(expected = "at least one provider")]
     fn test_empty_chain_panics() {
         let _ = ProviderChain::new(vec![]);
+    }
+
+    #[tokio::test]
+    async fn should_failover_after_report_late_failure() {
+        let chain = ProviderChain::new(vec![
+            Arc::new(SuccessProvider { name: "primary" }),
+            Arc::new(SuccessProvider { name: "fallback" }),
+        ])
+        .with_failure_threshold(1);
+
+        // Initially routes to primary
+        let resp = chain.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("ok"));
+        assert_eq!(chain.provider_name(), "primary");
+
+        // Report late failure degrades primary
+        chain.report_late_failure();
+        assert_eq!(
+            chain.slots[0].failures.load(Ordering::Relaxed),
+            1,
+            "late failure should increment failure count"
+        );
+
+        // Now should route to fallback (primary is degraded)
+        assert_eq!(chain.provider_name(), "fallback");
     }
 }

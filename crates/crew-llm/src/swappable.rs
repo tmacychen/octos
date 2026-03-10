@@ -109,6 +109,10 @@ impl LlmProvider for SwappableProvider {
     fn export_metrics(&self) -> Option<serde_json::Value> {
         self.inner.read().unwrap().export_metrics()
     }
+
+    fn report_late_failure(&self) {
+        self.inner.read().unwrap().report_late_failure();
+    }
 }
 
 #[cfg(test)]

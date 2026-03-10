@@ -53,6 +53,8 @@ struct GatewayProcess {
     stop_tx: watch::Sender<bool>,
     /// Feishu/Twilio webhook port this gateway is listening on (if any).
     webhook_port: Option<u16>,
+    /// API channel port this gateway is listening on (if any).
+    api_port: Option<u16>,
     /// Ring buffer of recent log lines so new subscribers can see history.
     log_history: Arc<Mutex<Vec<String>>>,
 }
@@ -161,7 +163,9 @@ impl ProcessManager {
     /// If the profile has a managed WhatsApp channel, the bridge is started first.
     pub async fn start(&self, profile: &UserProfile) -> Result<()> {
         // Hold the write lock for the entire operation to prevent TOCTOU races.
+        tracing::debug!(profile = %profile.id, "start: acquiring processes write lock");
         let mut procs = self.processes.write().await;
+        tracing::debug!(profile = %profile.id, "start: write lock acquired");
         if procs.contains_key(&profile.id) {
             bail!("gateway for '{}' is already running", profile.id);
         }
@@ -190,13 +194,18 @@ impl ProcessManager {
             None => None,
         };
 
+        // Detect API channel port from profile config
+        let api_port = crate::profiles::api_channel_port(profile);
+
         // Resolve data directory and ensure subdirs exist
+        tracing::debug!(profile = %profile.id, "start: resolving data dir");
         let data_dir = self.profile_store.resolve_data_dir(profile);
         for sub in ["memory", "sessions", "research", "skills", "history"] {
             std::fs::create_dir_all(data_dir.join(sub))?;
         }
 
         // Spawn the gateway as a child process, pointing at the profile JSON directly
+        tracing::debug!(profile = %profile.id, "start: building command");
         let exe = std::env::current_exe()?;
         let profile_path = self.profile_store.profile_path(&profile.id);
         let mut cmd = Command::new(&exe);
@@ -215,19 +224,26 @@ impl ProcessManager {
         if let Some(port) = feishu_port {
             cmd.arg("--feishu-port").arg(port.to_string());
         }
+        if let Some(port) = api_port {
+            cmd.arg("--api-port").arg(port.to_string());
+        }
 
         // Pass crew home dir so gateway can open ProfileStore for /account commands
         cmd.arg("--crew-home")
             .arg(self.profile_store.crew_home_dir());
 
         // Sub-account: pass parent profile path and merge parent env vars
+        tracing::debug!(profile = %profile.id, "start: checking sub-account");
         if let Some(ref parent_id) = profile.parent_id {
             let parent_path = self.profile_store.profile_path(parent_id);
             cmd.arg("--parent-profile").arg(&parent_path);
 
-            // Merge parent env_vars (API keys) into child process
+            // Merge parent env_vars (API keys) into child process,
+            // resolving keychain markers.
             if let Ok(Some(parent)) = self.profile_store.get(parent_id) {
-                for (key, value) in &parent.config.env_vars {
+                let resolved_parent =
+                    crate::auth::keychain::resolve_env_vars(&parent.config.env_vars);
+                for (key, value) in &resolved_parent {
                     // Sub-account's own env_vars take priority
                     if !profile.config.env_vars.contains_key(key) {
                         if !BLOCKED_ENV_VARS
@@ -269,8 +285,12 @@ impl ProcessManager {
             }
         }
 
-        // Pass env vars from profile config, filtering out dangerous ones.
-        for (key, value) in &profile.config.env_vars {
+        // Pass env vars from profile config, resolving keychain markers and
+        // filtering out dangerous ones.
+        tracing::debug!(profile = %profile.id, "start: resolving env vars");
+        let resolved_env_vars =
+            crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+        for (key, value) in &resolved_env_vars {
             if BLOCKED_ENV_VARS
                 .iter()
                 .any(|blocked| key.eq_ignore_ascii_case(blocked))
@@ -285,7 +305,9 @@ impl ProcessManager {
             cmd.env(key, value);
         }
 
+        tracing::debug!(profile = %profile.id, "start: spawning gateway subprocess");
         let mut child = cmd.spawn()?;
+        tracing::debug!(profile = %profile.id, "start: gateway subprocess spawned");
 
         let pid = child.id().unwrap_or(0);
         let (log_tx, _) = broadcast::channel::<String>(1024);
@@ -300,6 +322,7 @@ impl ProcessManager {
             log_tx: log_tx.clone(),
             stop_tx,
             webhook_port: feishu_port,
+            api_port,
             log_history: log_history.clone(),
         };
 
@@ -461,7 +484,7 @@ impl ProcessManager {
             }
         }
 
-        tracing::info!(profile = %profile.id, pid = pid, "gateway started");
+        tracing::debug!(profile = %profile.id, pid = pid, "gateway started");
         Ok(())
     }
 
@@ -596,6 +619,23 @@ impl ProcessManager {
     pub async fn webhook_port(&self, profile_id: &str) -> Option<u16> {
         let procs = self.processes.read().await;
         procs.get(profile_id).and_then(|p| p.webhook_port)
+    }
+
+    /// Get the API channel port for a profile.
+    pub async fn api_port(&self, profile_id: &str) -> Option<u16> {
+        let procs = self.processes.read().await;
+        procs.get(profile_id).and_then(|p| p.api_port)
+    }
+
+    /// Find the first running profile that has an API channel port.
+    pub async fn first_api_port(&self) -> Option<(String, u16)> {
+        let procs = self.processes.read().await;
+        for (id, proc) in procs.iter() {
+            if let Some(port) = proc.api_port {
+                return Some((id.clone(), port));
+            }
+        }
+        None
     }
 
     /// Read provider QoS metrics for a profile from its data_dir/provider_metrics.json.

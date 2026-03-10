@@ -37,6 +37,22 @@ pub struct ChatResponse {
 const MAX_MESSAGE_LEN: usize = 1_048_576;
 
 pub async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> Response {
+    // If a gateway has an API channel running, proxy the request to it.
+    // This gives the web client access to adaptive routing, queue modes,
+    // multi-provider failover, and all gateway features.
+    if let Some(pm) = &state.process_manager {
+        if let Some((_profile_id, port)) = pm.first_api_port().await {
+            return super::webhook_proxy::api_chat_proxy(
+                &state,
+                port,
+                &req.message,
+                req.session_id.as_deref(),
+            )
+            .await;
+        }
+    }
+
+    // No gateway with API channel — use standalone agent
     if req.stream {
         match chat_streaming(state, req).await {
             Ok(sse) => sse.into_response(),

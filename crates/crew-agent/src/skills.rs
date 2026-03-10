@@ -253,12 +253,23 @@ fn split_frontmatter(content: &str) -> (Option<Vec<String>>, &str) {
 }
 
 /// Extract a key from frontmatter lines (simple `key: value` format).
+/// Returns `None` for missing keys and YAML empty values (`[]`, `""`, `~`).
 fn fm_value(lines: &[String], key: &str) -> Option<String> {
     let prefix = format!("{key}:");
     lines.iter().find_map(|line| {
         let trimmed = line.trim();
         if trimmed.starts_with(&prefix) {
-            Some(trimmed[prefix.len()..].trim().to_string())
+            let mut val = trimmed[prefix.len()..].trim();
+            // Strip YAML inline comments (e.g. `[] # comment`)
+            if let Some(hash_pos) = val.find('#') {
+                val = val[..hash_pos].trim();
+            }
+            // Treat YAML empty markers as absent
+            if val.is_empty() || val == "[]" || val == "\"\"" || val == "~" {
+                None
+            } else {
+                Some(val.to_string())
+            }
         } else {
             None
         }
@@ -519,8 +530,27 @@ mod tests {
 
     #[test]
     fn test_fm_value_empty_value() {
+        // Empty value is treated as absent (returns None)
         let lines = vec!["name:".to_string()];
-        assert_eq!(fm_value(&lines, "name").unwrap(), "");
+        assert!(fm_value(&lines, "name").is_none());
+    }
+
+    #[test]
+    fn test_fm_value_yaml_empty_markers() {
+        // YAML empty markers are treated as absent
+        assert!(fm_value(&["requires_bins: []".into()], "requires_bins").is_none());
+        assert!(fm_value(&["requires_bins: ~".into()], "requires_bins").is_none());
+        assert!(fm_value(&[r#"requires_bins: """#.into()], "requires_bins").is_none());
+    }
+
+    #[test]
+    fn test_fm_value_inline_comment() {
+        // Inline YAML comments are stripped
+        let lines = vec!["requires_bins: []   # DOT-based pipeline".into()];
+        assert!(fm_value(&lines, "requires_bins").is_none());
+
+        let lines = vec!["model: gpt-4o # best model".into()];
+        assert_eq!(fm_value(&lines, "model").unwrap(), "gpt-4o");
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub async fn handle_account_command(
                             crate::profiles::ChannelCredentials::Feishu { .. } => "feishu",
                             crate::profiles::ChannelCredentials::Email { .. } => "email",
                             crate::profiles::ChannelCredentials::Twilio { .. } => "twilio",
+                            crate::profiles::ChannelCredentials::Api { .. } => "api",
                         })
                         .collect();
                     lines.push(format!(

@@ -946,6 +946,7 @@ impl FeishuChannel {
                     "message_type": msg_type,
                 }
             }),
+            message_id: None,
         })
     }
 

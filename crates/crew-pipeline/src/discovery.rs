@@ -29,6 +29,13 @@ impl PipelineDiscovery {
         }
     }
 
+    /// Add additional search paths (e.g. global crew_home/skills/).
+    pub fn add_search_path(&mut self, path: PathBuf) {
+        if !self.search_paths.contains(&path) {
+            self.search_paths.push(path);
+        }
+    }
+
     /// List all discoverable pipelines.
     pub fn list_available(&self) -> Vec<PipelineInfo> {
         let mut pipelines = Vec::new();

@@ -54,6 +54,8 @@ pub fn is_audio(path: &str) -> bool {
         || lower.ends_with(".wav")
         || lower.ends_with(".oga")
         || lower.ends_with(".opus")
+        || lower.ends_with(".flac")
+        || lower.ends_with(".amr")
 }
 
 /// Check if a file path looks like an image file.

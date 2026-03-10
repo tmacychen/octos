@@ -8,6 +8,7 @@ description = "Message bus, channels, and session management for crew-rs gateway
 
 [features]
 default = []
+api = ["axum"]
 telegram = ["teloxide"]
 discord = ["serenity"]
 slack = ["tokio-tungstenite"]

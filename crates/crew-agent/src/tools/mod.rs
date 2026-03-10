@@ -9,6 +9,22 @@ use crew_core::TokenUsage;
 use crew_llm::ToolSpec;
 use eyre::Result;
 
+use crate::progress::ProgressReporter;
+
+/// Execution context available to tools via task-local.
+/// Set by the agent before each tool invocation so plugin tools
+/// can report progress without changing the Tool trait signature.
+#[derive(Clone)]
+pub struct ToolContext {
+    pub tool_id: String,
+    pub reporter: Arc<dyn ProgressReporter>,
+}
+
+tokio::task_local! {
+    /// Task-local tool context, scoped per tool invocation in agent.rs.
+    pub static TOOL_CTX: ToolContext;
+}
+
 /// Progress update from a long-running tool execution.
 #[derive(Debug, Clone)]
 pub enum ToolProgress {

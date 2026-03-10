@@ -46,6 +46,14 @@ impl RunPipelineTool {
         }
     }
 
+    /// Add the global crew-home skills directory as a search path.
+    /// This ensures pipelines installed globally (e.g. `~/.crew/skills/`) are
+    /// discoverable even when data_dir is per-profile.
+    pub fn with_crew_home(mut self, crew_home: PathBuf) -> Self {
+        self.discovery.add_search_path(crew_home.join("skills"));
+        self
+    }
+
     pub fn with_provider_router(mut self, router: Arc<ProviderRouter>) -> Self {
         self.provider_router = Some(router);
         self
@@ -120,6 +128,10 @@ impl Tool for RunPipelineTool {
                     "type": "object",
                     "description": "Optional key-value pairs for template substitution in node prompts",
                     "additionalProperties": { "type": "string" }
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Timeout in seconds. Estimate based on real execution times: simple 2-node pipeline ~3min → 300s; standard 3-node research pipeline ~8min → 600s; 5-7 topic deep research with crawl+synthesize ~15-20min → 1200s; complex multi-source analysis with many nodes ~25min → 1500s. Max: 1800. Default: 600"
                 }
             },
             "required": ["pipeline", "input"]

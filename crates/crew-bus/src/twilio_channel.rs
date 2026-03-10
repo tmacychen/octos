@@ -412,6 +412,7 @@ impl Channel for TwilioChannel {
                         "from_number": state.from_number,
                     }
                 }),
+                message_id: None,
             };
 
             let _ = state.inbound_tx.send(inbound).await;

@@ -72,6 +72,9 @@ pub struct AuthManager {
     pending_otps: RwLock<HashMap<String, PendingOtp>>,
     sessions: RwLock<HashMap<String, ActiveSession>>,
     smtp_config: Option<SmtpConfig>,
+    /// Pre-resolved SMTP password (from profile env_vars or keychain).
+    /// Used as fallback when the process environment doesn't have the password.
+    smtp_password: Option<String>,
     session_expiry_hours: u64,
     pub allow_self_registration: bool,
     user_store: Arc<UserStore>,
@@ -91,10 +94,18 @@ impl AuthManager {
             pending_otps: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             smtp_config,
+            smtp_password: None,
             session_expiry_hours,
             allow_self_registration,
             user_store,
         }
+    }
+
+    /// Set an explicit SMTP password (e.g. resolved from profile env_vars).
+    /// Used as fallback when the process environment doesn't have the password.
+    pub fn with_smtp_password(mut self, password: String) -> Self {
+        self.smtp_password = Some(password);
+        self
     }
 
     /// Generate and send OTP to email. Returns Ok(true) if sent, Ok(false) if rate-limited.
@@ -297,7 +308,14 @@ impl AuthManager {
         use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
         let password = std::env::var(&smtp.password_env)
-            .map_err(|_| eyre::eyre!("SMTP password env var '{}' not set", smtp.password_env))?;
+            .ok()
+            .or_else(|| self.smtp_password.clone())
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "SMTP password not found in env var '{}' or profile env_vars",
+                    smtp.password_env,
+                )
+            })?;
 
         let email_msg = Message::builder()
             .from(smtp.from_address.parse().map_err(|e| eyre::eyre!("invalid from address: {e}"))?)

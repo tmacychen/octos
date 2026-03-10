@@ -58,6 +58,7 @@ impl Channel for CliChannel {
                 timestamp: Utc::now(),
                 media: vec![],
                 metadata: serde_json::json!({}),
+                message_id: None,
             };
 
             if inbound_tx.send(msg).await.is_err() {

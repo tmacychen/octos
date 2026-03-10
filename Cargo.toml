@@ -16,6 +16,7 @@ members = [
     "crates/app-skills/weather",
     "crates/platform-skills/voice",
     "crates/crew-pipeline",
+    "crates/crew-plugin",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ crew-llm = { path = "crates/crew-llm" }
 crew-agent = { path = "crates/crew-agent" }
 crew-bus = { path = "crates/crew-bus" }
 crew-pipeline = { path = "crates/crew-pipeline" }
+crew-plugin = { path = "crates/crew-plugin" }
 
 # codex-rs crates (reused)
 codex-execpolicy = { git = "https://github.com/openai/codex", path = "codex-rs/execpolicy" }
@@ -69,6 +71,9 @@ colored = "2"
 dirs = "5"
 rustyline = "15"
 open = "5"
+
+# Keychain (macOS Keychain for secure API key storage)
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
 
 # HTTP client (using rustls for pure Rust, no OpenSSL)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "multipart"] }
@@ -148,6 +153,7 @@ metrics-exporter-prometheus = "0.16"
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 
 # Archive extraction
 flate2 = "1"

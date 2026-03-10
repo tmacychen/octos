@@ -206,6 +206,7 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
             timestamp: Utc::now(),
             media: vec![],
             metadata: serde_json::json!({ "subject": subject }),
+            message_id: None,
         };
 
         if tx.send(inbound).await.is_err() {

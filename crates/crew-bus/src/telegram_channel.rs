@@ -14,7 +14,7 @@ use reqwest::Client;
 use teloxide::prelude::*;
 use teloxide::types::{
     BotCommand, ChatId, FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageId,
-    ParseMode, UpdateKind,
+    ParseMode, ReplyParameters, UpdateKind,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -139,21 +139,30 @@ impl TelegramChannel {
     }
 
     /// Try to send an HTML message, falling back to plain text on parse error.
-    async fn send_html_with_fallback(&self, chat_id: ChatId, html: &str) -> Result<Message> {
-        match self
-            .bot
-            .send_message(chat_id, html)
-            .parse_mode(ParseMode::Html)
-            .await
-        {
+    /// If `reply_to` is provided, the message is threaded as a reply.
+    async fn send_html_with_fallback(
+        &self,
+        chat_id: ChatId,
+        html: &str,
+        reply_to: Option<MessageId>,
+    ) -> Result<Message> {
+        let mut req = self.bot.send_message(chat_id, html);
+        req = req.parse_mode(ParseMode::Html);
+        if let Some(mid) = reply_to {
+            req = req.reply_parameters(ReplyParameters::new(mid));
+        }
+        match req.await {
             Ok(msg) => Ok(msg),
             Err(e) => {
                 // Telegram returns "Bad Request: can't parse entities" on malformed HTML.
                 let err_str = e.to_string();
                 if err_str.contains("can't parse entities") || err_str.contains("parse entities") {
                     warn!("HTML parse failed, falling back to plain text: {e}");
-                    self.bot
-                        .send_message(chat_id, html)
+                    let mut fallback = self.bot.send_message(chat_id, html);
+                    if let Some(mid) = reply_to {
+                        fallback = fallback.reply_parameters(ReplyParameters::new(mid));
+                    }
+                    fallback
                         .await
                         .wrap_err("failed to send Telegram message (plain text fallback)")
                 } else {
@@ -402,6 +411,7 @@ impl Channel for TelegramChannel {
                             timestamp: Utc::now(),
                             media,
                             metadata: serde_json::json!({}),
+                            message_id: Some(msg.id.0.to_string()),
                         };
 
                         if inbound_tx.send(inbound).await.is_err() {
@@ -450,6 +460,7 @@ impl Channel for TelegramChannel {
                                 "callback_data": callback_data,
                                 "callback_message_id": message_id,
                             }),
+                            message_id: None,
                         };
 
                         if inbound_tx.send(inbound).await.is_err() {
@@ -490,6 +501,12 @@ impl Channel for TelegramChannel {
             .parse()
             .wrap_err_with(|| format!("invalid Telegram chat_id: {}", msg.chat_id))?;
 
+        let reply_to = msg
+            .reply_to
+            .as_deref()
+            .and_then(|id| id.parse::<i32>().ok())
+            .map(MessageId);
+
         if !msg.media.is_empty() {
             // Send files as documents
             let caption = if msg.content.is_empty() {
@@ -513,6 +530,9 @@ impl Channel for TelegramChannel {
                         if let Some(ref cap) = caption {
                             req = req.caption(cap).parse_mode(ParseMode::Html);
                         }
+                        if let Some(mid) = reply_to {
+                            req = req.reply_parameters(ReplyParameters::new(mid));
+                        }
                     }
                     req.await
                         .wrap_err_with(|| format!("failed to send voice: {path}"))?;
@@ -526,6 +546,9 @@ impl Channel for TelegramChannel {
                         if let Some(ref cap) = caption {
                             req = req.caption(cap).parse_mode(ParseMode::Html);
                         }
+                        if let Some(mid) = reply_to {
+                            req = req.reply_parameters(ReplyParameters::new(mid));
+                        }
                     }
                     req.await
                         .wrap_err_with(|| format!("failed to send audio: {path}"))?;
@@ -535,6 +558,9 @@ impl Channel for TelegramChannel {
                     if i == 0 {
                         if let Some(ref cap) = caption {
                             req = req.caption(cap).parse_mode(ParseMode::Html);
+                        }
+                        if let Some(mid) = reply_to {
+                            req = req.reply_parameters(ReplyParameters::new(mid));
                         }
                     }
                     req.await
@@ -546,14 +572,17 @@ impl Channel for TelegramChannel {
 
             // Check for inline keyboard in metadata
             if let Some(markup) = Self::parse_inline_keyboard(&msg.metadata) {
-                self.bot
-                    .send_message(ChatId(chat_id), &html)
-                    .parse_mode(ParseMode::Html)
-                    .reply_markup(markup)
-                    .await
+                let mut req = self.bot
+                    .send_message(ChatId(chat_id), &html);
+                req = req.parse_mode(ParseMode::Html)
+                    .reply_markup(markup);
+                if let Some(mid) = reply_to {
+                    req = req.reply_parameters(ReplyParameters::new(mid));
+                }
+                req.await
                     .wrap_err("failed to send Telegram message with keyboard")?;
             } else {
-                self.send_html_with_fallback(ChatId(chat_id), &html).await?;
+                self.send_html_with_fallback(ChatId(chat_id), &html, reply_to).await?;
             }
         }
 
@@ -597,17 +626,26 @@ impl Channel for TelegramChannel {
             .parse()
             .wrap_err_with(|| format!("invalid Telegram chat_id: {}", msg.chat_id))?;
 
+        let reply_to = msg
+            .reply_to
+            .as_deref()
+            .and_then(|id| id.parse::<i32>().ok())
+            .map(MessageId);
+
         let html = markdown_to_telegram_html(&msg.content);
 
         let sent = if let Some(markup) = Self::parse_inline_keyboard(&msg.metadata) {
-            self.bot
-                .send_message(ChatId(chat_id), &html)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(markup)
-                .await
+            let mut req = self.bot
+                .send_message(ChatId(chat_id), &html);
+            req = req.parse_mode(ParseMode::Html)
+                .reply_markup(markup);
+            if let Some(mid) = reply_to {
+                req = req.reply_parameters(ReplyParameters::new(mid));
+            }
+            req.await
                 .wrap_err("failed to send Telegram message with keyboard")?
         } else {
-            self.send_html_with_fallback(ChatId(chat_id), &html).await?
+            self.send_html_with_fallback(ChatId(chat_id), &html, reply_to).await?
         };
 
         Ok(Some(sent.id.0.to_string()))

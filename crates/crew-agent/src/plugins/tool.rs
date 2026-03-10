@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use crate::tools::{Tool, ToolResult};
+use crate::progress::ProgressEvent;
+use crate::tools::{Tool, ToolContext, ToolResult, TOOL_CTX};
 
 use super::manifest::PluginToolDef;
 
@@ -65,7 +66,25 @@ impl Tool for PluginTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        self.tool_def.input_schema.clone()
+        let mut schema = self.tool_def.input_schema.clone();
+        // Inject `timeout_secs` so the LLM can request longer timeouts for
+        // complex tasks.  Only added when the schema is an object with
+        // "properties" and doesn't already define the field.
+        if let Some(props) = schema
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            if !props.contains_key("timeout_secs") {
+                props.insert(
+                    "timeout_secs".to_string(),
+                    serde_json::json!({
+                        "type": "integer",
+                        "description": "Timeout in seconds. Estimate based on real execution times: single deep_search (depth=2) ~3min → 300s; single deep_search (depth=3) ~5min → 400s; research pipeline with 3 topics ~8min → 600s; research pipeline with 5-7 topics ~15-20min → 1200s; very complex multi-source analysis ~25min → 1500s. Max: 1800. Default: 600"
+                    }),
+                );
+            }
+        }
+        schema
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
@@ -112,50 +131,92 @@ impl Tool for PluginTool {
             // Drop stdin to signal EOF
         }
 
-        // wait_with_output() takes ownership of child, so save the PID
-        // for killing on timeout.
-        let result = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => {
-                return Err(eyre::eyre!(
-                    "plugin '{}' tool '{}' execution failed: {e}",
-                    self.plugin_name,
-                    self.tool_def.name
-                ));
-            }
-            Err(_) => {
-                // Kill the child process by PID to prevent orphaned processes.
-                // child was consumed by wait_with_output(), so kill via PID.
-                #[cfg(unix)]
-                if child_pid > 0 {
-                    // Kill the process group (catches child processes like Chrome)
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &format!("-{child_pid}")])
-                        .status();
-                    // Also kill the process directly as fallback
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &child_pid.to_string()])
-                        .status();
-                }
-                return Err(eyre::eyre!(
-                    "plugin '{}' tool '{}' timed out after {}s",
-                    self.plugin_name,
-                    self.tool_def.name,
-                    self.timeout.as_secs()
-                ));
-            }
-        };
+        // Take stdout and stderr handles for separate streaming
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
 
-        let stdout = String::from_utf8_lossy(&result.stdout);
-        let stderr = String::from_utf8_lossy(&result.stderr);
+        // Read tool context from task-local (set by agent.rs)
+        let ctx: Option<ToolContext> = TOOL_CTX.try_with(|c| c.clone()).ok();
+
+        // Spawn stderr reader: streams lines as ToolProgress events
+        let tool_name = self.tool_def.name.clone();
+        let stderr_task = tokio::spawn(async move {
+            let mut collected = String::new();
+            if let Some(stderr) = stderr_handle {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some(ref ctx) = ctx {
+                        ctx.reporter.report(ProgressEvent::ToolProgress {
+                            name: tool_name.clone(),
+                            tool_id: ctx.tool_id.clone(),
+                            message: line.clone(),
+                        });
+                    }
+                    if !collected.is_empty() {
+                        collected.push('\n');
+                    }
+                    collected.push_str(&line);
+                }
+            }
+            collected
+        });
+
+        // Spawn stdout reader: buffers full output for result parsing
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut stdout) = stdout_handle {
+                let _ = stdout.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+
+        // Wait for process exit with timeout
+        let exit_status =
+            match tokio::time::timeout(self.timeout, child.wait()).await {
+                Ok(Ok(status)) => status,
+                Ok(Err(e)) => {
+                    stderr_task.abort();
+                    stdout_task.abort();
+                    return Err(eyre::eyre!(
+                        "plugin '{}' tool '{}' execution failed: {e}",
+                        self.plugin_name,
+                        self.tool_def.name
+                    ));
+                }
+                Err(_) => {
+                    // Timeout — kill the child process and abort reader tasks
+                    stderr_task.abort();
+                    stdout_task.abort();
+                    #[cfg(unix)]
+                    if child_pid > 0 {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &format!("-{child_pid}")])
+                            .status();
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &child_pid.to_string()])
+                            .status();
+                    }
+                    return Err(eyre::eyre!(
+                        "plugin '{}' tool '{}' timed out after {}s",
+                        self.plugin_name,
+                        self.tool_def.name,
+                        self.timeout.as_secs()
+                    ));
+                }
+            };
+
+        // Collect stdout and stderr from reader tasks
+        let stdout_bytes = stdout_task.await.unwrap_or_default();
+        let stderr_text = stderr_task.await.unwrap_or_default();
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
 
         tracing::info!(
             plugin = %self.plugin_name,
             tool = %self.tool_def.name,
             pid = child_pid,
-            exit_code = result.status.code().unwrap_or(-1),
+            exit_code = exit_status.code().unwrap_or(-1),
             stdout_len = stdout.len(),
-            stderr_len = stderr.len(),
+            stderr_len = stderr_text.len(),
             "plugin process completed"
         );
 
@@ -169,7 +230,7 @@ impl Tool for PluginTool {
             let success = parsed
                 .get("success")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(result.status.success());
+                .unwrap_or(exit_status.success());
             return Ok(ToolResult {
                 output,
                 success,
@@ -179,16 +240,16 @@ impl Tool for PluginTool {
 
         // Fallback: raw stdout + stderr
         let mut output = stdout.to_string();
-        if !stderr.is_empty() {
+        if !stderr_text.is_empty() {
             if !output.is_empty() {
                 output.push('\n');
             }
-            output.push_str(&stderr);
+            output.push_str(&stderr_text);
         }
 
         Ok(ToolResult {
             output,
-            success: result.status.success(),
+            success: exit_status.success(),
             ..Default::default()
         })
     }

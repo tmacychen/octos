@@ -101,6 +101,7 @@ impl EventHandler for Handler {
                 "message_id": msg.id.to_string(),
                 "guild_id": msg.guild_id.map(|g| g.to_string()),
             }),
+            message_id: None,
         };
 
         if let Err(e) = self.inbound_tx.send(inbound).await {

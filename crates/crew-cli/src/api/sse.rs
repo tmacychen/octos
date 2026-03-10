@@ -62,6 +62,9 @@ pub(crate) fn event_to_json(event: &ProgressEvent) -> serde_json::Value {
         ProgressEvent::ToolCompleted { name, success, .. } => {
             serde_json::json!({"type": "tool_end", "tool": name, "success": success})
         }
+        ProgressEvent::ToolProgress { name, message, .. } => {
+            serde_json::json!({"type": "tool_progress", "tool": name, "message": message})
+        }
         ProgressEvent::StreamChunk { text, .. } => {
             serde_json::json!({"type": "token", "text": text})
         }

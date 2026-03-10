@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crew_agent::progress::ProgressEvent;
+use crew_agent::tools::TOOL_CTX;
 use crew_agent::TokenTracker;
 use crew_core::{Message, MessageRole, TokenUsage};
 use crew_llm::{ChatConfig, LlmProvider, ProviderRouter};
@@ -96,6 +98,17 @@ struct DynamicTask {
     task: String,
     #[serde(default)]
     label: Option<String>,
+}
+
+/// Report pipeline progress via the task-local TOOL_CTX reporter (if available).
+fn report_progress(message: &str) {
+    if let Ok(ctx) = TOOL_CTX.try_with(|c| c.clone()) {
+        ctx.reporter.report(ProgressEvent::ToolProgress {
+            name: "run_pipeline".to_string(),
+            tool_id: ctx.tool_id.clone(),
+            message: message.to_string(),
+        });
+    }
 }
 
 /// Resolve an LLM provider from a model key using an optional router.
@@ -390,6 +403,12 @@ impl PipelineExecutor {
             "starting pipeline execution"
         );
 
+        report_progress(&format!(
+            "Pipeline '{}' started ({} nodes)",
+            graph.id,
+            graph.nodes.len()
+        ));
+
         loop {
             let node = graph
                 .nodes
@@ -468,6 +487,8 @@ impl PipelineExecutor {
                 let fan_start = Instant::now();
 
                 // Prepare and execute all targets concurrently
+                let total_targets = targets.len();
+                let par_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let mut futures = Vec::new();
                 for target_id in &targets {
                     let target_node = graph
@@ -503,6 +524,9 @@ impl PipelineExecutor {
                     let handler = handler.clone();
                     let max_retries = target_with_prompt.max_retries;
                     let tid = target_id.clone();
+                    let par_label = target_with_prompt.label.clone().unwrap_or_else(|| tid.clone());
+                    let par_done = par_completed.clone();
+                    let par_node_label = node.label.as_deref().unwrap_or(&node.id).to_string();
 
                     futures.push(async move {
                         let start = Instant::now();
@@ -513,6 +537,11 @@ impl PipelineExecutor {
                             max_retries,
                         )
                         .await;
+                        let n = par_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let secs = start.elapsed().as_secs();
+                        report_progress(&format!(
+                            "{par_node_label}: '{par_label}' done ({n}/{total_targets}, {secs}s)"
+                        ));
                         (tid, target_with_prompt, start.elapsed(), result)
                     });
                 }
@@ -631,6 +660,9 @@ impl PipelineExecutor {
                      Respond with ONLY a JSON array of objects with \"task\" and \"label\" fields.",
                 );
 
+                let dp_label = node.label.as_deref().unwrap_or(&node.id);
+                report_progress(&format!("{dp_label}: planning sub-tasks..."));
+
                 info!(
                     node = %node.id,
                     planner_model = %planner_provider.model_id(),
@@ -718,6 +750,16 @@ impl PipelineExecutor {
                     bridge.set_words(words);
                 }
 
+                let worker_labels: Vec<String> = synthetic_nodes
+                    .iter()
+                    .map(|(_, n)| n.label.as_deref().unwrap_or(&n.id).to_string())
+                    .collect();
+                report_progress(&format!(
+                    "{dp_label}: {} workers running ({})",
+                    synthetic_nodes.len(),
+                    worker_labels.join(", ")
+                ));
+
                 info!(
                     node = %node.id,
                     tasks = synthetic_nodes.len(),
@@ -732,6 +774,8 @@ impl PipelineExecutor {
                 })?;
 
                 // Execute all synthetic nodes concurrently
+                let total_workers = synthetic_nodes.len();
+                let completed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let mut futures = Vec::new();
                 for (task_id, mut synth_node) in synthetic_nodes {
                     // Apply variable substitution to synthetic prompt
@@ -753,12 +797,20 @@ impl PipelineExecutor {
 
                     let handler = codergen_handler.clone();
                     let max_retries = synth_node.max_retries;
+                    let worker_label = synth_node.label.clone().unwrap_or_else(|| task_id.clone());
+                    let dp_label = dp_label.clone();
+                    let done_count = completed_count.clone();
 
                     futures.push(async move {
                         let start = Instant::now();
                         let result =
                             execute_with_retries_static(&handler, &synth_node, &ctx, max_retries)
                                 .await;
+                        let n = done_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let secs = start.elapsed().as_secs();
+                        report_progress(&format!(
+                            "{dp_label}: '{worker_label}' done ({n}/{total_workers}, {secs}s)"
+                        ));
                         (task_id, synth_node, start.elapsed(), result)
                     });
                 }
@@ -776,6 +828,12 @@ impl PipelineExecutor {
                 }
 
                 let fan_duration = fan_start.elapsed().as_millis() as u64;
+
+                report_progress(&format!(
+                    "{dp_label}: done ({} workers, {:.0}s)",
+                    tasks.len(),
+                    fan_duration as f64 / 1000.0
+                ));
 
                 info!(
                     node = %node.id,
@@ -880,6 +938,9 @@ impl PipelineExecutor {
                 bridge.set_words(vec![label.to_string()]);
             }
 
+            let seq_label = node.label.as_deref().unwrap_or(&node.id);
+            report_progress(&format!("{seq_label}: running..."));
+
             info!(
                 node = %node.id,
                 handler = ?node.handler,
@@ -895,6 +956,11 @@ impl PipelineExecutor {
                 .await?;
 
             let duration_ms = node_start.elapsed().as_millis() as u64;
+
+            report_progress(&format!(
+                "{seq_label}: done ({:.0}s)",
+                duration_ms as f64 / 1000.0
+            ));
 
             info!(
                 node = %node.id,
@@ -925,6 +991,11 @@ impl PipelineExecutor {
 
             // Check goal gate
             if node.goal_gate && outcome.status == OutcomeStatus::Pass {
+                report_progress(&format!(
+                    "Pipeline '{}' complete ({:.0}s)",
+                    graph.id,
+                    pipeline_start.elapsed().as_secs_f64()
+                ));
                 info!(
                     pipeline = %graph.id,
                     goal_node = %node.id,

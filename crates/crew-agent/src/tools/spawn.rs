@@ -446,6 +446,7 @@ impl Tool for SpawnTool {
                         "deliver_to_channel": origin_channel,
                         "deliver_to_chat_id": origin_chat_id,
                     }),
+                    message_id: None,
                 };
 
                 if let Err(e) = inbound_tx.send(announce).await {

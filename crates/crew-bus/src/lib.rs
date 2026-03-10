@@ -12,6 +12,8 @@ pub mod markdown_html;
 pub mod media;
 pub mod session;
 
+#[cfg(feature = "api")]
+pub mod api_channel;
 #[cfg(feature = "discord")]
 pub mod discord_channel;
 #[cfg(feature = "email")]
@@ -40,6 +42,8 @@ pub use session::{
     ActiveSessionStore, Session, SessionListEntry, SessionManager, validate_topic_name,
 };
 
+#[cfg(feature = "api")]
+pub use api_channel::ApiChannel;
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
 #[cfg(feature = "email")]

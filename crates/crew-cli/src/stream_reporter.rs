@@ -24,6 +24,10 @@ pub enum StreamProgressEvent {
     ToolStarted { name: String },
     /// A tool completed.
     ToolCompleted { name: String, success: bool },
+    /// Mid-execution progress from a tool.
+    ToolProgress { name: String, message: String },
+    /// LLM call status update (retry progress, provider switching).
+    LlmStatus { message: String },
 }
 
 /// A `ProgressReporter` that forwards stream events through an unbounded channel.
@@ -52,6 +56,12 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::ToolStarted { name, .. } => StreamProgressEvent::ToolStarted { name },
             ProgressEvent::ToolCompleted { name, success, .. } => {
                 StreamProgressEvent::ToolCompleted { name, success }
+            }
+            ProgressEvent::ToolProgress { name, message, .. } => {
+                StreamProgressEvent::ToolProgress { name, message }
+            }
+            ProgressEvent::LlmStatus { message, .. } => {
+                StreamProgressEvent::LlmStatus { message }
             }
             _ => return,
         };
@@ -167,6 +177,35 @@ pub async fn run_stream_forwarder(
                     flush_to_channel(&channel, &chat_id, &buffer, &mut message_id).await;
                     last_edit = Instant::now();
                 }
+            }
+            StreamProgressEvent::ToolProgress { name, message } => {
+                // Update the tool status line with the progress message
+                if !buffer.is_empty() {
+                    let pending = format!("⚙ `{name}`...");
+                    let progress = format!("⚙ `{name}`: {message}");
+                    if buffer.contains(&pending) {
+                        buffer = buffer.replace(&pending, &progress);
+                    } else {
+                        // Replace previous progress line for this tool
+                        let prev_prefix = format!("⚙ `{name}`:");
+                        if let Some(pos) = buffer.rfind(&prev_prefix) {
+                            let end = buffer[pos..]
+                                .find('\n')
+                                .map_or(buffer.len(), |i| pos + i);
+                            buffer.replace_range(pos..end, &progress);
+                        }
+                    }
+                    if last_edit.elapsed() >= EDIT_THROTTLE {
+                        flush_to_channel(&channel, &chat_id, &buffer, &mut message_id).await;
+                        last_edit = Instant::now();
+                    }
+                }
+            }
+            StreamProgressEvent::LlmStatus { message } => {
+                // Show retry/failover status as a temporary message
+                let status_text = format!("⟳ {message}");
+                flush_to_channel(&channel, &chat_id, &status_text, &mut message_id).await;
+                last_edit = Instant::now();
             }
         }
     }

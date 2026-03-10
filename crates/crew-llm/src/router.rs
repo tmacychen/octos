@@ -241,6 +241,12 @@ impl LlmProvider for ProviderRouter {
     fn provider_name(&self) -> &str {
         "router"
     }
+
+    fn report_late_failure(&self) {
+        if let Ok(p) = self.active_provider() {
+            p.report_late_failure();
+        }
+    }
 }
 
 #[cfg(test)]

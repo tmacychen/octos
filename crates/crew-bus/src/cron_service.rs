@@ -282,6 +282,7 @@ impl CronService {
                 "deliver_to_channel": job.payload.channel,
                 "deliver_to_chat_id": job.payload.chat_id,
             }),
+            message_id: None,
         };
 
         if let Err(e) = self.inbound_tx.send(msg).await {

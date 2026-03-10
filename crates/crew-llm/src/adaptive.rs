@@ -885,6 +885,22 @@ impl LlmProvider for AdaptiveRouter {
     fn export_metrics(&self) -> Option<serde_json::Value> {
         serde_json::to_value(self.export_shared_metrics()).ok()
     }
+
+    fn report_late_failure(&self) {
+        let (idx, _) = self.select_provider();
+        self.slots[idx].metrics.record_failure();
+        let consec = self.slots[idx]
+            .metrics
+            .consecutive_failures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if consec >= self.config.failure_threshold {
+            warn!(
+                provider = self.slots[idx].provider.provider_name(),
+                consecutive_failures = consec,
+                "provider circuit breaker opened (late failure)"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1532,5 +1548,92 @@ mod tests {
         let status = router.adaptive_status();
         assert!(status.qos_ranking);
         assert_eq!(status.mode, AdaptiveMode::Hedge);
+    }
+
+    #[test]
+    fn should_record_failure_on_report_late_failure() {
+        let config = AdaptiveConfig {
+            failure_threshold: 2,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+
+        // Initially no failures
+        assert_eq!(
+            router.slots[0]
+                .metrics
+                .consecutive_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Report late failure increments failure count on selected provider
+        router.report_late_failure();
+        assert_eq!(
+            router.slots[0]
+                .metrics
+                .consecutive_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        // Second late failure trips the circuit breaker (threshold=2)
+        router.report_late_failure();
+        assert!(router.slots[0].metrics.is_circuit_open(2));
+    }
+
+    #[tokio::test]
+    async fn should_failover_after_late_failure_opens_circuit() {
+        let config = AdaptiveConfig {
+            failure_threshold: 1,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+
+        // Late failure opens circuit breaker on primary
+        router.report_late_failure();
+        assert!(router.slots[0].metrics.is_circuit_open(1));
+
+        // Next call should skip circuit-broken primary and go to fallback
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-fallback"));
     }
 }

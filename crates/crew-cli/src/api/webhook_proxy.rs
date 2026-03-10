@@ -145,6 +145,65 @@ async fn proxy_to_gateway_with_bytes(
     response
 }
 
+/// Streaming SSE proxy for API channel requests.
+///
+/// Forwards `POST /api/chat` to the gateway's API channel HTTP server and
+/// streams the SSE response back to the web client.
+pub async fn api_chat_proxy(
+    state: &AppState,
+    port: u16,
+    message: &str,
+    session_id: Option<&str>,
+) -> Response {
+    let url = format!("http://127.0.0.1:{port}/chat");
+    let body = serde_json::json!({
+        "message": message,
+        "session_id": session_id,
+    });
+
+    let resp = match state
+        .http_client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(port, error = %e, "API chat proxy: upstream request failed");
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("gateway proxy failed: {e}"),
+            );
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let err_body = resp.text().await.unwrap_or_default();
+        return json_error(
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            &err_body,
+        );
+    }
+
+    // Stream the SSE response body directly back to the client
+    let stream = resp.bytes_stream();
+    match Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(stream))
+    {
+        Ok(r) => r,
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to build SSE response: {e}"),
+        ),
+    }
+}
+
 /// Return a JSON error response so Feishu/Lark doesn't complain about non-JSON.
 fn json_error(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({"error": message});

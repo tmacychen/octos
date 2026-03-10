@@ -39,6 +39,11 @@ impl PluginLoader {
                     continue;
                 }
 
+                // Skip DOT-only pipeline skills (no manifest.json, only .dot files)
+                if !path.join("manifest.json").exists() {
+                    continue;
+                }
+
                 match Self::load_plugin(&path) {
                     Ok(tools) => {
                         let n = tools.len();

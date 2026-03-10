@@ -90,6 +90,7 @@ mod tests {
             timestamp: Utc::now(),
             media: vec![],
             metadata: serde_json::json!({}),
+            message_id: None,
         }
     }
 

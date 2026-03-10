@@ -77,6 +77,10 @@ pub struct GatewayCommand {
     #[arg(long, hide = true)]
     pub feishu_port: Option<u16>,
 
+    /// Override API channel port (used by managed gateways).
+    #[arg(long, hide = true)]
+    pub api_port: Option<u16>,
+
     /// LLM provider to use (overrides config).
     #[arg(long)]
     pub provider: Option<String>,
@@ -638,6 +642,7 @@ impl GatewayCommand {
                 let policy_c = tools.provider_policy().cloned();
                 let plugins_c = plugin_dirs.clone();
                 let router_c = provider_router.clone();
+                let crew_home_c = self.crew_home.clone();
 
                 struct DefaultPipelineToolFactory {
                     llm: Arc<dyn LlmProvider>,
@@ -647,6 +652,7 @@ impl GatewayCommand {
                     policy: Option<crew_agent::ToolPolicy>,
                     plugin_dirs: Vec<PathBuf>,
                     router: Option<Arc<ProviderRouter>>,
+                    crew_home: Option<PathBuf>,
                 }
 
                 impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
@@ -662,6 +668,9 @@ impl GatewayCommand {
                         if let Some(ref router) = self.router {
                             pt = pt.with_provider_router(router.clone());
                         }
+                        if let Some(ref crew_home) = self.crew_home {
+                            pt = pt.with_crew_home(crew_home.clone());
+                        }
                         Arc::new(pt)
                     }
                 }
@@ -674,6 +683,7 @@ impl GatewayCommand {
                     policy: policy_c,
                     plugin_dirs: plugins_c,
                     router: router_c,
+                    crew_home: crew_home_c,
                 })
                     as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
             }
@@ -797,6 +807,7 @@ impl GatewayCommand {
             pending_messages: pending_messages.clone(),
             queue_mode: gw_config.queue_mode,
             adaptive_router: adaptive_router_ref,
+            memory_store: Some(memory_store.clone()),
         };
 
         // Start config watcher for hot-reload
@@ -1041,6 +1052,28 @@ impl GatewayCommand {
                         .with_webhook_port(webhook_port),
                     ));
                 }
+                #[cfg(feature = "api")]
+                "api" => {
+                    let port: u16 = self
+                        .api_port
+                        .unwrap_or_else(|| {
+                            entry
+                                .settings
+                                .get("port")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(8091) as u16
+                        });
+                    let auth_token = entry
+                        .settings
+                        .get("auth_token")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    channel_mgr.register(Arc::new(crew_bus::ApiChannel::new(
+                        port,
+                        auth_token,
+                        shutdown.clone(),
+                    )));
+                }
                 other => {
                     println!(
                         "{}: channel '{}' not supported, skipping",
@@ -1210,7 +1243,10 @@ impl GatewayCommand {
                 }
             }
 
-            // Transcribe audio media and separate images (stays on main task)
+            // Transcribe audio media and separate images (stays on main task).
+            // Always append the audio file path so the agent can use it for
+            // voice_clone if needed (user may have expressed clone intent in a
+            // previous message). Transcribe as usual too — the agent decides.
             let mut image_media = Vec::new();
             let mut is_voice_message = false;
             if let Some(ref asr_bin) = asr_binary {
@@ -1227,7 +1263,6 @@ impl GatewayCommand {
                         }
                         match transcribe_via_skill(asr_bin, &input.to_string()).await {
                             Ok(text) => {
-                                // Store transcript in metadata for status indicator display
                                 if let Some(obj) = inbound.metadata.as_object_mut() {
                                     obj.insert(
                                         "voice_transcript".into(),
@@ -1239,6 +1274,10 @@ impl GatewayCommand {
                             }
                             Err(e) => warn!("transcription failed: {e}"),
                         }
+                        // Always append audio file path so agent can use it
+                        // for voice_clone / voice_save_profile if conversation
+                        // context calls for it.
+                        inbound.content.push_str(&format!("\n[Audio file: {path}]"));
                     } else if crew_bus::media::is_image(path) {
                         image_media.push(path.clone());
                     }

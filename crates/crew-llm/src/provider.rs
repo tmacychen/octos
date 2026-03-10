@@ -64,6 +64,12 @@ pub trait LlmProvider: Send + Sync {
     fn export_metrics(&self) -> Option<serde_json::Value> {
         None
     }
+
+    /// Report a late failure (e.g. empty response detected after stream consumption).
+    /// The adaptive router uses this to update failure metrics so subsequent calls
+    /// may failover to a different provider.
+    fn report_late_failure(&self) {}
+
 }
 
 /// Truncate an API error body to avoid leaking verbose internal details.

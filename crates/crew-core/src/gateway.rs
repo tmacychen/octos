@@ -17,6 +17,9 @@ pub struct InboundMessage {
     pub media: Vec<String>,
     #[serde(default = "default_metadata")]
     pub metadata: serde_json::Value,
+    /// Platform message ID (e.g. Telegram msg.id) for threading replies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// Outbound message from the agent to a channel.
@@ -57,6 +60,7 @@ mod tests {
             timestamp: Utc::now(),
             media: vec![],
             metadata: serde_json::json!({}),
+            message_id: None,
         };
         assert_eq!(msg.session_key(), SessionKey::new("telegram", "chat42"));
     }
@@ -71,6 +75,7 @@ mod tests {
             timestamp: Utc::now(),
             media: vec!["image.png".into()],
             metadata: serde_json::json!({"key": "value"}),
+            message_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: InboundMessage = serde_json::from_str(&json).unwrap();

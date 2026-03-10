@@ -249,6 +249,7 @@ impl Channel for WhatsAppChannel {
                                     "jid": sender,
                                 }
                             }),
+                            message_id: None,
                         };
 
                         if inbound_tx.send(inbound).await.is_err() {

@@ -34,16 +34,35 @@ fn main() -> Result<()> {
     // Initialize error handling
     color_eyre::install()?;
 
-    // Initialize tracing
-    init_tracing()?;
-
-    // Parse arguments and execute command
+    // Parse arguments first to determine logging setup
     let args = Args::parse();
+
+    // Determine log directory for serve command (enables rolling file logs)
+    #[allow(unused_mut)]
+    let mut log_dir: Option<std::path::PathBuf> = None;
+    #[cfg(feature = "api")]
+    if let commands::Command::Serve(ref cmd) = args.command {
+        let data_dir = commands::resolve_data_dir(cmd.data_dir.clone())?;
+        let dir = data_dir.join("logs");
+        std::fs::create_dir_all(&dir).ok();
+        log_dir = Some(dir);
+    }
+
+    // Initialize tracing (with optional rolling file output for serve)
+    let _log_guard = init_tracing(log_dir.as_deref())?;
+
     args.command.execute()
 }
 
-fn init_tracing() -> Result<()> {
-    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+/// Initialize tracing with console output and optional rolling file output.
+///
+/// When `log_dir` is `Some`, logs are also written to daily-rotated files
+/// under that directory (e.g. `~/.crew/logs/serve.2026-03-09.log`), keeping
+/// the last 7 days.  The returned guard must be held for the program lifetime.
+fn init_tracing(
+    log_dir: Option<&std::path::Path>,
+) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+    use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
@@ -53,30 +72,53 @@ fn init_tracing() -> Result<()> {
     // Check if JSON format is requested via environment
     let json_logs = std::env::var("CREW_LOG_JSON").is_ok();
 
-    if json_logs {
-        // JSON format for structured logging (good for log aggregation)
-        tracing_subscriber::registry()
-            .with(
-                fmt::layer()
-                    .json()
-                    .with_target(true)
-                    .with_span_list(true)
-                    .with_current_span(true),
-            )
-            .with(filter)
-            .init();
+    // Console layer (boxed so we can unify json vs compact types)
+    let console_layer: Box<dyn Layer<_> + Send + Sync> = if json_logs {
+        fmt::layer()
+            .json()
+            .with_target(true)
+            .with_span_list(true)
+            .with_current_span(true)
+            .boxed()
     } else {
-        // Human-readable format (default)
+        fmt::layer()
+            .with_target(false)
+            .with_thread_ids(false)
+            .compact()
+            .boxed()
+    };
+
+    if let Some(dir) = log_dir {
+        // Rolling daily log file, keep last 7 days
+        let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("serve")
+            .filename_suffix("log")
+            .max_log_files(7)
+            .build(dir)
+            .map_err(|e| eyre::eyre!("failed to create log file appender: {e}"))?;
+
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        let file_layer = fmt::layer()
+            .with_ansi(false)
+            .with_target(false)
+            .compact()
+            .with_writer(non_blocking);
+
         tracing_subscriber::registry()
-            .with(
-                fmt::layer()
-                    .with_target(false)
-                    .with_thread_ids(false)
-                    .compact(),
-            )
+            .with(console_layer)
+            .with(file_layer)
             .with(filter)
             .init();
-    }
 
-    Ok(())
+        Ok(Some(guard))
+    } else {
+        tracing_subscriber::registry()
+            .with(console_layer)
+            .with(filter)
+            .init();
+
+        Ok(None)
+    }
 }

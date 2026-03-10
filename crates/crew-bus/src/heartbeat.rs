@@ -105,6 +105,7 @@ impl HeartbeatService {
                 "deliver_to_channel": "cli",
                 "deliver_to_chat_id": "heartbeat",
             }),
+            message_id: None,
         };
 
         if let Err(e) = self.inbound_tx.send(msg).await {

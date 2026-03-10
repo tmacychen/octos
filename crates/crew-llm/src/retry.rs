@@ -250,6 +250,10 @@ impl LlmProvider for RetryProvider {
     fn provider_name(&self) -> &str {
         self.inner.provider_name()
     }
+
+    fn report_late_failure(&self) {
+        self.inner.report_late_failure();
+    }
 }
 
 #[cfg(test)]

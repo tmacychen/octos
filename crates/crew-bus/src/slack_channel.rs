@@ -338,6 +338,7 @@ impl Channel for SlackChannel {
                             "channel_type": channel_type,
                         }
                     }),
+                    message_id: None,
                 };
 
                 if inbound_tx.send(inbound).await.is_err() {

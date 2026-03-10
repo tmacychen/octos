@@ -129,6 +129,10 @@ impl LlmProvider for MiddlewareStack {
     fn context_window(&self) -> u32 {
         self.inner.context_window()
     }
+
+    fn report_late_failure(&self) {
+        self.inner.report_late_failure();
+    }
 }
 
 /// Middleware that logs request/response metadata via `tracing`.

@@ -18,7 +18,7 @@ use crew_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
     ResponsivenessObserver,
 };
-use crew_memory::EpisodeStore;
+use crew_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -293,6 +293,9 @@ pub struct ActorFactory {
     /// Side-channel to the AdaptiveRouter for responsiveness feedback.
     /// None when adaptive routing is disabled or using a static provider chain.
     pub adaptive_router: Option<Arc<AdaptiveRouter>>,
+    /// Memory store for saving long-form outputs (research reports) to the
+    /// memory bank so only a summary is injected into session context.
+    pub memory_store: Option<Arc<MemoryStore>>,
 }
 
 /// Trait for creating per-session ToolRegistry instances.
@@ -448,6 +451,7 @@ impl ActorFactory {
             queue_mode: self.queue_mode,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: self.adaptive_router.clone(),
+            memory_store: self.memory_store.clone(),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -565,6 +569,8 @@ struct SessionActor {
     responsiveness: ResponsivenessObserver,
     /// Side-channel to AdaptiveRouter for toggling auto-protection.
     adaptive_router: Option<Arc<AdaptiveRouter>>,
+    /// Memory store for saving long research reports out-of-band.
+    memory_store: Option<Arc<MemoryStore>>,
 }
 
 impl SessionActor {
@@ -916,26 +922,72 @@ impl SessionActor {
         }
     }
 
-    /// Inject a background task result as a system message into the conversation.
-    /// This avoids an extra LLM round-trip — the result is available in context
-    /// for the next user message.
+    /// Inject a background task result into the conversation.
+    ///
+    /// For long results (>1000 chars), the full content is saved to the memory
+    /// bank and only a summary is injected into session context.  The agent can
+    /// retrieve the full report via `recall_memory("<slug>")`.
     async fn inject_background_result(&self, task_label: &str, content: &str) {
-        let system_msg = Message::system(format!(
-            "[Background task \"{task_label}\" completed]\n\n{content}"
-        ));
+        const SUMMARY_THRESHOLD: usize = 1000;
+        const SUMMARY_CHARS: usize = 800;
 
+        let (context_content, notification) = if content.len() > SUMMARY_THRESHOLD {
+            // Save full report to memory bank
+            let slug = task_label
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+                .collect::<String>()
+                .to_lowercase();
+            let slug = slug.trim_matches('-').to_string();
+
+            if let Some(ref ms) = self.memory_store {
+                let report_md = format!(
+                    "# {task_label}\n\n_Generated: {}_\n\n{content}",
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
+                );
+                if let Err(e) = ms.write_entity(&slug, &report_md).await {
+                    warn!(session = %self.session_key, error = %e, "failed to save report to memory bank");
+                } else {
+                    info!(session = %self.session_key, slug = %slug, len = content.len(), "saved report to memory bank");
+                }
+            }
+
+            // Truncate for context injection
+            let summary: String = content.chars().take(SUMMARY_CHARS).collect();
+            let ctx = format!(
+                "[Background task \"{task_label}\" completed]\n\n\
+                 {summary}\n\n[... truncated — full report ({} chars) saved to memory bank as \"{slug}\". \
+                 Use recall_memory(\"{slug}\") to load the complete report.]",
+                content.len(),
+            );
+
+            // Notification includes a preview for the user
+            let preview: String = content.chars().take(300).collect();
+            let notif = format!(
+                "✅ **{task_label}** completed.\n\n{preview}...\n\n_Full report saved. Ask me to recall it for details._",
+            );
+
+            (ctx, notif)
+        } else {
+            // Short result — inject fully
+            let ctx = format!("[Background task \"{task_label}\" completed]\n\n{content}");
+            let notif = format!("✅ **{task_label}** completed.\n\n{content}");
+            (ctx, notif)
+        };
+
+        let system_msg = Message::system(context_content);
         let mut mgr = self.session_mgr.lock().await;
         if let Err(e) = mgr.add_message(&self.session_key, system_msg).await {
             warn!(session = %self.session_key, error = %e, "failed to inject background result");
         }
 
-        // Notify user the background task finished
+        // Notify user with preview
         let _ = self
             .out_tx
             .send(OutboundMessage {
                 channel: self.channel.clone(),
                 chat_id: self.chat_id.clone(),
-                content: format!("✅ Background task \"{task_label}\" completed."),
+                content: notification,
                 reply_to: None,
                 media: vec![],
                 metadata: serde_json::json!({}),
@@ -953,6 +1005,9 @@ impl SessionActor {
         inbound: InboundMessage,
         image_media: Vec<String>,
     ) {
+        // Capture the platform message ID for reply threading
+        let inbound_message_id = inbound.message_id.clone();
+
         let patience = self
             .responsiveness
             .baseline()
@@ -1074,6 +1129,14 @@ impl SessionActor {
             vec![]
         };
 
+        // Snapshot for overflow tasks: conversation context BEFORE the
+        // primary task, EXCLUDING the primary user message.  Overflow needs
+        // identity, preferences, and prior exchanges, but must NOT see the
+        // primary question — otherwise the LLM re-answers it alongside the
+        // overflow question.  Same base as history_for_agent (primary user
+        // message stripped).
+        let overflow_history = history_for_agent.clone();
+
         let mut agent_task = tokio::spawn(async move {
             let start = Instant::now();
             let result = tokio::time::timeout(
@@ -1125,7 +1188,7 @@ impl SessionActor {
                             );
                             // Always spawn — the user sent a new message while
                             // the primary is running, so it needs processing.
-                            self.serve_overflow(&message, max_history);
+                            self.serve_overflow(&message, &overflow_history);
                             overflow_served = true;
                         }
                         Some(ActorMessage::BackgroundResult { task_label, content }) => {
@@ -1294,7 +1357,7 @@ impl SessionActor {
                                 channel: self.channel.clone(),
                                 chat_id: self.chat_id.clone(),
                                 content: display_content,
-                                reply_to: None,
+                                reply_to: inbound_message_id.clone(),
                                 media: vec![],
                                 metadata: serde_json::json!({}),
                             })
@@ -1310,7 +1373,7 @@ impl SessionActor {
                         channel: self.channel.clone(),
                         chat_id: self.chat_id.clone(),
                         content: format!("Error: {e}"),
-                        reply_to: None,
+                        reply_to: inbound_message_id.clone(),
                         media: vec![],
                         metadata: serde_json::json!({}),
                     })
@@ -1324,24 +1387,40 @@ impl SessionActor {
                         channel: self.channel.clone(),
                         chat_id: self.chat_id.clone(),
                         content: "Processing timed out. Please try again.".to_string(),
-                        reply_to: None,
+                        reply_to: inbound_message_id.clone(),
                         media: vec![],
                         metadata: serde_json::json!({}),
                     })
                     .await;
             }
         }
+
+        // Send completion marker so the API channel can close the SSE stream.
+        if self.channel == "api" {
+            let _ = self
+                .out_tx
+                .send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: String::new(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({"_completion": true}),
+                })
+                .await;
+        }
     }
 
     /// Spawn a full agent task for an overflow message (with tools).
     /// The task runs concurrently with the primary agent call.
-    /// When it completes, it saves results to session history and sends
-    /// the response to the user.
-    fn serve_overflow(&self, msg: &InboundMessage, _max_history: usize) {
+    /// Each overflow gets its own chat bubble (stream reporter + status
+    /// indicator) so the user sees independent progress per message.
+    fn serve_overflow(&self, msg: &InboundMessage, pre_primary_history: &[Message]) {
         info!(
             session = %self.session_key,
             overflow_content_len = msg.content.len(),
-            "speculative: spawning full agent task for overflow"
+            history_len = pre_primary_history.len(),
+            "speculative: spawning full agent task for overflow with own chat bubble"
         );
 
         // Clone everything needed for the spawned task
@@ -1352,8 +1431,10 @@ impl SessionActor {
         let chat_id = self.chat_id.clone();
         let session_key = self.session_key.clone();
         let content = msg.content.clone();
+        let overflow_reply_to = msg.message_id.clone();
         let session_timeout = self.session_timeout;
         let status_indicator = self.status_indicator.clone();
+        let history = pre_primary_history.to_vec();
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -1371,25 +1452,69 @@ impl SessionActor {
                 let _ = mgr.add_message(&session_key, user_msg).await;
             }
 
-            // Use empty history so the overflow agent treats this as a fresh
-            // standalone question.  Loading the full session history causes the
-            // LLM to re-answer questions the primary task is already handling,
-            // producing duplicate content.  The system prompt still provides
-            // personality and instructions.
-            let history: Vec<Message> = vec![];
-
-            // Start typing indicator
-            if let Some(ref si) = status_indicator {
-                let _ = si.channel().send_typing(&chat_id).await;
-            }
-
-            // Run full agent with tools
+            let history: Vec<Message> = history;
             let tracker = Arc::new(TokenTracker::new());
-            let result = tokio::time::timeout(
-                session_timeout,
-                agent.process_message_tracked(&content, &history, vec![], &tracker),
-            )
+
+            // ── Per-overflow status indicator (own "✦ Thinking..." message) ──
+            let status_handle = status_indicator.as_ref().map(|si| {
+                si.start(
+                    chat_id.clone(),
+                    &content,
+                    Arc::clone(&tracker),
+                    None,
+                )
+            });
+
+            // ── Per-overflow stream reporter (own chat bubble) ──────────────
+            let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+            let overflow_reporter: Arc<dyn crew_agent::ProgressReporter> =
+                Arc::new(crate::stream_reporter::ChannelStreamReporter::new(stream_tx));
+
+            // Spawn stream forwarder — edits its OWN message, not the primary's
+            let stream_forwarder = if let Some(ref si) = status_indicator {
+                let fwd_channel = Arc::clone(si.channel());
+                let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
+                let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+                Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
+                    stream_rx,
+                    fwd_channel,
+                    chat_id.clone(),
+                    cancel_status,
+                    status_msg_id,
+                )))
+            } else {
+                drop(stream_rx);
+                None
+            };
+
+            // ── Run agent with task-local reporter override ─────────────────
+            let reporter_for_scope = overflow_reporter.clone();
+            let result = crew_agent::TASK_REPORTER.scope(reporter_for_scope, async {
+                tokio::time::timeout(
+                    session_timeout,
+                    agent.process_message_tracked(&content, &history, vec![], &tracker),
+                )
+                .await
+            })
             .await;
+
+            // Drop the reporter so the stream forwarder sees channel close
+            drop(overflow_reporter);
+
+            // Wait for stream forwarder to finish flushing
+            let stream_result = if let Some(handle) = stream_forwarder {
+                match handle.await {
+                    Ok(sr) => Some(sr),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            // Stop status indicator (deletes the "✦ Thinking..." message)
+            if let Some(handle) = status_handle {
+                handle.stop().await;
+            }
 
             match result {
                 Ok(Ok(conv_response)) => {
@@ -1409,13 +1534,19 @@ impl SessionActor {
                     }
 
                     let reply = strip_think_tags(&conv_response.content);
-                    if !reply.trim().is_empty() {
+                    // If streaming already delivered the reply (edited into
+                    // the stream message), skip the duplicate out_tx send.
+                    let already_streamed = stream_result
+                        .as_ref()
+                        .map_or(false, |sr| sr.message_id.is_some());
+
+                    if !reply.trim().is_empty() && !already_streamed {
                         let _ = out_tx
                             .send(OutboundMessage {
                                 channel,
                                 chat_id,
                                 content: reply,
-                                reply_to: None,
+                                reply_to: overflow_reply_to,
                                 media: vec![],
                                 metadata: serde_json::json!({}),
                             })
@@ -1429,7 +1560,7 @@ impl SessionActor {
                             channel,
                             chat_id,
                             content: format!("Error: {e}"),
-                            reply_to: None,
+                            reply_to: overflow_reply_to,
                             media: vec![],
                             metadata: serde_json::json!({}),
                         })
@@ -1441,7 +1572,7 @@ impl SessionActor {
                             channel,
                             chat_id,
                             content: "Processing timed out.".to_string(),
-                            reply_to: None,
+                            reply_to: overflow_reply_to,
                             media: vec![],
                             metadata: serde_json::json!({}),
                         })
@@ -1452,6 +1583,9 @@ impl SessionActor {
     }
 
     async fn process_inbound(&mut self, inbound: InboundMessage, image_media: Vec<String>) {
+        // Capture the platform message ID for reply threading
+        let inbound_message_id = inbound.message_id.clone();
+
         // Acquire concurrency permit
         let _permit = match self.semaphore.acquire().await {
             Ok(p) => p,
@@ -1658,7 +1792,7 @@ impl SessionActor {
                                 channel: self.channel.clone(),
                                 chat_id: self.chat_id.clone(),
                                 content: display_content,
-                                reply_to: None,
+                                reply_to: inbound_message_id.clone(),
                                 media: vec![],
                                 metadata: serde_json::json!({}),
                             })
@@ -1674,7 +1808,7 @@ impl SessionActor {
                         channel: self.channel.clone(),
                         chat_id: self.chat_id.clone(),
                         content: format!("Error: {e}"),
-                        reply_to: None,
+                        reply_to: inbound_message_id.clone(),
                         media: vec![],
                         metadata: serde_json::json!({}),
                     })
@@ -1688,12 +1822,27 @@ impl SessionActor {
                         channel: self.channel.clone(),
                         chat_id: self.chat_id.clone(),
                         content: "Processing timed out. Please try again.".to_string(),
-                        reply_to: None,
+                        reply_to: inbound_message_id.clone(),
                         media: vec![],
                         metadata: serde_json::json!({}),
                     })
                     .await;
             }
+        }
+
+        // Send completion marker so the API channel can close the SSE stream.
+        if self.channel == "api" {
+            let _ = self
+                .out_tx
+                .send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: String::new(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({"_completion": true}),
+                })
+                .await;
         }
     }
 }
@@ -1813,6 +1962,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 media: vec![],
                 metadata: serde_json::json!({}),
+                message_id: None,
             },
             image_media: vec![],
         }
@@ -1880,6 +2030,7 @@ mod tests {
             queue_mode,
             responsiveness,
             adaptive_router,
+            memory_store: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -1955,6 +2106,7 @@ mod tests {
             queue_mode: QueueMode::Speculative,
             responsiveness,
             adaptive_router: Some(router),
+            memory_store: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -2109,10 +2261,10 @@ mod tests {
 
     /// Test that messages within patience threshold are NOT served as overflow.
     #[tokio::test]
-    async fn test_speculative_within_patience_drops() {
+    async fn test_speculative_within_patience_serves_both() {
         let dir = tempfile::TempDir::new().unwrap();
 
-        // Agent: 5 warmups + primary at 5s (within 10s patience)
+        // Agent: 5 warmups + primary (5s) + overflow (fast)
         let agent_llm = Arc::new(DelayedMockProvider::new(
             "agent",
             vec![
@@ -2122,22 +2274,22 @@ mod tests {
                 (Duration::from_millis(200), make_response("w4")),
                 (Duration::from_millis(200), make_response("w5")),
                 (Duration::from_secs(5), make_response("primary done")),
+                (Duration::from_millis(100), make_response("overflow done")),
             ],
         ));
 
-        // Router providers (should NOT be consumed since overflow not triggered)
         let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
             "router-a",
             vec![(
                 Duration::from_millis(100),
-                make_response("should not appear"),
+                make_response("unused"),
             )],
         ));
         let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
             "router-b",
             vec![(
                 Duration::from_millis(100),
-                make_response("should not appear"),
+                make_response("unused"),
             )],
         ));
 
@@ -2153,11 +2305,11 @@ mod tests {
         // Send primary (5s)
         tx.send(make_inbound("medium task")).await.unwrap();
 
-        // Send overflow at 2s (within 10s patience)
+        // Send overflow at 2s (within 10s patience) — should still be served
         tokio::time::sleep(Duration::from_secs(2)).await;
         tx.send(make_inbound("quick question")).await.unwrap();
 
-        // Collect responses — should only get 1 (primary), overflow dropped
+        // Collect responses — should get 2 (both overflow and primary)
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -2169,15 +2321,21 @@ mod tests {
 
         assert_eq!(
             responses.len(),
-            1,
-            "expected exactly 1 response (primary only, overflow dropped), got {}: {:?}",
+            2,
+            "expected 2 responses (overflow + primary), got {}: {:?}",
             responses.len(),
             responses
         );
+        // Overflow finishes first (fast), primary finishes second (5s)
         assert!(
-            responses[0].contains("primary done"),
-            "expected primary response, got: {}",
-            responses[0]
+            responses.iter().any(|r| r.contains("overflow done")),
+            "expected overflow response, got: {:?}",
+            responses
+        );
+        assert!(
+            responses.iter().any(|r| r.contains("primary done")),
+            "expected primary response, got: {:?}",
+            responses
         );
 
         drop(tx);
