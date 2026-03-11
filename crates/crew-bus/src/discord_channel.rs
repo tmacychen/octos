@@ -12,7 +12,8 @@ use eyre::{Result, WrapErr};
 use reqwest::Client as HttpClient;
 use serenity::Client;
 use serenity::all::{
-    Context, EventHandler, GatewayIntents, Http, Message as DiscordMessage, Ready,
+    Context, EditMessage, EventHandler, GatewayIntents, Http, Message as DiscordMessage,
+    MessageId, Ready,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -160,6 +161,65 @@ impl Channel for DiscordChannel {
             .say(&*self.http, &msg.content)
             .await
             .wrap_err("failed to send Discord message")?;
+
+        Ok(())
+    }
+
+    async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
+        let channel_id: u64 = msg
+            .chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord channel_id: {}", msg.chat_id))?;
+
+        let channel = serenity::model::id::ChannelId::new(channel_id);
+
+        let sent = channel
+            .say(&*self.http, &msg.content)
+            .await
+            .wrap_err("failed to send Discord message")?;
+
+        Ok(Some(sent.id.to_string()))
+    }
+
+    async fn edit_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        new_content: &str,
+    ) -> Result<()> {
+        let channel_id: u64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord channel_id: {chat_id}"))?;
+        let msg_id: u64 = message_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord message_id: {message_id}"))?;
+
+        let channel = serenity::model::id::ChannelId::new(channel_id);
+        channel
+            .edit_message(
+                &*self.http,
+                MessageId::new(msg_id),
+                EditMessage::new().content(new_content),
+            )
+            .await
+            .wrap_err("failed to edit Discord message")?;
+
+        Ok(())
+    }
+
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        let channel_id: u64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord channel_id: {chat_id}"))?;
+        let msg_id: u64 = message_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord message_id: {message_id}"))?;
+
+        let channel = serenity::model::id::ChannelId::new(channel_id);
+        channel
+            .delete_message(&*self.http, MessageId::new(msg_id))
+            .await
+            .wrap_err("failed to delete Discord message")?;
 
         Ok(())
     }
