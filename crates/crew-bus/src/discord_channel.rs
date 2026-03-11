@@ -12,8 +12,8 @@ use eyre::{Result, WrapErr};
 use reqwest::Client as HttpClient;
 use serenity::Client;
 use serenity::all::{
-    Context, EditMessage, EventHandler, GatewayIntents, Http, Message as DiscordMessage,
-    MessageId, Ready,
+    Context, EditMessage, EventHandler, GatewayIntents, Http, Message as DiscordMessage, MessageId,
+    Ready,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -185,12 +185,7 @@ impl Channel for DiscordChannel {
         Ok(Some(sent.id.to_string()))
     }
 
-    async fn edit_message(
-        &self,
-        chat_id: &str,
-        message_id: &str,
-        new_content: &str,
-    ) -> Result<()> {
+    async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
         let channel_id: u64 = chat_id
             .parse()
             .wrap_err_with(|| format!("invalid Discord channel_id: {chat_id}"))?;

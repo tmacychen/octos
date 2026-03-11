@@ -19,7 +19,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::channel::Channel;
 use crate::media::{download_media, is_image};
-use crate::wecom_crypto::{decode_aes_key, decrypt_wecom_message, verify_wecom_signature, xml_extract};
+use crate::wecom_crypto::{
+    decode_aes_key, decrypt_wecom_message, verify_wecom_signature, xml_extract,
+};
 
 /// Token refresh interval (slightly under 2 hours).
 const TOKEN_TTL_SECS: u64 = 7000;

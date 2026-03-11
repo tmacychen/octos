@@ -44,8 +44,10 @@ const MAX_SEEN_IDS: usize = 1000;
 /// Max message length for WeCom markdown.
 const MAX_MSG_LENGTH: usize = 4096;
 
-type WsSink =
-    SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, WsMessage>;
+type WsSink = SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    WsMessage,
+>;
 
 /// WeCom Group Robot channel (WebSocket long connection).
 ///
@@ -183,7 +185,10 @@ impl WeComBotChannel {
             return None;
         }
 
-        info!(msg_id, msg_type, from_user, chat_id, "WeComBot: parsed message");
+        info!(
+            msg_id,
+            msg_type, from_user, chat_id, "WeComBot: parsed message"
+        );
 
         Some(InboundMessage {
             channel: "wecom-bot".into(),
@@ -291,9 +296,7 @@ impl WeComBotChannel {
         }
 
         // Process incoming frames
-        let result = self
-            .process_frames(stream, inbound_tx)
-            .await;
+        let result = self.process_frames(stream, inbound_tx).await;
 
         // Clear sink on disconnect
         {
@@ -710,6 +713,11 @@ mod tests {
     fn should_build_ping_frame() {
         let frame: Value = serde_json::from_str(&WeComBotChannel::ping_frame()).unwrap();
         assert_eq!(frame["cmd"], "ping");
-        assert!(frame["headers"]["req_id"].as_str().unwrap().starts_with("ping_"));
+        assert!(
+            frame["headers"]["req_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("ping_")
+        );
     }
 }

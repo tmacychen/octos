@@ -1044,11 +1044,8 @@ impl GatewayCommand {
                 #[cfg(feature = "wecom-bot")]
                 "wecom-bot" => {
                     let bot_id = settings_str(&entry.settings, "bot_id", "");
-                    let secret_env = settings_str(
-                        &entry.settings,
-                        "secret_env",
-                        "WECOM_BOT_SECRET",
-                    );
+                    let secret_env =
+                        settings_str(&entry.settings, "secret_env", "WECOM_BOT_SECRET");
                     let secret = std::env::var(&secret_env)
                         .wrap_err_with(|| format!("{secret_env} environment variable not set"))?;
                     if bot_id.is_empty() {

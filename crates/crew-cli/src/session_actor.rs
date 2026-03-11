@@ -1040,8 +1040,7 @@ impl SessionActor {
             let channel = Arc::clone(si.channel());
             if channel.supports_edit() {
                 let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
-                let status_msg_id =
-                    status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+                let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
                 Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
                     stream_rx,
                     channel,
@@ -1503,8 +1502,7 @@ impl SessionActor {
             let channel = Arc::clone(si.channel());
             if channel.supports_edit() {
                 let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
-                let status_msg_id =
-                    status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+                let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
                 Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
                     stream_rx,
                     channel,

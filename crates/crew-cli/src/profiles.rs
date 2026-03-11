@@ -805,10 +805,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "webhook_port": webhook_port,
             }
         }),
-        ChannelCredentials::WeComBot {
-            bot_id,
-            secret_env,
-        } => serde_json::json!({
+        ChannelCredentials::WeComBot { bot_id, secret_env } => serde_json::json!({
             "type": "wecom-bot",
             "settings": {
                 "bot_id": bot_id,

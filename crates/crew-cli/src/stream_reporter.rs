@@ -132,10 +132,7 @@ pub async fn run_stream_forwarder(
                 buffer.push_str(&text);
 
                 // Throttled edit — strip <think> blocks before showing to user
-                if !no_edit_support
-                    && last_edit.elapsed() >= EDIT_THROTTLE
-                    && !buffer.is_empty()
-                {
+                if !no_edit_support && last_edit.elapsed() >= EDIT_THROTTLE && !buffer.is_empty() {
                     let visible = strip_think_from_buffer(&buffer);
                     if !visible.is_empty() {
                         flush_to_channel(
