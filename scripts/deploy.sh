@@ -498,10 +498,10 @@ OMINIX_BIN="$(command -v ominix-api 2>/dev/null || echo "$HOME/.cargo/bin/ominix
 if [ -d ~/.ominix/models ]; then MODELS_DIR=~/.ominix/models
 elif [ -d ~/.OminiX/models ]; then MODELS_DIR=~/.OminiX/models
 else MODELS_DIR=~/.ominix/models; mkdir -p "$MODELS_DIR"; fi
-ASR_MODEL="$(find "$MODELS_DIR" -maxdepth 1 -type d \( -name "Qwen3-ASR-*" -o -name "qwen3-asr-*" \) 2>/dev/null | head -1)"
+ASR_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) \( -name "Qwen3-ASR-*" -o -name "qwen3-asr-*" \) 2>/dev/null | head -1)"
 # Prefer CustomVoice model (has preset speakers); fall back to any TTS model
-TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 -type d -iname "*customvoice*" 2>/dev/null | head -1)"
-[ -z "$TTS_MODEL" ] && TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 -type d \( -name "Qwen3-TTS-*" -o -name "qwen3-tts-*" \) 2>/dev/null | head -1)"
+TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) -iname "*customvoice*" 2>/dev/null | head -1)"
+[ -z "$TTS_MODEL" ] && TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) \( -name "Qwen3-TTS-*" -o -name "qwen3-tts-*" \) 2>/dev/null | head -1)"
 ARGS="        <string>$OMINIX_BIN</string>
         <string>--port</string>
         <string>8080</string>
