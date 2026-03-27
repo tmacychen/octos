@@ -48,7 +48,7 @@ KEEP_PROFILES=false
 CLONE_FROM=""
 REMOTE_DATA=""
 SERVE_PORT="3000"
-BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager voice voice-skill clock weather)
+BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager voice voice-skill clock weather pipeline-guard)
 
 # --- Parse arguments ---
 # We build parallel arrays: DEPLOY_HOSTS[], DEPLOY_AUTH_TYPE[], DEPLOY_AUTH_VAL[], DEPLOY_LABEL[]
@@ -564,6 +564,16 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
         fi
     fi
 
+    # Upload octos-web (chat client) if dist exists
+    OCTOS_WEB_DIR="${OCTOS_WEB_DIR:-$HOME/home/octos-web}"
+    if [ -d "$OCTOS_WEB_DIR/dist" ]; then
+        echo "==> Uploading octos-web chat client..."
+        tar czf /tmp/octos-web-dist.tar.gz -C "$OCTOS_WEB_DIR/dist" .
+        scp_target "$i" /tmp/octos-web-dist.tar.gz "$REMOTE:/tmp/octos-web-dist.tar.gz"
+        ssh_target "$i" "mkdir -p ~/octos-web && tar xzf /tmp/octos-web-dist.tar.gz -C ~/octos-web"
+        echo "    octos-web deployed to ~/octos-web"
+    fi
+
     echo "==> Stopping launchd service..."
     ssh_target "$i" "launchctl unload ~/Library/LaunchAgents/${PLIST}.plist 2>/dev/null || true"
     sleep 1
@@ -679,6 +689,7 @@ echo "  ominix-api plist generated"'"'"
         check_and_install poppler pdftoppm
         check_and_install node node
         check_and_install git git
+        check_and_install gh gh
         check_and_install docker docker
 
         # --- Colima (lightweight Docker runtime for macOS) ---
@@ -780,14 +791,14 @@ echo "  ominix-api plist generated"'"'"
             }
         fi
 
-        # Models to download: repo_id -> local_dir_name
-        declare -A MODELS
-        MODELS["mlx-community/Qwen3-ASR-1.7B-8bit"]="Qwen3-ASR-1.7B-8bit"
-        MODELS["mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"]="Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
-        MODELS["mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"]="Qwen3-TTS-12Hz-1.7B-Base-8bit"
+        # Models to download: repo_id local_dir_name (no associative arrays — bash 3 compat)
+        set -- \
+            "mlx-community/Qwen3-ASR-1.7B-8bit"                        "Qwen3-ASR-1.7B-8bit" \
+            "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"       "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit" \
+            "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"              "Qwen3-TTS-12Hz-1.7B-Base-8bit"
 
-        for repo in "${!MODELS[@]}"; do
-            local_name="${MODELS[$repo]}"
+        while [ $# -ge 2 ]; do
+            repo="$1"; local_name="$2"; shift 2
             local_path="$MODELS_DIR/$local_name"
             if [ -d "$local_path" ] && [ "$(ls -A "$local_path" 2>/dev/null)" ]; then
                 echo "  $local_name: already downloaded, skipping"
