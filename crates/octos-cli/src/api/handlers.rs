@@ -785,9 +785,7 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                 let session_id = session.unwrap_or_else(|| "default".into());
 
                 // If a gateway is running, proxy through it (same as chat handler).
-                if let Some((_profile_id, port)) =
-                    resolve_api_port(&state, &headers).await
-                {
+                if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
                     let ws_tx2 = ws_tx.clone();
                     let _abort_ref = abort_handle.clone();
                     let http_client = state.http_client.clone();
@@ -803,25 +801,21 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                         .await;
                     });
                     *abort_handle.lock().await = Some(handle.abort_handle());
-                } else if let Ok((agent, sessions)) = validate_chat_request(&state, &ChatRequest {
-                    message: content.clone(),
-                    session_id: Some(session_id.clone()),
-                    stream: true,
-                    media: media.clone(),
-                }) {
+                } else if let Ok((agent, sessions)) = validate_chat_request(
+                    &state,
+                    &ChatRequest {
+                        message: content.clone(),
+                        session_id: Some(session_id.clone()),
+                        stream: true,
+                        media: media.clone(),
+                    },
+                ) {
                     // Standalone agent mode — run the agent directly.
                     let ws_tx2 = ws_tx.clone();
                     let _abort_ref = abort_handle.clone();
                     let handle = tokio::spawn(async move {
-                        ws_standalone_agent(
-                            ws_tx2,
-                            agent,
-                            sessions,
-                            &session_id,
-                            &content,
-                            media,
-                        )
-                        .await;
+                        ws_standalone_agent(ws_tx2, agent, sessions, &session_id, &content, media)
+                            .await;
                     });
                     *abort_handle.lock().await = Some(handle.abort_handle());
                 } else {
@@ -1142,8 +1136,7 @@ mod tests {
 
     #[test]
     fn ws_client_msg_send_with_session_and_media() {
-        let json =
-            r#"{"type": "send", "content": "hi", "session": "s1", "media": ["/tmp/a.png"]}"#;
+        let json = r#"{"type": "send", "content": "hi", "session": "s1", "media": ["/tmp/a.png"]}"#;
         let msg: WsClientMsg = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMsg::Send {

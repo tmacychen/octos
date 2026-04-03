@@ -57,10 +57,7 @@ impl Sandbox for AppContainerSandbox {
         let mut cmd = Command::new(helper_path);
 
         // Profile name
-        let profile = self
-            .profile_name
-            .as_deref()
-            .unwrap_or("octos.default");
+        let profile = self.profile_name.as_deref().unwrap_or("octos.default");
         cmd.arg("--profile").arg(profile);
 
         // Working directory (read-write)

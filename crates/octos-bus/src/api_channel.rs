@@ -105,10 +105,7 @@ impl Channel for ApiChannel {
             .route("/sessions", get(handle_list_sessions))
             .route("/sessions/{id}/messages", get(handle_session_messages))
             .route("/sessions/{id}/status", get(handle_session_status))
-            .route(
-                "/sessions/{id}/deferred-files",
-                get(handle_deferred_files),
-            )
+            .route("/sessions/{id}/deferred-files", get(handle_deferred_files))
             .route("/sessions/{id}", delete(handle_delete_session))
             .route("/files/{*path}", get(handle_file_download))
             .route("/upload", post(handle_upload))
@@ -200,8 +197,8 @@ impl Channel for ApiChannel {
                 // Check if this is a background task completion notification
                 // (arrives after _completion with grace period). Close the SSE
                 // stream after forwarding the notification.
-                let is_bg_notification = msg.content.starts_with('\u{2713}')
-                    || msg.content.starts_with('\u{2717}');
+                let is_bg_notification =
+                    msg.content.starts_with('\u{2713}') || msg.content.starts_with('\u{2717}');
                 // Regular message — send as replace event (full text replacement).
                 let event = serde_json::json!({
                     "type": "replace",

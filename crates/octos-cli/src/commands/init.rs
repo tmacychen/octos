@@ -91,9 +91,12 @@ fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("model_catalog.json"))),
         // Workspace root (for development)
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent()?.parent()?.parent().map(|d| d.join("model_catalog.json"))),
+        std::env::current_exe().ok().and_then(|p| {
+            p.parent()?
+                .parent()?
+                .parent()
+                .map(|d| d.join("model_catalog.json"))
+        }),
         // Current directory
         Some(PathBuf::from("model_catalog.json")),
     ];
@@ -103,8 +106,7 @@ fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
             if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(models) = catalog.get("models").and_then(|m| m.as_array()) {
                     for model in models {
-                        if let Some(provider_model) =
-                            model.get("provider").and_then(|p| p.as_str())
+                        if let Some(provider_model) = model.get("provider").and_then(|p| p.as_str())
                         {
                             let parts: Vec<&str> = provider_model.splitn(2, '/').collect();
                             if parts.len() == 2 {
@@ -382,10 +384,7 @@ impl Executable for InitCommand {
         }
 
         println!();
-        println!(
-            "{}",
-            "Ready! Run 'octos chat' to start.".green().bold()
-        );
+        println!("{}", "Ready! Run 'octos chat' to start.".green().bold());
 
         Ok(())
     }

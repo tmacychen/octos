@@ -249,7 +249,9 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             }
             #[cfg(not(windows))]
             {
-                tracing::warn!("AppContainer is only available on Windows, falling back to NoSandbox");
+                tracing::warn!(
+                    "AppContainer is only available on Windows, falling back to NoSandbox"
+                );
                 Box::new(NoSandbox)
             }
         }
