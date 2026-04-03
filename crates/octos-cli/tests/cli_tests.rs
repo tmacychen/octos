@@ -151,8 +151,9 @@ fn test_init_defaults_in_temp_dir() {
 
     // Check config content
     let content = std::fs::read_to_string(&config_path).unwrap();
-    assert!(content.contains("anthropic"));
-    assert!(content.contains("claude-sonnet-4-20250514"));
+    // When no API key is set, defaults to openai (first provider)
+    assert!(content.contains("openai"));
+    assert!(content.contains("gpt-4.1-mini"));
 }
 
 #[test]
