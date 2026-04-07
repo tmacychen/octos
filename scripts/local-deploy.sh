@@ -166,7 +166,7 @@ case "$MODE" in
         echo "    Mode: minimal (CLI + chat only)"
         ;;
     full)
-        CLI_FEATURES="api,telegram,discord,slack,whatsapp,feishu,email,twilio,wecom"
+        CLI_FEATURES="api,telegram,discord,slack,whatsapp,feishu,email,twilio,wecom,matrix"
         echo "    Mode: full (all channels + dashboard + skills)"
         ;;
 esac
