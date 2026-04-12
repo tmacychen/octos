@@ -55,8 +55,20 @@ impl TelegramChannel {
         shutdown: Arc<AtomicBool>,
         media_dir: PathBuf,
     ) -> Self {
+        // Support custom API URL via environment variable (for testing with mock server)
+        let api_url = std::env::var("TELOXIDE_API_URL")
+            .ok()
+            .and_then(|u| reqwest::Url::parse(&u).ok());
+
+        let bot = if let Some(url) = api_url {
+            info!("Using custom Telegram API URL: {}", url);
+            Bot::new(token).set_api_url(url)
+        } else {
+            Bot::new(token)
+        };
+
         Self {
-            bot: Bot::new(token),
+            bot,
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
             media_dir,
