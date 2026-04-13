@@ -16,7 +16,8 @@ import pytest
 from runner import BotTestRunner
 
 # ── 超时配置 ──────────────────────────────────────────────────────────────────
-TIMEOUT_COMMAND = 10   # 本地命令，无需 LLM
+# bot 使用 10s 长轮询，最坏情况下消息要等 10s 才被取到，再加处理时间
+TIMEOUT_COMMAND = 15   # 本地命令，无需 LLM
 TIMEOUT_LLM     = 30   # 需要调用 LLM API
 
 
