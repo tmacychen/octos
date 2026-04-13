@@ -1,151 +1,119 @@
 #!/usr/bin/env python3
 """
-Test Runner for Telegram Bot Tests
+BotTestRunner - 连接已运行的 Mock Server，供 pytest 测试用例使用。
 
-This module provides utilities to run integration tests for the octos bot
-using the mock Telegram API server.
-
-Usage:
-    python -m telegram_mock.runner
+Mock Server 和 Bot 进程由 run_test.fish 负责启动，
+pytest 只需通过 HTTP 与 Mock Server 交互。
 """
 
 import asyncio
 import os
-import sys
 import time
-import signal
 from pathlib import Path
 from typing import Callable, Any
 
-# Add project root to path
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
+import httpx
 
-from telegram_mock import MockTelegramServer
+MOCK_BASE_URL = os.environ.get("MOCK_BASE_URL", "http://127.0.0.1:5000")
 
 
 class BotTestRunner:
     """
-    Test runner that manages the mock server and bot process.
-    
-    Usage:
+    连接已运行的 Mock Server，提供测试辅助方法。
+
+    用法：
         runner = BotTestRunner()
-        await runner.start()
-        
-        # Inject messages and check responses
-        runner.server.inject_message("/start")
-        await asyncio.sleep(2)
-        
-        # Check results
-        messages = runner.server.get_sent_messages()
-        assert any("Welcome" in m.text for m in messages)
-        
-        await runner.stop()
+
+        # 注入消息
+        runner.inject("/start")
+
+        # 等待并断言回复
+        msg = runner.wait_for_reply(timeout=10)
+        assert msg is not None
+
+        # 清空状态（每个测试前调用）
+        runner.clear()
     """
-    
-    def __init__(self, bot_token: str = "test_token_123", 
-                 mock_port: int = 5000,
-                 bot_port: int = 8080):
-        self.bot_token = bot_token
-        self.mock_port = mock_port
-        self.bot_port = bot_port
-        self.server = MockTelegramServer(port=mock_port)
-        self.bot_process = None
-        self._running = False
-    
-    async def start(self, env_overrides: dict = None):
-        """Start the mock server and bot"""
-        # Start mock server in background
-        self.server.start_background()
-        await asyncio.sleep(1)  # Wait for server to start
-        
-        # Set environment variables for the bot
-        env = os.environ.copy()
-        env["TELOXIDE_API_URL"] = f"http://127.0.0.1:{self.mock_port}"
-        env["TELOXIDE_TOKEN"] = self.bot_token
-        if env_overrides:
-            env.update(env_overrides)
-        
-        # TODO: Start the actual bot process
-        # For now, this is a placeholder - the bot would be started via:
-        # self.bot_process = subprocess.Popen(
-        #     ["cargo", "run", "--", "--telegram-token", self.bot_token],
-        #     env=env,
-        #     cwd=project_root
-        # )
-        
-        self._running = True
-        print(f"✅ Test runner started (mock: {self.mock_port}, bot port: {self.bot_port})")
-    
-    async def stop(self):
-        """Stop the mock server and bot"""
-        if self.bot_process:
-            self.bot_process.terminate()
-            self.bot_process.wait()
-        
-        self._running = False
-        print("🛑 Test runner stopped")
-    
-    def inject_and_wait(self, text: str, wait_seconds: float = 2.0):
-        """Inject a message and wait for bot to process"""
-        self.server.inject_message(text)
-        time.sleep(wait_seconds)
-    
-    def get_responses(self) -> list:
-        """Get all messages sent by the bot"""
-        return self.server.get_sent_messages()
-    
-    def find_response(self, predicate: Callable[[Any], bool]) -> Any:
-        """Find a response matching a predicate"""
-        for msg in self.server.get_sent_messages():
-            if predicate(msg):
-                return msg
+
+    def __init__(self, base_url: str = MOCK_BASE_URL):
+        self.base_url = base_url
+
+    def inject(self, text: str, chat_id: int = 123,
+               username: str = "testuser", is_group: bool = False) -> dict:
+        """向 Mock Server 注入一条用户消息"""
+        resp = httpx.post(f"{self.base_url}/_inject", json={
+            "text": text,
+            "chat_id": chat_id,
+            "username": username,
+            "is_group": is_group,
+        })
+        resp.raise_for_status()
+        return resp.json()
+
+    def inject_callback(self, data: str, chat_id: int = 123,
+                        message_id: int = 100) -> dict:
+        """注入一个按钮回调"""
+        resp = httpx.post(f"{self.base_url}/_inject_callback", json={
+            "data": data,
+            "chat_id": chat_id,
+            "message_id": message_id,
+        })
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_sent_messages(self) -> list[dict]:
+        """获取 bot 已发送的所有消息"""
+        resp = httpx.get(f"{self.base_url}/_sent_messages")
+        resp.raise_for_status()
+        return resp.json()
+
+    def clear(self):
+        """清空 Mock Server 的消息记录"""
+        httpx.post(f"{self.base_url}/_clear").raise_for_status()
+
+    def wait_for_reply(self, count_before: int = 0,
+                       timeout: int = 10) -> dict | None:
+        """
+        等待 bot 发送新消息，返回最新一条。
+        count_before: 调用前已有的消息数量
+        timeout: 最长等待秒数
+        """
+        for _ in range(timeout):
+            time.sleep(1)
+            msgs = self.get_sent_messages()
+            if len(msgs) > count_before:
+                return msgs[-1]
         return None
 
+    def wait_for_reply_async(self, count_before: int = 0,
+                             timeout: int = 10):
+        """异步版本的 wait_for_reply，供 pytest-asyncio 使用"""
+        return _AsyncWaiter(self, count_before, timeout)
 
-async def run_simple_test():
-    """Run a simple test to verify the mock server works"""
-    print("🧪 Running simple mock server test...")
-    
-    server = MockTelegramServer()
-    server.start_background()
-    await asyncio.sleep(1)
-    
-    # Test 1: Inject a message
-    server.inject_message("/start", chat_id=123)
-    await asyncio.sleep(0.5)
-    
-    # Test 2: Simulate bot sending a response (for testing the mock itself)
-    # In real tests, the bot would call sendMessage, but we can verify the endpoint works
-    
-    # Test 3: Check health endpoint
-    import httpx
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"http://127.0.0.1:{server.port}/health")
-        assert resp.status_code == 200
-        print("✅ Health check passed")
-    
-    print("✅ Simple test passed!")
-    return True
+    def health(self) -> bool:
+        """检查 Mock Server 是否在线"""
+        try:
+            resp = httpx.get(f"{self.base_url}/health", timeout=2)
+            return resp.status_code == 200
+        except Exception:
+            return False
 
 
-def main():
-    """Main entry point"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Telegram Bot Test Runner")
-    parser.add_argument("--test", action="store_true", help="Run built-in tests")
-    parser.add_argument("--port", type=int, default=5000, help="Mock server port")
-    args = parser.parse_args()
-    
-    if args.test:
-        asyncio.run(run_simple_test())
-    else:
-        print("Telegram Mock Test Runner")
-        print("=" * 40)
-        print("Use --test to run built-in tests")
-        print("Import MockTelegramServer in your own test code")
+class _AsyncWaiter:
+    """供 async with 语法使用的异步等待器"""
 
+    def __init__(self, runner: BotTestRunner, count_before: int, timeout: int):
+        self.runner = runner
+        self.count_before = count_before
+        self.timeout = timeout
 
-if __name__ == "__main__":
-    main()
+    def __await__(self):
+        return self._wait().__await__()
+
+    async def _wait(self) -> dict | None:
+        for _ in range(self.timeout):
+            await asyncio.sleep(1)
+            msgs = self.runner.get_sent_messages()
+            if len(msgs) > self.count_before:
+                return msgs[-1]
+        return None

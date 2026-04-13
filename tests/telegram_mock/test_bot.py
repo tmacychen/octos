@@ -1,201 +1,156 @@
 #!/usr/bin/env python3
 """
-Pytest-based tests for the Telegram bot
+Telegram Bot 集成测试用例
 
-These tests demonstrate how to use the mock server to test bot functionality.
-Run with: pytest tests/telegram_mock/test_bot.py -v
+前置条件（由 run_test.fish 自动完成）：
+  1. Mock Server 运行在 http://127.0.0.1:5000
+  2. octos gateway 已启动并连接到 Mock Server
 
-Prerequisites:
-    pip install pytest pytest-asyncio httpx
-    cargo build --release  # Build the octos binary first
+运行方式：
+  # 通过 run_test.fish 自动运行（推荐）
+  fish tests/telegram_mock/run_test.fish
+
+  # 手动运行（需先手动启动 mock server 和 bot）
+  cd tests/telegram_mock
+  pytest test_bot.py -v
 """
 
-import asyncio
-import os
-import subprocess
 import time
 import pytest
-import httpx
-from typing import Generator
+from runner import BotTestRunner
 
-# Import the mock server
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# ── Fixtures ──────────────────────────────────────────────────────────────────
 
-from telegram_mock import MockTelegramServer
-
-
-# Configuration
-MOCK_PORT = 5000
-BOT_PORT = 8080
-TEST_TOKEN = "test_token_123456"
-BOT_BINARY = "target/release/octos-bus"  # Adjust as needed
+@pytest.fixture(scope="session")
+def runner():
+    """提供一个连接到 Mock Server 的 BotTestRunner 实例"""
+    r = BotTestRunner()
+    assert r.health(), "Mock Server 未运行，请先启动 run_test.fish"
+    return r
 
 
-@pytest.fixture(scope="module")
-def mock_server() -> Generator[MockTelegramServer, None, None]:
-    """Fixture that provides a mock Telegram server"""
-    server = MockTelegramServer(port=MOCK_PORT)
-    server.start_background()
-    time.sleep(1)  # Wait for server to start
-    yield server
-    server.clear()
+@pytest.fixture(autouse=True)
+def clear_messages(runner):
+    """每个测试前清空消息记录"""
+    runner.clear()
+    yield
+    # 测试后不清空，方便调试
 
 
-@pytest.fixture(scope="module")
-def bot_process(mock_server: MockTelegramServer) -> Generator[subprocess.Popen, None, None]:
-    """Fixture that starts the bot process with mock server configuration"""
-    
-    # Check if bot binary exists
-    if not os.path.exists(BOT_BINARY):
-        pytest.skip(f"Bot binary not found at {BOT_BINARY}. Run 'cargo build --release' first.")
-    
-    # Set environment for bot to use mock server
-    env = os.environ.copy()
-    env["TELOXIDE_API_URL"] = f"http://127.0.0.1:{MOCK_PORT}"
-    env["TELOXIDE_TOKEN"] = TEST_TOKEN
-    
-    # TODO: Add your bot's required environment variables here
-    # env["OCTOS_CONFIG_PATH"] = "config.test.json"
-    
-    # Start the bot
-    # Note: This is a placeholder - adjust based on your bot's CLI
-    process = subprocess.Popen(
-        [BOT_BINARY, "--telegram-token", TEST_TOKEN],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    
-    # Wait for bot to initialize
-    time.sleep(3)
-    
-    yield process
-    
-    # Cleanup
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
+# ── 测试用例 ──────────────────────────────────────────────────────────────────
+
+class TestBotCommands:
+    """Bot 命令测试（本地处理，无需 LLM，响应快）"""
+
+    def test_start_command(self, runner: BotTestRunner):
+        """
+        /start 命令应返回可用命令列表
+        预期：bot 回复包含命令帮助信息
+        """
+        runner.inject("/start", chat_id=123)
+        msg = runner.wait_for_reply(count_before=0, timeout=10)
+
+        assert msg is not None, "Bot 未回复 /start 命令"
+        print(f"\n  Bot 回复: {msg['text'][:100]}")
+
+    def test_new_session_command(self, runner: BotTestRunner):
+        """
+        /new 命令应创建新会话
+        预期：bot 回复确认信息
+        """
+        runner.inject("/new", chat_id=123)
+        msg = runner.wait_for_reply(count_before=0, timeout=10)
+
+        assert msg is not None, "Bot 未回复 /new 命令"
+        print(f"\n  Bot 回复: {msg['text'][:100]}")
+
+    def test_sessions_command(self, runner: BotTestRunner):
+        """
+        /sessions 命令应列出当前会话
+        预期：bot 回复会话列表
+        """
+        runner.inject("/sessions", chat_id=123)
+        msg = runner.wait_for_reply(count_before=0, timeout=10)
+
+        assert msg is not None, "Bot 未回复 /sessions 命令"
+        print(f"\n  Bot 回复: {msg['text'][:100]}")
+
+    def test_unknown_command(self, runner: BotTestRunner):
+        """
+        未知命令应返回错误提示
+        预期：bot 回复包含可用命令列表
+        """
+        runner.inject("/unknowncmd", chat_id=123)
+        msg = runner.wait_for_reply(count_before=0, timeout=10)
+
+        assert msg is not None, "Bot 未回复未知命令"
+        print(f"\n  Bot 回复: {msg['text'][:100]}")
 
 
-class TestTelegramBot:
-    """Test suite for Telegram bot functionality"""
-    
-    def test_mock_server_health(self, mock_server: MockTelegramServer):
-        """Test that the mock server is running"""
-        import httpx
-        
-        # Note: Can't use httpx.AsyncClient directly in sync test
-        # This is just a placeholder - real tests would be async
-        assert mock_server is not None
-        assert mock_server.port == MOCK_PORT
-    
-    @pytest.mark.asyncio
-    async def test_bot_responds_to_start_command(self, mock_server: MockTelegramServer):
-        """Test that bot responds to /start command"""
-        
-        # Inject /start message from user
-        mock_server.inject_message("/start", chat_id=123, from_username="testuser")
-        
-        # Wait for bot to process
-        await asyncio.sleep(2)
-        
-        # Check that bot sent a message
-        sent_messages = mock_server.get_sent_messages()
-        assert len(sent_messages) > 0, "Bot should have sent at least one message"
-        
-        # Check that the message contains welcome text
-        last_message = sent_messages[-1]
-        assert last_message.text is not None
-        print(f"📝 Bot response: {last_message.text}")
-    
-    @pytest.mark.asyncio
-    async def test_bot_handles_regular_text(self, mock_server: MockTelegramServer):
-        """Test that bot handles regular text messages"""
-        
-        # Clear previous messages
-        mock_server.clear()
-        
-        # Inject a regular text message
-        mock_server.inject_message("Hello bot!", chat_id=123, from_username="testuser")
-        
-        # Wait for bot to process
-        await asyncio.sleep(2)
-        
-        # Check bot response
-        sent_messages = mock_server.get_sent_messages()
-        assert len(sent_messages) > 0, "Bot should respond to text messages"
-    
-    @pytest.mark.asyncio
-    async def test_bot_handles_callback_query(self, mock_server: MockTelegramServer):
-        """Test that bot handles callback queries (button presses)"""
-        
-        mock_server.clear()
-        
-        # Inject a callback query (button press)
-        mock_server.inject_callback_query("s:topic1", chat_id=123, message_id=100)
-        
-        # Wait for bot to process
-        await asyncio.sleep(2)
-        
-        # Check bot response
-        sent_messages = mock_server.get_sent_messages()
-        # Bot might respond to callback or not depending on implementation
-        print(f"📝 Callback handled, messages: {len(sent_messages)}")
+class TestBotLLM:
+    """LLM 消息测试（需要调用 LLM API，响应较慢）"""
+
+    def test_regular_message(self, runner: BotTestRunner):
+        """
+        普通文本消息应触发 LLM 回复
+        预期：bot 返回非空回复
+        超时：30s（LLM API 调用）
+        """
+        runner.inject("Hello!", chat_id=123)
+        msg = runner.wait_for_reply(count_before=0, timeout=30)
+
+        assert msg is not None, "Bot 未回复普通消息（30s 超时）"
+        assert len(msg["text"]) > 0, "Bot 回复为空"
+        print(f"\n  Bot 回复: {msg['text'][:100]}")
+
+    def test_chinese_message(self, runner: BotTestRunner):
+        """
+        中文消息应正常处理
+        预期：bot 返回非空回复
+        """
+        runner.inject("你好", chat_id=123)
+        msg = runner.wait_for_reply(count_before=0, timeout=30)
+
+        assert msg is not None, "Bot 未回复中文消息（30s 超时）"
+        print(f"\n  Bot 回复: {msg['text'][:100]}")
 
 
-# --- Manual test runner (for development) ---
+class TestBotMultiUser:
+    """多用户隔离测试"""
 
-async def run_manual_test():
-    """
-    Manual test runner for development.
-    Run this to test the bot without pytest.
-    """
-    print("=" * 60)
-    print("Telegram Bot Manual Test")
-    print("=" * 60)
-    
-    # Start mock server
-    server = MockTelegramServer(port=MOCK_PORT)
-    server.start_background()
-    await asyncio.sleep(1)
-    
-    # Check health
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"http://127.0.0.1:{MOCK_PORT}/health")
-        print(f"✅ Mock server health: {resp.json()}")
-    
-    # Test injecting messages
-    print("\n📥 Injecting test messages...")
-    
-    # Test 1: /start command
-    server.inject_message("/start", chat_id=123, from_username="testuser")
-    await asyncio.sleep(1)
-    
-    # Test 2: Regular message
-    server.inject_message("Hello!", chat_id=123, from_username="testuser")
-    await asyncio.sleep(1)
-    
-    # Test 3: Callback query
-    server.inject_callback_query("s:topic1", chat_id=123, message_id=100)
-    await asyncio.sleep(1)
-    
-    # Show results
-    print("\n📤 Messages sent by bot:")
-    for i, msg in enumerate(server.get_sent_messages(), 1):
-        print(f"  {i}. Chat {msg.chat_id}: {msg.text[:80]}...")
-    
-    print("\n✅ Manual test complete!")
+    def test_different_users_isolated(self, runner: BotTestRunner):
+        """
+        不同用户的消息应独立处理
+        预期：两个用户都能收到回复
+        """
+        # 用户 A
+        runner.inject("/start", chat_id=111, username="user_a")
+        msg_a = runner.wait_for_reply(count_before=0, timeout=10)
+        assert msg_a is not None, "用户 A 未收到回复"
+
+        count = len(runner.get_sent_messages())
+
+        # 用户 B
+        runner.inject("/start", chat_id=222, username="user_b")
+        msg_b = runner.wait_for_reply(count_before=count, timeout=10)
+        assert msg_b is not None, "用户 B 未收到回复"
+
+        print(f"\n  用户 A 回复: {msg_a['text'][:60]}")
+        print(f"  用户 B 回复: {msg_b['text'][:60]}")
 
 
-if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--manual":
-        asyncio.run(run_manual_test())
-    else:
-        print("Run tests with: pytest tests/telegram_mock/test_bot.py -v")
-        print("Or run manual test: python -m telegram_mock.test_bot --manual")
+# ── 如何添加新测试用例 ────────────────────────────────────────────────────────
+#
+# 1. 在对应的 class 里添加 test_ 开头的方法
+# 2. 使用 runner.inject() 发送消息
+# 3. 使用 runner.wait_for_reply() 等待回复
+# 4. 用 assert 验证结果
+#
+# 示例：
+#
+# class TestMyFeature:
+#     def test_something(self, runner: BotTestRunner):
+#         runner.inject("/mycommand", chat_id=123)
+#         msg = runner.wait_for_reply(timeout=10)
+#         assert msg is not None
+#         assert "expected text" in msg["text"]

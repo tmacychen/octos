@@ -82,20 +82,29 @@ class MockTelegramServer:
         """Set up FastAPI routes"""
         app = self.app
         
-        @app.get("/bot{token}/getUpdates")
-        async def get_updates(token: str, offset: int = 0, timeout: int = 30):
+        # teloxide sends PascalCase paths, so register both cases for each endpoint
+
+        @app.api_route("/bot{token}/getUpdates", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/GetUpdates", methods=["GET", "POST"])
+        async def get_updates(token: str, request: Request):
             """Long polling endpoint - returns pending updates"""
-            # Filter updates with ID > offset
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            offset = int(data.get("offset", 0))
+            timeout = int(data.get("timeout", 0))
+
             updates = [u for u in self._updates if u.update_id > offset]
-            
-            # If no updates and timeout > 0, wait a bit (simulate real API)
+
             if not updates and timeout > 0:
                 await asyncio.sleep(min(timeout, 1))
                 updates = [u for u in self._updates if u.update_id > offset]
-            
+
             return {"ok": True, "result": self._serialize_updates(updates)}
         
-        @app.post("/bot{token}/sendMessage")
+        @app.api_route("/bot{token}/sendMessage", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/SendMessage", methods=["GET", "POST"])
         async def send_message(token: str, request: Request):
             """Send a message - bot calls this to reply to users"""
             data = await request.json()
@@ -131,7 +140,8 @@ class MockTelegramServer:
                 }
             }
         
-        @app.post("/bot{token}/sendDocument")
+        @app.api_route("/bot{token}/sendDocument", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/SendDocument", methods=["GET", "POST"])
         async def send_document(token: str, request: Request):
             """Send a document"""
             data = await request.json()
@@ -154,7 +164,8 @@ class MockTelegramServer:
                 }
             }
         
-        @app.post("/bot{token}/sendVoice")
+        @app.api_route("/bot{token}/sendVoice", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/SendVoice", methods=["GET", "POST"])
         async def send_voice(token: str, request: Request):
             """Send a voice message"""
             data = await request.json()
@@ -177,7 +188,8 @@ class MockTelegramServer:
                 }
             }
         
-        @app.post("/bot{token}/sendAudio")
+        @app.api_route("/bot{token}/sendAudio", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/SendAudio", methods=["GET", "POST"])
         async def send_audio(token: str, request: Request):
             """Send an audio file"""
             data = await request.json()
@@ -200,7 +212,8 @@ class MockTelegramServer:
                 }
             }
         
-        @app.post("/bot{token}/editMessageText")
+        @app.api_route("/bot{token}/editMessageText", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/EditMessageText", methods=["GET", "POST"])
         async def edit_message_text(token: str, request: Request):
             """Edit a message"""
             data = await request.json()
@@ -213,39 +226,61 @@ class MockTelegramServer:
                 }
             }
         
-        @app.post("/bot{token}/deleteMessage")
+        @app.api_route("/bot{token}/deleteMessage", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/DeleteMessage", methods=["GET", "POST"])
         async def delete_message(token: str, request: Request):
             """Delete a message"""
             return {"ok": True, "result": True}
         
-        @app.post("/bot{token}/answerCallbackQuery")
+        @app.api_route("/bot{token}/answerCallbackQuery", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/AnswerCallbackQuery", methods=["GET", "POST"])
         async def answer_callback_query(token: str, request: Request):
             """Answer a callback query (dismiss loading spinner)"""
             return {"ok": True, "result": True}
         
-        @app.post("/bot{token}/getMe")
+        @app.api_route("/bot{token}/getMe", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/GetMe", methods=["GET", "POST"])
         async def get_me(token: str):
             """Get bot info"""
             return {"ok": True, "result": self._bot_info}
-        
-        @app.post("/bot{token}/setMyCommands")
+
+        @app.api_route("/bot{token}/getWebhookInfo", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/GetWebhookInfo", methods=["GET", "POST"])
+        async def get_webhook_info(token: str):
+            """Webhook info - return empty (we use long polling)"""
+            return {"ok": True, "result": {
+                "url": "",
+                "has_custom_certificate": False,
+                "pending_update_count": 0,
+            }}
+
+        @app.api_route("/bot{token}/setMyCommands", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/SetMyCommands", methods=["GET", "POST"])
         async def set_my_commands(token: str, request: Request):
             """Register bot commands"""
-            data = await request.json()
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
             self._commands_registered = data.get("commands", [])
             logger.info(f"📝 Bot registered commands: {self._commands_registered}")
             return {"ok": True, "result": True}
-        
-        @app.post("/bot{token}/getMyCommands")
+
+        @app.api_route("/bot{token}/getMyCommands", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/GetMyCommands", methods=["GET", "POST"])
         async def get_my_commands(token: str):
             """Get registered commands"""
             return {"ok": True, "result": self._commands_registered}
         
-        @app.post("/bot{token}/getFile")
+        @app.api_route("/bot{token}/getFile", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/GetFile", methods=["GET", "POST"])
         async def get_file(token: str, request: Request):
             """Get file info (for media downloads)"""
-            data = await request.json()
-            file_id = data.get("file_id")
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            file_id = data.get("file_id", "unknown")
             return {
                 "ok": True,
                 "result": {
@@ -256,7 +291,8 @@ class MockTelegramServer:
                 }
             }
         
-        @app.post("/bot{token}/sendChatAction")
+        @app.api_route("/bot{token}/sendChatAction", methods=["GET", "POST"])
+        @app.api_route("/bot{token}/SendChatAction", methods=["GET", "POST"])
         async def send_chat_action(token: str, request: Request):
             """Send typing/recording action"""
             return {"ok": True, "result": True}
@@ -265,6 +301,59 @@ class MockTelegramServer:
         async def health():
             """Health check endpoint"""
             return {"status": "ok"}
+
+        # --- Test control endpoints (not part of real Telegram API) ---
+
+        @app.post("/_inject")
+        async def inject(request: Request):
+            """Inject a message as if sent by a user (for test scripts)"""
+            data = await request.json()
+            update_id = self.inject_message(
+                text=data.get("text", ""),
+                chat_id=data.get("chat_id", 123),
+                from_username=data.get("username", "testuser"),
+                is_group=data.get("is_group", False),
+            )
+            return {"ok": True, "update_id": update_id}
+
+        @app.post("/_inject_callback")
+        async def inject_callback(request: Request):
+            """Inject a callback query (button press) for test scripts"""
+            data = await request.json()
+            update_id = self.inject_callback_query(
+                data=data.get("data", ""),
+                chat_id=data.get("chat_id", 123),
+                message_id=data.get("message_id", 100),
+            )
+            return {"ok": True, "update_id": update_id}
+
+        @app.get("/_sent_messages")
+        async def get_sent_messages():
+            """Return all messages sent by the bot (for test assertions)"""
+            return [
+                {
+                    "chat_id": m.chat_id,
+                    "text": m.text,
+                    "parse_mode": m.parse_mode,
+                }
+                for m in self._sent_messages
+            ]
+
+        @app.post("/_clear")
+        async def clear_state():
+            """Clear all stored updates and messages"""
+            self.clear()
+            return {"ok": True}
+
+        @app.api_route("/bot{token}/{path:path}", methods=["GET", "POST"])
+        async def catch_all(token: str, path: str, request: Request):
+            """Catch-all: log unhandled API calls for debugging"""
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            logger.warning(f"⚠️  Unhandled API call: {request.method} /{path} body={body}")
+            return {"ok": True, "result": True}
     
     def _serialize_updates(self, updates: list[Update]) -> list[dict]:
         """Serialize updates for API response"""
