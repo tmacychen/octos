@@ -341,8 +341,9 @@ class MockTelegramServer:
 
         @app.post("/_clear")
         async def clear_state():
-            """Clear all stored updates and messages"""
-            self.clear()
+            """Clear stored messages only (not update_id counter)"""
+            self._updates.clear()
+            self._sent_messages.clear()
             return {"ok": True}
 
         @app.api_route("/bot{token}/{path:path}", methods=["GET", "POST"])
@@ -441,7 +442,8 @@ class MockTelegramServer:
         """Clear all stored updates and messages"""
         self._updates.clear()
         self._sent_messages.clear()
-        self._next_update_id = 1
+        # 注意：不重置 _next_update_id
+        # bot 的长轮询基于 update_id offset，重置会导致新消息被 bot 忽略
     
     def get_last_message(self) -> SentMessage | None:
         """Get the most recent message sent by the bot"""
