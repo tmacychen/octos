@@ -1,195 +1,191 @@
-# Telegram Mock Testing Framework
+# Telegram Mock 测试框架
 
-## 原理
+## 整体架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     本地测试环境                              │
-│                                                             │
-│  ┌──────────────┐   GetUpdates    ┌──────────────────────┐  │
-│  │  Mock Server │◄────────────────│   octos bot          │  │
-│  │  (Python)    │  (长轮询)        │   (Rust)             │  │
-│  │              │─────────────────►│                      │  │
-│  │  模拟 Telegram│  updates[]      │  处理消息             │  │
-│  │  API         │                 │  调用 LLM            │  │
-│  │              │◄────────────────│                      │  │
-│  │              │  sendMessage    │                      │  │
-│  └──────────────┘                 └──────────────────────┘  │
-│         ▲                                                   │
-│         │ /_inject  /_sent_messages                         │
-│  ┌──────────────┐                                           │
-│  │  测试脚本     │                                           │
-│  │  run_test.fish│                                          │
-│  └──────────────┘                                           │
-└─────────────────────────────────────────────────────────────┘
+tests/telegram_mock/
+├── run_test.fish   # 一键测试入口：启动环境 → 编译 → 运行 pytest → 清理
+├── mock_tg.py      # Mock Telegram API 服务器
+├── runner.py       # BotTestRunner：pytest 用的测试辅助工具类
+├── test_bot.py     # 所有测试用例（pytest）
+├── requirements.txt
+└── README.md
 ```
 
-Mock Server 扮演两个角色：
-1. **模拟 Telegram 服务器**：响应 bot 的 `GetUpdates`、`sendMessage` 等 API 调用
-2. **测试控制器**：通过 `/_inject` 注入用户消息，通过 `/_sent_messages` 读取 bot 的回复
+## 测试原理
 
-Bot 通过环境变量 `TELOXIDE_API_URL=http://127.0.0.1:5000` 指向 Mock Server，
-无需真实 Telegram 网络连接。
+```
+┌─────────────────────────────────────────────────────────┐
+│                      本地测试环境                         │
+│                                                         │
+│  ┌─────────────┐   GetUpdates (长轮询)  ┌─────────────┐ │
+│  │ Mock Server │ ◄────────────────────  │  octos bot  │ │
+│  │ (Python)    │  updates[]            │  (Rust)     │ │
+│  │             │ ─────────────────────► │             │ │
+│  │ 模拟        │                        │ 处理消息    │ │
+│  │ Telegram API│  sendMessage          │ 调用 LLM   │ │
+│  │             │ ◄────────────────────  │             │ │
+│  └─────────────┘                        └─────────────┘ │
+│         ▲                                               │
+│         │  /_inject  /_sent_messages  /_clear           │
+│  ┌─────────────┐                                        │
+│  │  test_bot.py│  (pytest 测试用例)                      │
+│  │  runner.py  │  (BotTestRunner 工具类)                 │
+│  └─────────────┘                                        │
+└─────────────────────────────────────────────────────────┘
+```
 
----
+**关键机制：**
+
+1. octos bot 通过环境变量 `TELOXIDE_API_URL=http://127.0.0.1:5000` 将所有 Telegram API 请求重定向到 Mock Server，无需真实 Telegram 网络连接
+2. Mock Server 实现了 `GetUpdates`（长轮询）、`sendMessage` 等 Telegram API 端点
+3. 测试用例通过 `/_inject` 注入模拟用户消息，通过 `/_sent_messages` 读取 bot 的回复，通过 `/_clear` 重置状态
 
 ## 所需资源
 
 | 资源 | 说明 |
 |------|------|
-| `ANTHROPIC_API_KEY` | Anthropic API key（bot 调用 LLM 需要） |
+| `ANTHROPIC_API_KEY` | LLM API key（bot 调用 LLM 需要） |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token（格式验证用，不会真正连接 Telegram） |
-| Python 3.11+ | Mock server 运行环境 |
+| Python 3.11+ | Mock Server 运行环境 |
 | `uv` | Python 包管理器（`brew install uv`） |
 | Rust / Cargo | 编译 octos bot |
-
----
 
 ## 快速开始
 
 ```fish
 # 设置环境变量
-set -x ANTHROPIC_API_KEY "sk-ant-..."
+set -x ANTHROPIC_API_KEY "your-api-key"
 set -x TELEGRAM_BOT_TOKEN "123456:ABC..."
 
 # 从项目根目录运行
 fish tests/telegram_mock/run_test.fish
 ```
 
-脚本会自动完成：
-- 创建 Python venv 并安装依赖（首次运行）
-- 写入测试用 config（`.octos/test_config.json`）
-- 启动 Mock Server
-- 编译并启动 octos bot（指向 Mock Server）
-- 执行测试用例
-- 清理所有进程
+`run_test.fish` 自动完成以下步骤：
 
----
-
-## 文件结构
-
-```
-tests/telegram_mock/
-├── README.md           # 本文档
-├── run_test.fish       # 一键测试脚本（入口）
-├── mock_tg.py          # Mock Telegram API 服务器
-├── test_bot.py         # pytest 测试用例集
-├── runner.py           # 测试运行器工具类
-├── __init__.py
-└── requirements.txt    # Python 依赖
-```
-
----
+1. 检查环境变量
+2. 创建 Python venv 并安装依赖（首次运行）
+3. 写入测试专用 config（`.octos/test_config.json`）
+4. 清理并启动 Mock Server（端口 5000）
+5. 编译 octos（`--features telegram`）
+6. 启动 octos gateway，等待 "Gateway ready"
+7. 调用 `pytest test_bot.py -v`
+8. 清理所有进程，输出结果
 
 ## 当前测试用例
 
-### Test 1: `/start` 命令
-- 注入 `/start` 消息
-- 验证 bot 回复了命令帮助信息
-- 预期：bot 返回可用命令列表
-- 超时：10s（本地命令，无需 LLM）
+测试用例全部在 `test_bot.py` 中，按功能分为四组：
 
-### Test 2: 普通文本消息
-- 注入 `Hello!` 消息
-- 验证 bot 调用 LLM 并回复
-- 预期：bot 返回任意非空回复
-- 超时：15s（需要 LLM API 调用）
+### TestSessionCommands — 会话管理命令（GatewayDispatcher）
 
----
+本地处理，无需 LLM，超时 `TIMEOUT_COMMAND = 10s`。
 
-## 两类消息的区别
+| 测试方法 | 输入 | 验证 |
+|----------|------|------|
+| `test_new_session_default` | `/new` | bot 有回复 |
+| `test_new_session_named` | `/new work` | 回复包含会话名 |
+| `test_switch_session` | `/s research` | 切换成功 |
+| `test_sessions_list` | `/sessions` | bot 有回复 |
+| `test_back_command` | `/back` | bot 有回复 |
+| `test_back_alias_b` | `/b` | 与 /back 等价 |
+| `test_delete_session` | `/delete temp-session` | 删除成功 |
+| `test_delete_alias_d` | `/d alias-test` | 与 /delete 等价 |
+| `test_soul_show` | `/soul` | 查看 persona |
+| `test_soul_set_and_reset` | `/soul <text>` + `/soul reset` | 设置并重置 |
 
-| 类型 | 示例 | 处理方式 | 响应时间 |
-|------|------|----------|----------|
-| Bot 命令 | `/start` `/new` `/sessions` | 本地处理，无需 LLM | < 1s |
-| 普通消息 | `Hello!` `帮我写代码` | 调用 LLM API | 3~15s |
+### TestSessionActorCommands — 会话内控制命令（SessionActor）
 
-测试命令类消息时用较短超时（5~10s），测试 LLM 回复时用较长超时（15~30s）。
+本地处理，无需 LLM，超时 `TIMEOUT_COMMAND = 10s`。
 
----
+| 测试方法 | 输入 | 验证 |
+|----------|------|------|
+| `test_adaptive_show` | `/adaptive` | bot 有回复 |
+| `test_queue_show` | `/queue` | bot 有回复 |
+| `test_status_show` | `/status` | bot 有回复 |
+| `test_reset_command` | `/reset` | bot 有回复 |
+| `test_unknown_command_shows_help` | `/unknowncmd` | 回复包含 /new 和 /sessions |
 
-## 如何编写新测试用例
+### TestMultiUser — 多用户隔离测试
 
-在 `run_test.fish` 的测试区块中添加，或在 `test_bot.py` 中用 pytest 编写。
+| 测试方法 | 说明 | 验证 |
+|----------|------|------|
+| `test_two_users_independent_sessions` | 两个 chat_id 各自创建会话 | 两个用户都收到回复 |
+| `test_callback_query` | 点击内联键盘按钮 | 回调被正常处理 |
 
-### 方式一：在 run_test.fish 中添加（快速验证）
+### TestLLMMessages — LLM 消息测试（标记 `@pytest.mark.llm`）
 
-找到测试区块，按照现有格式添加：
+需要调用 LLM API，超时 `TIMEOUT_LLM = 30s`。可用 `pytest -m "not llm"` 跳过。
 
-```python
-# ── Test 3: /new 命令 ──
-print('  Test 3: /new command')
-r = await client.get(f'{base}/_sent_messages')
-count_before = len(r.json())
-await client.post(f'{base}/_inject', json={
-    'text': '/new test-session',
-    'chat_id': 123,
-    'username': 'testuser'
-})
-replied = False
-for _ in range(10):
-    await asyncio.sleep(1)
-    r = await client.get(f'{base}/_sent_messages')
-    msgs = r.json()
-    if len(msgs) > count_before:
-        preview = msgs[-1]['text'][:80].replace('\n', ' ')
-        print(f'    \033[32m✅ Bot replied:\033[0m {preview}')
-        passed += 1
-        replied = True
-        break
-if not replied:
-    print('    \033[31m❌ No reply received\033[0m')
-    failed += 1
-```
+| 测试方法 | 输入 | 验证 |
+|----------|------|------|
+| `test_regular_message` | `Hello!` | bot 回复非空 |
+| `test_chinese_message` | `你好` | bot 回复非空 |
 
-### 方式二：在 test_bot.py 中用 pytest 编写（推荐）
+## 添加新测试用例
+
+### 步骤
+
+1. 打开 `test_bot.py`
+2. 在合适的 class 里添加 `test_` 开头的方法
+3. 使用 `runner.inject()` 发送消息
+4. 使用 `runner.wait_for_reply()` 等待回复
+5. 用 `assert` 验证结果
+
+### 模板
 
 ```python
-@pytest.mark.asyncio
-async def test_new_session_command(self, mock_server):
-    mock_server.clear()
-    mock_server.inject_message("/new my-session", chat_id=123)
-    
-    # 等待回复（命令类用短超时）
-    for _ in range(10):
-        await asyncio.sleep(1)
-        msgs = mock_server.get_sent_messages()
-        if msgs:
-            assert "my-session" in msgs[-1].text or "session" in msgs[-1].text.lower()
-            return
-    
-    pytest.fail("Bot did not reply to /new command")
+def test_my_feature(self, runner: BotTestRunner):
+    """描述这个测试验证什么"""
+    runner.inject("/mycommand", chat_id=123)
+    msg = runner.wait_for_reply(count_before=0, timeout=TIMEOUT_COMMAND)
+
+    assert msg is not None, "Bot 未回复"
+    assert "expected text" in msg["text"], f"回复内容不符: {msg['text']}"
 ```
 
-### Mock Server 控制 API
+### 超时选择
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/_inject` | POST | 注入用户消息 |
-| `/_sent_messages` | GET | 获取 bot 发出的所有消息 |
-| `/_clear` | POST | 清空消息记录 |
-| `/health` | GET | 健康检查 |
+- 命令类（`/start`, `/new` 等）：用 `TIMEOUT_COMMAND`（10s）
+- 普通消息（需要 LLM）：用 `TIMEOUT_LLM`（30s）
 
-`/_inject` 请求体：
-```json
-{
-  "text": "消息内容",
-  "chat_id": 123,
-  "username": "testuser",
-  "is_group": false
-}
+### BotTestRunner API
+
+| 方法 | 说明 |
+|------|------|
+| `runner.inject(text, chat_id, username, is_group)` | 注入用户消息 |
+| `runner.inject_callback(data, chat_id, message_id)` | 注入按钮回调 |
+| `runner.wait_for_reply(count_before, timeout)` | 等待新消息，返回最新一条 |
+| `runner.get_sent_messages()` | 获取所有已发消息列表 |
+| `runner.clear()` | 清空消息记录（每个测试前自动调用） |
+| `runner.health()` | 检查 Mock Server 是否在线 |
+
+### 多轮对话示例
+
+```python
+def test_multi_turn(self, runner: BotTestRunner):
+    """测试多轮对话"""
+    # 第一轮
+    runner.inject("你好", chat_id=123)
+    msg1 = runner.wait_for_reply(count_before=0, timeout=TIMEOUT_LLM)
+    assert msg1 is not None
+
+    # 第二轮（注意 count_before 要更新）
+    count = len(runner.get_sent_messages())
+    runner.inject("继续", chat_id=123)
+    msg2 = runner.wait_for_reply(count_before=count, timeout=TIMEOUT_LLM)
+    assert msg2 is not None
 ```
 
----
+### 按钮回调示例
 
-## 已知限制
-
-1. **LLM 测试不稳定**：普通消息需要调用真实 LLM API，受网络延迟影响，超时设置需要留余量
-2. **无媒体文件测试**：当前 Mock 对图片/语音返回假数据，不测试实际媒体处理
-3. **单用户场景**：当前测试用例只模拟单个用户（chat_id=123），多用户并发未覆盖
-4. **会话状态**：每次运行脚本 bot 是全新启动，不保留上次会话状态
-
----
+```python
+def test_callback_button(self, runner: BotTestRunner):
+    """测试按钮点击"""
+    runner.inject_callback("s:my-topic", chat_id=123, message_id=100)
+    msg = runner.wait_for_reply(count_before=0, timeout=TIMEOUT_COMMAND)
+    assert msg is not None
+```
 
 ## 调试技巧
 
@@ -215,4 +211,15 @@ curl -X POST http://127.0.0.1:5000/_inject \
 
 # 查看 bot 回复
 curl http://127.0.0.1:5000/_sent_messages
+
+# 单独运行某个测试（需先手动启动 mock server 和 bot）
+cd tests/telegram_mock
+PYTHONPATH=. MOCK_BASE_URL=http://127.0.0.1:5000 \
+  .venv/bin/pytest test_bot.py::TestBotCommands::test_start_command -v
 ```
+
+## 已知限制
+
+- LLM 测试受网络延迟影响，超时设置需留余量
+- 媒体文件（图片/语音）Mock 返回假数据，不测试实际媒体处理
+- 每次运行 bot 全新启动，不保留上次会话状态
