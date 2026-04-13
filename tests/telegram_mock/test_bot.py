@@ -99,16 +99,16 @@ class TestSessionCommands:
         text = inject_and_get_reply(runner, "/s")
         assert text == "Switched to default session.", f"实际回复: {text}"
 
-    def test_sessions_empty(self, runner: BotTestRunner):
-        """/sessions → 有回复"""
+    def test_sessions_list(self, runner: BotTestRunner):
+        """/sessions → bot replies with session list (sessions exist from prior tests)"""
         text = inject_and_get_reply(runner, "/sessions")
-        assert len(text) > 0, "回复为空"
+        assert len(text) > 0, "Empty reply"
         print(f"\n  /sessions → {text[:100]}")
 
-    def test_back_no_history(self, runner: BotTestRunner):
-        """/back（无历史）→ 'No previous session to switch to.'"""
+    def test_back_returns_session(self, runner: BotTestRunner):
+        """/back → either 'Switched back to session: X' or 'No previous session'"""
         text = inject_and_get_reply(runner, "/back")
-        assert "session" in text.lower(), f"实际回复: {text}"
+        assert "session" in text.lower(), f"Unexpected reply: {text}"
         print(f"\n  /back → {text}")
 
     def test_back_with_history(self, runner: BotTestRunner):
