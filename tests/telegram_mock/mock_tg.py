@@ -95,7 +95,7 @@ class MockTelegramServer:
             offset = int(data.get("offset", 0))
             timeout = int(data.get("timeout", 0))
 
-            updates = [u for u in self._updates if u.update_id > offset]
+            updates = [u for u in self._updates if u.update_id >= offset]
 
             if not updates and timeout > 0:
                 # Poll up to timeout seconds, checking every 0.2s for new messages
@@ -103,7 +103,7 @@ class MockTelegramServer:
                 while waited < timeout:
                     await asyncio.sleep(0.2)
                     waited += 0.2
-                    updates = [u for u in self._updates if u.update_id > offset]
+                    updates = [u for u in self._updates if u.update_id >= offset]
                     if updates:
                         break
 
