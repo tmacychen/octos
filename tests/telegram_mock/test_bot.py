@@ -30,9 +30,19 @@ def runner():
     return r
 
 
+# 不使用 clear()，改用全局单调递增的消息计数
+# 每个测试开始时记录当前消息总数，等待超过该数量的新消息
 @pytest.fixture(autouse=True)
-def clear_messages(runner):
-    runner.clear()
+def message_baseline(runner):
+    """记录测试开始前的消息总数，供 inject_and_get_reply 使用"""
+    # 等待上一个测试可能的延迟回复稳定（0.3s 无新消息则认为稳定）
+    prev = len(runner.get_sent_messages())
+    for _ in range(10):
+        time.sleep(0.3)
+        cur = len(runner.get_sent_messages())
+        if cur == prev:
+            break
+        prev = cur
     yield
 
 
