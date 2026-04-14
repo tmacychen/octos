@@ -327,6 +327,8 @@ generate_plist() {
         <string>${rdata}</string>
         <key>OCTOS_AUTH_TOKEN</key>
         <string>octos-admin-2026</string>
+        <key>SMTP_PASSWORD</key>
+        <string>${SMTP_PASSWORD:-}</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>${rhome}</string>
