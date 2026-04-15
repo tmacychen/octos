@@ -1,14 +1,14 @@
 #!/usr/bin/env fish
-# Telegram Bot Mock Test Runner
-# Usage: fish tests/telegram_mock/run_test.fish
+# Discord Bot Mock Test Runner
+# Usage: fish tests/bot_mock/run_discord_test.fish
 
 set SCRIPT_DIR (dirname (realpath (status filename)))
 set PROJECT_ROOT (realpath $SCRIPT_DIR/../..)
-set MOCK_PORT 5000
+set MOCK_PORT 5001
 set VENV_PYTHON $SCRIPT_DIR/.venv/bin/python
 set BOT_BIN $PROJECT_ROOT/target/debug/octos
-set BOT_LOG /tmp/octos_bot_test.log
-set CONFIG_FILE $PROJECT_ROOT/.octos/test_config.json
+set BOT_LOG /tmp/octos_discord_bot_test.log
+set CONFIG_FILE $PROJECT_ROOT/.octos/test_discord_config.json
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 set RED   '\033[0;31m'
@@ -45,9 +45,12 @@ if not set -q ANTHROPIC_API_KEY
     err "ANTHROPIC_API_KEY is not set"
     exit 1
 end
-if not set -q TELEGRAM_BOT_TOKEN
-    err "TELEGRAM_BOT_TOKEN is not set"
-    exit 1
+
+# In mock mode, DISCORD_BOT_TOKEN is not a real Discord token — the mock server
+# doesn't validate it. Auto-set a dummy value if not provided.
+if not set -q DISCORD_BOT_TOKEN
+    set -x DISCORD_BOT_TOKEN "mock-bot-token-for-testing"
+    info "DISCORD_BOT_TOKEN not set, using dummy value (mock mode)"
 end
 ok "Environment variables present"
 
@@ -55,11 +58,11 @@ ok "Environment variables present"
 if not test -f $VENV_PYTHON
     info "Creating Python venv..."
     uv venv $SCRIPT_DIR/.venv
-    uv pip install fastapi uvicorn httpx pytest pytest-asyncio --python $VENV_PYTHON
+    uv pip install fastapi uvicorn httpx pytest pytest-asyncio websockets --python $VENV_PYTHON
 end
-ok "Python venv ready"
+ok "Python venv ready (with websockets for Discord WS support)"
 
-# ── 3. Write test config ──────────────────────────────────────────────────────
+# ── 3. Write test config (Discord channel) ───────────────────────────────────
 section "Writing config"
 mkdir -p (dirname $CONFIG_FILE)
 echo '{
@@ -71,16 +74,16 @@ echo '{
   "gateway": {
     "channels": [
       {
-        "type": "telegram",
+        "type": "discord",
         "settings": {
-          "token_env": "TELEGRAM_BOT_TOKEN"
+          "token_env": "DISCORD_BOT_TOKEN"
         },
         "allowed_senders": []
       }
     ]
   }
 }' > $CONFIG_FILE
-ok "Config written to $CONFIG_FILE"
+ok "Config written to $CONFIG_FILE (discord channel)"
 
 # ── 4. Kill anything on the mock port ────────────────────────────────────────
 section "Preparing mock server"
@@ -96,12 +99,12 @@ if test -n "$EXISTING_PID"
     end
 end
 
-# ── 5. Start mock server ──────────────────────────────────────────────────────
+# ── 5. Start Discord mock server (REST + WebSocket) ─────────────────────────
 set -x PYTHONPATH $SCRIPT_DIR
 $VENV_PYTHON -c "
 import time, signal, sys
-from mock_tg import MockTelegramServer
-server = MockTelegramServer(port=$MOCK_PORT)
+from mock_discord import MockDiscordServer
+server = MockDiscordServer(port=$MOCK_PORT)
 server.start_background()
 print('ready', flush=True)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -111,49 +114,49 @@ while True:
 set MOCK_PID $last_pid
 
 # Wait for health check
-sleep 1
+sleep 2  # Give extra time for WS endpoint to be ready
 if not $VENV_PYTHON -c "
 import httpx, sys
 try:
-    r = httpx.get('http://127.0.0.1:$MOCK_PORT/health', timeout=3)
+    r = httpx.get('http://127.0.0.1:$MOCK_PORT/health', timeout=5)
     sys.exit(0 if r.status_code == 200 else 1)
 except Exception as e:
     print(e); sys.exit(1)
 " 2>/dev/null
-    err "Mock server failed to start"
+    err "Discord Mock server failed to start"
     lsof -i tcp:$MOCK_PORT
     exit 1
 end
-ok "Mock server running on port $MOCK_PORT (PID $MOCK_PID)"
+ok "Discord Mock server running on port $MOCK_PORT (PID $MOCK_PID)"
 
-# ── 6. Build bot ──────────────────────────────────────────────────────────────
-section "Building octos (telegram feature)"
+# ── 6. Build bot with discord feature ────────────────────────────────────────
+section "Building octos (--features discord)"
 info "This may take a moment on first build..."
-set BUILD_LOG /tmp/octos_build.log
-cargo build --manifest-path $PROJECT_ROOT/Cargo.toml --bin octos --features telegram > $BUILD_LOG 2>&1
+set BUILD_LOG /tmp/octos_discord_build.log
+cargo build --manifest-path $PROJECT_ROOT/Cargo.toml --bin octos --features discord > $BUILD_LOG 2>&1
 if test $status -ne 0
     err "Build failed:"
     cat $BUILD_LOG
     kill $MOCK_PID 2>/dev/null
     exit 1
 end
-ok "Build complete"
+ok "Build complete (discord feature)"
 
 # ── 7. Start bot ──────────────────────────────────────────────────────────────
 section "Starting octos gateway"
-set -x TELOXIDE_API_URL http://127.0.0.1:$MOCK_PORT
 rm -f $BOT_LOG
+# DISCORD_API_BASE_URL tells serenity's HttpBuilder.proxy() to replace
+# https://discord.com with our mock server URL. No forward proxy needed.
+set -x DISCORD_API_BASE_URL "http://127.0.0.1:$MOCK_PORT"
 $BOT_BIN gateway --config $CONFIG_FILE > $BOT_LOG 2>&1 &
 set BOT_PID $last_pid
-info "Bot PID: $BOT_PID  |  Log: $BOT_LOG"
+info "Bot PID: $BOT_PID  |  Log: $BOT_LOG  |  API: $DISCORD_API_BASE_URL"
 
-# Poll for "Gateway ready" with live log tail
 echo ""
 echo -e "$GRAY  Waiting for gateway to start...$RESET"
 set READY 0
-for i in (seq 1 40)
+for i in (seq 1 50)
     sleep 1
-    # Print any new log lines
     if test -f $BOT_LOG
         set LINES (cat $BOT_LOG | wc -l | string trim)
         if test $LINES -gt 0
@@ -161,11 +164,15 @@ for i in (seq 1 40)
             echo -e "$GRAY  › $LAST_LINE$RESET"
         end
     end
+    # Look for ready signal or bot connected message
     if grep -q "gateway.*ready\|Gateway ready\|\[gateway\] ready" $BOT_LOG 2>/dev/null
         set READY 1
         break
     end
-    # Detect early failure
+    if grep -q "Discord.*bot connected\|Discord channel started" $BOT_LOG 2>/dev/null
+        set READY 1
+        break
+    end
     if grep -q "^Error:" $BOT_LOG 2>/dev/null
         break
     end
@@ -182,7 +189,7 @@ if test $READY -eq 0
     kill $MOCK_PID 2>/dev/null
     exit 1
 end
-ok "Gateway ready!"
+ok "Gateway ready! (Discord channel active)"
 
 # ── 8. Run tests ──────────────────────────────────────────────────────────────
 section "Running tests"
@@ -190,7 +197,7 @@ section "Running tests"
 set -x PYTHONPATH $SCRIPT_DIR
 set -x MOCK_BASE_URL http://127.0.0.1:$MOCK_PORT
 
-$VENV_PYTHON -m pytest $SCRIPT_DIR/test_bot.py -v --tb=short --no-header
+$VENV_PYTHON -m pytest $SCRIPT_DIR/test_discord.py -v --tb=short --no-header
 
 set TEST_EXIT $status
 
@@ -202,9 +209,9 @@ ok "Processes stopped"
 
 echo ""
 if test $TEST_EXIT -eq 0
-    echo -e "$BOLD$GREEN  🎉 All tests passed!$RESET"
+    echo -e "$BOLD$GREEN  🎉 All Discord tests passed!$RESET"
 else
-    echo -e "$BOLD$RED  💥 Some tests failed$RESET"
+    echo -e "$BOLD$RED  💥 Some Discord tests failed$RESET"
     echo -e "$GRAY  Bot log: $BOT_LOG$RESET"
 end
 echo ""

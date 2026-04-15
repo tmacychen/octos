@@ -10,10 +10,9 @@ use chrono::Utc;
 use eyre::{Result, WrapErr};
 use octos_core::{InboundMessage, OutboundMessage};
 use reqwest::Client as HttpClient;
-use serenity::Client;
 use serenity::all::{
-    Context, EditMessage, EventHandler, GatewayIntents, Http, Message as DiscordMessage, MessageId,
-    ReactionType, Ready,
+    ClientBuilder, Context, EditMessage, EventHandler, GatewayIntents, Http, HttpBuilder,
+    Message as DiscordMessage, MessageId, ReactionType, Ready,
 };
 use serenity::builder::{CreateAttachment, CreateEmbed, CreateMessage};
 use tokio::sync::mpsc;
@@ -39,7 +38,26 @@ impl DiscordChannel {
         shutdown: Arc<AtomicBool>,
         media_dir: PathBuf,
     ) -> Self {
-        let http = Arc::new(Http::new(token));
+        // Support DISCORD_API_BASE_URL for testing against a mock server.
+        // When set, uses HttpBuilder::proxy() which replaces serenity's
+        // hardcoded https://discord.com with the given URL. This redirects
+        // all REST API calls to the mock server. The gateway WebSocket URL
+        // comes from GET /gateway/bot, which the mock server also handles.
+        let http = if let Ok(base_url) = std::env::var("DISCORD_API_BASE_URL") {
+            info!(url = %base_url, "Discord using custom API base URL (mock mode)");
+            // NOTE: ratelimiter must be disabled in mock mode because serenity's
+            // Ratelimiter::perform() passes `None` for the proxy parameter when
+            // calling Request::build(), which bypasses the URL rewriting. Without
+            // this, all requests still go to discord.com instead of the mock.
+            Arc::new(
+                HttpBuilder::new(token)
+                    .proxy(base_url)
+                    .ratelimiter_disabled(true)
+                    .build(),
+            )
+        } else {
+            Arc::new(Http::new(token))
+        };
         Self {
             token: token.to_string(),
             http,
@@ -47,6 +65,20 @@ impl DiscordChannel {
             shutdown,
             media_dir,
             dedup: Arc::new(MessageDedup::new()),
+        }
+    }
+
+    /// Build an Http instance with the same proxy configuration as self.http.
+    /// This is needed because ClientBuilder::new_with_http takes ownership of Http,
+    /// and self.http is shared via Arc for send/edit/delete methods.
+    fn build_http_for_client(&self) -> Http {
+        if let Some(proxy) = &self.http.proxy {
+            HttpBuilder::new(&self.token)
+                .proxy(proxy.clone())
+                .ratelimiter_disabled(true)
+                .build()
+        } else {
+            Http::new(&self.token)
         }
     }
 
@@ -177,7 +209,12 @@ impl Channel for DiscordChannel {
             dedup: Arc::clone(&self.dedup),
         };
 
-        let mut client = Client::builder(&self.token, intents)
+        // Build an Http instance with the same proxy config and pass it to
+        // ClientBuilder::new_with_http. This ensures the Client's internal
+        // Http (used for gateway URL fetch + shard management) uses the mock
+        // server when DISCORD_API_BASE_URL is set.
+        let http = self.build_http_for_client();
+        let mut client = ClientBuilder::new_with_http(http, intents)
             .event_handler(handler)
             .await
             .wrap_err("failed to build Discord client")?;

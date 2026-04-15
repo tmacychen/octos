@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""
+BaseMockRunner - Mock Server 测试辅助工具的基类。
+
+提供与 Mock Server 交互的通用方法：
+  - get_sent_messages: 获取 bot 已发送的所有消息
+  - wait_for_reply: 等待 bot 发送新消息
+  - health: 检查 Mock Server 是否在线
+"""
+
+import time
+from typing import Optional
+
+import httpx
+
+
+class BaseMockRunner:
+    """连接已运行的 Mock Server，提供测试辅助方法的基类。"""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+
+    def get_sent_messages(self) -> list[dict]:
+        """获取 bot 已发送的所有消息"""
+        resp = httpx.get(f"{self.base_url}/_sent_messages", timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+
+    def wait_for_reply(self, count_before: int = 0,
+                       timeout: int = 10, poll_interval: float = 1.0) -> Optional[dict]:
+        """
+        等待 bot 发送新消息，返回最新一条。
+        count_before: 调用前已有的消息数量
+        timeout: 最长等待秒数
+        poll_interval: 轮询间隔秒数
+        """
+        elapsed = 0.0
+        while elapsed < timeout:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+            msgs = self.get_sent_messages()
+            if len(msgs) > count_before:
+                return msgs[-1]
+        return None
+
+    def health(self) -> bool:
+        """检查 Mock Server 是否在线"""
+        try:
+            resp = httpx.get(f"{self.base_url}/health", timeout=2)
+            return resp.status_code == 200
+        except Exception:
+            return False

@@ -8,10 +8,10 @@ Telegram API credentials.
 
 Usage:
     # Start the mock server
-    python -m telegram_mock.mock_tg
+    python -m bot_mock.mock_tg
 
     # Or import and use programmatically
-    from telegram_mock import MockTelegramServer
+    from bot_mock import MockTelegramServer
     server = MockTelegramServer()
     await server.start()
 """
