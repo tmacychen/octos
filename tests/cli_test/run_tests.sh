@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# Octos CLI Automated Test Script
+# For Linux/macOS
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/test_cases.json"
+
+# Default values
+OCTOS_BINARY="octos"
+OUTPUT_DIR="test-results"
+VERBOSE=false
+CANCELLED=false
+
+# Counters
+TOTAL=0
+PASSED=0
+FAILED=0
+
+# Arrays for results
+declare -a RESULTS=()
+
+# Timestamp
+TEST_DATE=$(date '+%Y-%m-%d %H:%M:%S')
+REPORT_DATE=$(date '+%Y-%m-%d_%H%M')
+LOG_FILE=""
+TEST_DIR=""
+CURRENT_CATEGORY=""
+
+# Colors (if terminal supports)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    CYAN='\033[0;36m'
+    GRAY='\033[0;90m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    GRAY=''
+    NC=''
+fi
+
+usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+Options:
+    -b, --binary NAME       Octos binary name (default: octos)
+    -o, --output-dir DIR    Output directory (default: test-results)
+    -c, --config FILE       Test config file (default: test_cases.json)
+    -v, --verbose           Verbose output
+    -h, --help              Show this help message
+
+Examples:
+    $0                                    # Run with defaults
+    $0 -v                                  # Verbose output
+    $0 -b ./target/release/octos -v       # Custom binary with verbose
+EOF
+}
+
+log() {
+    local msg="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] $msg" >> "$LOG_FILE"
+}
+
+verbose_log() {
+    local msg="$1"
+    log "$msg"
+    if [[ "$VERBOSE" == true ]]; then
+        echo -e "${GRAY}[$msg]${NC}"
+    fi
+}
+
+cleanup() {
+    if [[ -n "${TEST_DIR:-}" ]] && [[ -d "$TEST_DIR" ]]; then
+        rm -rf "$TEST_DIR"
+    fi
+}
+
+cancel_handler() {
+    CANCELLED=true
+    echo -e "\n${YELLOW}[CANCELLED] Test run cancelled by user${NC}"
+    log "[CANCELLED] Test run cancelled by user"
+
+    # Kill any running processes
+    pkill -f "octos" 2>/dev/null || true
+
+    # Generate partial report
+    if [[ ${#RESULTS[@]} -gt 0 ]]; then
+        local partial_report="${OUTPUT_DIR}/CLI_TEST_REPORT_CANCELLED_$(date '+%Y%m%d_%H%M%S').md"
+        {
+            echo "# Octos CLI Test - Cancelled"
+            echo ""
+            echo "Test run was cancelled. Partial results:"
+            echo ""
+            echo "| ID | Category | Test Name | Status |"
+            echo "|----|----------|-----------|--------|"
+            for r in "${RESULTS[@]}"; do
+                echo "$r"
+            done
+        } >> "$partial_report"
+        echo -e "${YELLOW}Partial report: $partial_report${NC}"
+    fi
+
+    exit 1
+}
+
+trap cancel_handler SIGINT SIGTERM
+
+parse_json() {
+    local json="$1"
+    local key="$2"
+    echo "$json" | grep -o "\"${key}\":[^,}]*" | sed 's/.*: *"\?\([^"]*\)"\?.*/\1/' | tr -d '"'
+}
+
+run_cli_test() {
+    local test_id="$1"
+    local category="$2"
+    local test_name="$3"
+    local cmd_args="$4"
+    local expected="$5"
+    local validation="${6:-contains}"
+    local timeout="${7:-60}"
+
+    TOTAL=$((TOTAL + 1))
+
+    verbose_log "[EXEC] octos $cmd_args"
+
+    local stdout stderr exit_code
+    if timeout "$timeout" bash -c "\"$OCTOS_BINARY\" $cmd_args" > /tmp/octos_stdout_$$.txt 2> /tmp/octos_stderr_$$.txt; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+
+    stdout=$(cat /tmp/octos_stdout_$$.txt 2>/dev/null || echo "")
+    stderr=$(cat /tmp/octos_stderr_$$.txt 2>/dev/null || echo "")
+    rm -f /tmp/octos_stdout_$$.txt /tmp/octos_stderr_$$.txt
+
+    local actual="$stdout$stderr"
+    local passed=false
+
+    case "$validation" in
+        contains)
+            if echo "$actual" | grep -q "$expected"; then
+                passed=true
+            fi
+            ;;
+        not_contains)
+            if ! echo "$actual" | grep -q "$expected"; then
+                passed=true
+            fi
+            ;;
+        exitcode)
+            if [[ "$exit_code" -eq "$expected" ]]; then
+                passed=true
+            fi
+            ;;
+    esac
+
+    if [[ "$passed" == true ]]; then
+        PASSED=$((PASSED + 1))
+        status="PASS"
+        color="$GREEN"
+    else
+        FAILED=$((FAILED + 1))
+        status="FAIL"
+        color="$RED"
+    fi
+
+    # Truncate actual for summary
+    local actual_truncated="${actual:0:200}"
+    actual_truncated="${actual_truncated//$'\n'/ }"
+    actual_truncated="${actual_truncated//$'\r'/ }"
+
+    RESULTS+=("| $test_id | $category | $test_name | $status |")
+
+    # Always log to file
+    log "[EXEC] octos $cmd_args"
+    log "[EXITCODE] $exit_code"
+    log "[STDOUT] $stdout"
+    [[ -n "$stderr" ]] && log "[STDERR] $stderr"
+    log "[STATUS] $status"
+    log ""
+
+    # Verbose output
+    if [[ "$VERBOSE" == true ]]; then
+        echo -e "${CYAN}[EXEC] octos $cmd_args${NC}"
+        echo -e "${GRAY}[EXITCODE] $exit_code${NC}"
+        if [[ -n "$stdout" ]]; then
+            echo -e "${GRAY}[STDOUT]${NC}"
+            echo -e "${GRAY}$stdout${NC}"
+        fi
+        if [[ -n "$stderr" ]]; then
+            echo -e "${YELLOW}[STDERR]${NC}"
+            echo -e "${YELLOW}$stderr${NC}"
+        fi
+        echo ""
+    fi
+
+    echo -e "$color[$status]${NC} $test_id $test_name"
+}
+
+run_file_check() {
+    local test_id="$1"
+    local category="$2"
+    local test_name="$3"
+    local path="$4"
+    local should_exist="${5:-true}"
+
+    TOTAL=$((TOTAL + 1))
+
+    local exists=false
+    if [[ -e "$path" ]]; then
+        exists=true
+    fi
+
+    local passed=false
+    if [[ "$exists" == "$should_exist" ]]; then
+        passed=true
+    fi
+
+    if [[ "$passed" == true ]]; then
+        PASSED=$((PASSED + 1))
+        status="PASS"
+        color="$GREEN"
+    else
+        FAILED=$((FAILED + 1))
+        status="FAIL"
+        color="$RED"
+    fi
+
+    local actual_msg
+    if [[ "$exists" == true ]]; then
+        actual_msg="Path exists: $path"
+    else
+        actual_msg="Path not found: $path"
+    fi
+
+    RESULTS+=("| $test_id | $category | $test_name | $status |")
+
+    log "[FILE CHECK] $path"
+    log "[STATUS] $status"
+    log ""
+
+    if [[ "$VERBOSE" == true ]]; then
+        echo -e "${CYAN}[FILE CHECK] $path${NC}"
+        echo -e "${GRAY}[STATUS] $status${NC}"
+        echo ""
+    fi
+
+    echo -e "$color[$status]${NC} $test_id $test_name"
+}
+
+check_jq() {
+    if ! command -v jq &> /dev/null; then
+        echo -e "${RED}[ERROR] jq is required for JSON parsing${NC}"
+        echo -e "${YELLOW}Install jq:${NC}"
+        echo -e "  macOS: brew install jq"
+        echo -e "  Ubuntu/Debian: apt install jq"
+        exit 1
+    fi
+}
+
+load_tests_from_json() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}[ERROR] Config file not found: $CONFIG_FILE${NC}"
+        exit 1
+    fi
+
+    check_jq
+
+    echo -e "${CYAN}Loading tests from: $CONFIG_FILE${NC}"
+    log "Loading test configuration from: $CONFIG_FILE"
+
+    TEST_COUNT=$(jq '.tests | length' "$CONFIG_FILE")
+    echo -e "${CYAN}Found $TEST_COUNT test cases${NC}"
+    log "Found $TEST_COUNT test cases"
+}
+
+run_tests_from_json() {
+    check_jq
+
+    TEST_COUNT=$(jq '.tests | length' "$CONFIG_FILE")
+
+    for i in $(seq 0 $((TEST_COUNT - 1))); do
+        if [[ "$CANCELLED" == true ]]; then
+            break
+        fi
+
+        TEST_ID=$(jq -r ".tests[$i].id" "$CONFIG_FILE")
+        CATEGORY=$(jq -r ".tests[$i].category" "$CONFIG_FILE")
+        NAME=$(jq -r ".tests[$i].name" "$CONFIG_FILE")
+        COMMAND=$(jq -r ".tests[$i].command" "$CONFIG_FILE")
+        EXPECTED=$(jq -r ".tests[$i].expected" "$CONFIG_FILE")
+        VALIDATION=$(jq -r ".tests[$i].validation // \"contains\"" "$CONFIG_FILE")
+        TIMEOUT=$(jq -r ".tests[$i].timeout // 60" "$CONFIG_FILE")
+        TEST_TYPE=$(jq -r ".tests[$i].type // \"cli\"" "$CONFIG_FILE")
+        PATH=$(jq -r ".tests[$i].path // \"\"" "$CONFIG_FILE")
+        SHOULD_EXIST=$(jq -r ".tests[$i].should_exist // true" "$CONFIG_FILE")
+
+        COMMAND=$(echo "$COMMAND" | sed "s|{testDir}|$TEST_DIR|g" | sed "s|{tempDir}|$TEMP_DIR|g")
+
+        if [[ "$CATEGORY" != "$CURRENT_CATEGORY" ]]; then
+            CURRENT_CATEGORY="$CATEGORY"
+            echo -e "\n${YELLOW}[$CATEGORY]${NC}"
+            log "[SECTION] $CATEGORY"
+        fi
+
+        if [[ "$TEST_TYPE" == "file_check" ]]; then
+            CHECK_PATH=$(echo "$PATH" | sed "s|{testDir}|$TEST_DIR|g" | sed "s|{tempDir}|$TEMP_DIR|g")
+            run_file_check "$TEST_ID" "$CATEGORY" "$NAME" "$CHECK_PATH" "$SHOULD_EXIST"
+        else
+            run_cli_test "$TEST_ID" "$CATEGORY" "$NAME" "$COMMAND" "$EXPECTED" "$VALIDATION" "$TIMEOUT"
+        fi
+    done
+}
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -b|--binary)
+                OCTOS_BINARY="$2"
+                shift 2
+                ;;
+            -o|--output-dir)
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            -c|--config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}[ERROR] Unknown option: $1${NC}"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Setup directories
+    mkdir -p "$OUTPUT_DIR"
+    LOGS_DIR="${OUTPUT_DIR}/logs"
+    mkdir -p "$LOGS_DIR"
+    LOG_FILE="${LOGS_DIR}/test_$(date '+%Y%m%d_%H%M').log"
+
+    TEST_DIR=$(mktemp -d)
+    TEMP_DIR="${TEST_DIR}/temp"
+    mkdir -p "$TEMP_DIR"
+
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN}Octos CLI Automated Test${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${GRAY}Test Time: $TEST_DATE${NC}"
+    echo -e "${GRAY}Binary: $OCTOS_BINARY${NC}"
+    echo -e "${GRAY}Log File: $LOG_FILE${NC}"
+    echo ""
+
+    log "========================================"
+    log "Octos CLI Automated Test"
+    log "========================================"
+    log "Test Time: $TEST_DATE"
+    log "Binary: $OCTOS_BINARY"
+    log "Verbose Mode: $VERBOSE"
+    log ""
+
+    # Check if binary exists
+    if ! command -v "$OCTOS_BINARY" &> /dev/null; then
+        echo -e "${RED}[ERROR] Binary not found: $OCTOS_BINARY${NC}"
+        echo -e "${YELLOW}Please run: cargo build --all-features${NC}"
+        log "[ERROR] Binary not found: $OCTOS_BINARY"
+        exit 1
+    fi
+
+    echo -e "${GRAY}Test workspace: $TEST_DIR${NC}"
+    log "Test workspace: $TEST_DIR"
+    echo ""
+
+    CURRENT_CATEGORY=""
+    load_tests_from_json
+    run_tests_from_json
+
+    # ========================================
+    # Generate Report
+    # ========================================
+    echo -e "\n${CYAN}========================================${NC}"
+    echo -e "${CYAN}Generating Report...${NC}"
+    log "========================================"
+    log "Generating Report..."
+
+    local report_path="${OUTPUT_DIR}/CLI_TEST_REPORT_${REPORT_DATE}.md"
+    local pass_rate=0
+    if [[ $TOTAL -gt 0 ]]; then
+        pass_rate=$(( PASSED * 100 / TOTAL ))
+    fi
+
+    {
+        echo "# Octos CLI Automated Test Report"
+        echo ""
+        echo "## Test Information"
+        echo ""
+        echo "| Item | Content |"
+        echo "|------|---------|"
+        echo "| Test Date | $TEST_DATE |"
+        echo "| Binary | $OCTOS_BINARY |"
+        echo "| Total Tests | $TOTAL |"
+        echo "| Passed | $PASSED |"
+        echo "| Failed | $FAILED |"
+        echo "| Pass Rate | ${pass_rate}% |"
+        echo "| Log File | $LOG_FILE |"
+        echo ""
+        echo "## Detailed Test Results"
+        echo ""
+        echo "| ID | Category | Test Name | Status |"
+        echo "|----|----------|-----------|--------|"
+        for r in "${RESULTS[@]}"; do
+            echo "$r"
+        done
+        echo ""
+        echo "## Environment"
+        echo ""
+        echo "- OS: $(uname -s)"
+        echo "- Test Date: $TEST_DATE"
+        echo ""
+        echo "---"
+        echo "*Generated by Bash test script*"
+    } >> "$report_path"
+
+    echo -e "${GREEN}Report: $report_path${NC}"
+    echo -e "${GREEN}Log: $LOG_FILE${NC}"
+    log "Report saved to: $report_path"
+    log "Log saved to: $LOG_FILE"
+    echo ""
+    echo -e "${CYAN}========================================${NC}"
+
+    if [[ $pass_rate -ge 80 ]]; then
+        echo -e "${GREEN}SUMMARY: Total=$TOTAL Passed=$PASSED Failed=$FAILED PassRate=${pass_rate}%${NC}"
+    elif [[ $pass_rate -ge 60 ]]; then
+        echo -e "${YELLOW}SUMMARY: Total=$TOTAL Passed=$PASSED Failed=$FAILED PassRate=${pass_rate}%${NC}"
+    else
+        echo -e "${RED}SUMMARY: Total=$TOTAL Passed=$PASSED Failed=$FAILED PassRate=${pass_rate}%${NC}"
+    fi
+
+    log "========================================"
+    log "SUMMARY: Total=$TOTAL Passed=$PASSED Failed=$FAILED PassRate=${pass_rate}%"
+
+    # Cleanup
+    cleanup
+
+    # Remove cancel handler
+    trap - SIGINT SIGTERM
+
+    if [[ $FAILED -gt 0 ]]; then
+        exit 1
+    else
+        exit 0
+    fi
+}
+
+main "$@"

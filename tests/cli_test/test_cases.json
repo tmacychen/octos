@@ -1,0 +1,300 @@
+{
+  "version": "1.0",
+  "description": "Octos CLI Test Cases Configuration",
+  "platform_support": ["linux", "macos", "windows"],
+  "test_defaults": {
+    "timeout": 60,
+    "validation": "contains"
+  },
+  "tests": [
+    {
+      "id": "1.1",
+      "category": "CLI",
+      "name": "help info",
+      "command": "--help",
+      "expected": "chat",
+      "timeout": 30
+    },
+    {
+      "id": "1.2",
+      "category": "CLI",
+      "name": "version info",
+      "command": "--version",
+      "expected": "octos",
+      "timeout": 30
+    },
+    {
+      "id": "1.3",
+      "category": "CLI",
+      "name": "single message mode",
+      "command": "chat --message \"hello\" --no-retry",
+      "expected": "hello",
+      "timeout": 30
+    },
+    {
+      "id": "2.1",
+      "category": "Tools",
+      "name": "single message mode",
+      "command": "chat --message \"echo hello\" --no-retry",
+      "expected": "hello",
+      "timeout": 30
+    },
+    {
+      "id": "3.1",
+      "category": "Security",
+      "name": "dangerous command rejection",
+      "command": "chat --message \"run rm -rf /\" --no-retry",
+      "expected": "reject",
+      "timeout": 30
+    },
+    {
+      "id": "4.1",
+      "category": "Init",
+      "name": "help info",
+      "command": "init --help",
+      "expected": "--defaults",
+      "timeout": 30
+    },
+    {
+      "id": "4.2",
+      "category": "Init",
+      "name": "default init",
+      "command": "init --defaults --cwd \"{testDir}\"",
+      "expected": "Created",
+      "timeout": 30
+    },
+    {
+      "id": "4.3",
+      "category": "Init",
+      "name": "config.json exists",
+      "type": "file_check",
+      "path": "{testDir}/.octos/config.json",
+      "should_exist": true,
+      "timeout": 30
+    },
+    {
+      "id": "4.4",
+      "category": "Init",
+      "name": "reinit prompt",
+      "command": "init --cwd \"{testDir}\" --defaults",
+      "expected": "already exists",
+      "timeout": 30
+    },
+    {
+      "id": "5.1",
+      "category": "Clean",
+      "name": "help info",
+      "command": "clean --help",
+      "expected": "--all",
+      "timeout": 30
+    },
+    {
+      "id": "5.2",
+      "category": "Clean",
+      "name": "no .octos dir",
+      "command": "clean --cwd \"{tempDir}/no-octos-dir\"",
+      "expected": "No .octos",
+      "timeout": 30
+    },
+    {
+      "id": "5.3",
+      "category": "Clean",
+      "name": "empty dir",
+      "command": "clean --cwd \"{testDir}\"",
+      "expected": "Nothing to clean",
+      "timeout": 30
+    },
+    {
+      "id": "6.1",
+      "category": "Status",
+      "name": "help info",
+      "command": "status --help",
+      "expected": "status",
+      "timeout": 30
+    },
+    {
+      "id": "6.2",
+      "category": "Status",
+      "name": "show status",
+      "command": "status --cwd \"{testDir}\"",
+      "expected": "provider",
+      "timeout": 30
+    },
+    {
+      "id": "7.1",
+      "category": "Completions",
+      "name": "help info",
+      "command": "completions --help",
+      "expected": "bash",
+      "timeout": 30
+    },
+    {
+      "id": "7.2",
+      "category": "Completions",
+      "name": "bash completion",
+      "command": "completions bash",
+      "expected": "_octos",
+      "timeout": 30
+    },
+    {
+      "id": "7.3",
+      "category": "Completions",
+      "name": "zsh completion",
+      "command": "completions zsh",
+      "expected": "compdef",
+      "timeout": 30
+    },
+    {
+      "id": "7.4",
+      "category": "Completions",
+      "name": "fish completion",
+      "command": "completions fish",
+      "expected": "complete",
+      "timeout": 30
+    },
+    {
+      "id": "7.5",
+      "category": "Completions",
+      "name": "powershell completion",
+      "command": "completions powershell",
+      "expected": "Register-ArgumentCompleter",
+      "timeout": 30
+    },
+    {
+      "id": "7.6",
+      "category": "Completions",
+      "name": "invalid shell",
+      "command": "completions invalid-shell",
+      "expected": "error",
+      "timeout": 30
+    },
+    {
+      "id": "8.1",
+      "category": "Skills",
+      "name": "help info",
+      "command": "skills --help",
+      "expected": "list",
+      "timeout": 30
+    },
+    {
+      "id": "8.2",
+      "category": "Skills",
+      "name": "list skills",
+      "command": "skills list",
+      "expected": "Installed Skills",
+      "timeout": 30
+    },
+    {
+      "id": "8.3",
+      "category": "Skills",
+      "name": "search skills",
+      "command": "skills search mofa",
+      "expected": "mofa",
+      "timeout": 30
+    },
+    {
+      "id": "8.4",
+      "category": "Skills",
+      "name": "search no result",
+      "command": "skills search xyznonexistent99",
+      "expected": "No packages",
+      "timeout": 30
+    },
+    {
+      "id": "8.5",
+      "category": "Skills",
+      "name": "remove nonexistent skill",
+      "command": "skills remove nonexistent-skill-xyz",
+      "expected": "not found",
+      "timeout": 30
+    },
+    {
+      "id": "9.1",
+      "category": "Auth",
+      "name": "help info",
+      "command": "auth --help",
+      "expected": "login",
+      "timeout": 30
+    },
+    {
+      "id": "9.2",
+      "category": "Auth",
+      "name": "auth status",
+      "command": "auth status",
+      "expected": "Not logged in",
+      "timeout": 30
+    },
+    {
+      "id": "10.1",
+      "category": "Channels",
+      "name": "help info",
+      "command": "channels --help",
+      "expected": "channels",
+      "timeout": 30
+    },
+    {
+      "id": "10.2",
+      "category": "Channels",
+      "name": "channels status",
+      "command": "channels status",
+      "expected": "gateway",
+      "timeout": 30
+    },
+    {
+      "id": "11.1",
+      "category": "Cron",
+      "name": "help info",
+      "command": "cron --help",
+      "expected": "list",
+      "timeout": 30
+    },
+    {
+      "id": "11.2",
+      "category": "Cron",
+      "name": "cron list",
+      "command": "cron list",
+      "expected": "No scheduled",
+      "timeout": 30
+    },
+    {
+      "id": "12.1",
+      "category": "Chat",
+      "name": "help info",
+      "command": "chat --help",
+      "expected": "--model",
+      "timeout": 30
+    },
+    {
+      "id": "13.1",
+      "category": "Gateway",
+      "name": "help info",
+      "command": "gateway --help",
+      "expected": "gateway",
+      "timeout": 30
+    },
+    {
+      "id": "14.1",
+      "category": "Serve",
+      "name": "help info",
+      "command": "serve --help",
+      "expected": "--port",
+      "timeout": 30
+    },
+    {
+      "id": "15.1",
+      "category": "Docs",
+      "name": "help info",
+      "command": "docs --help",
+      "expected": "docs",
+      "timeout": 30
+    }
+  ],
+  "platform_overrides": {
+    "windows": {
+      "4.2": {
+        "command": "init --defaults --cwd \"{testDir}\"",
+        "note": "Same command on Windows"
+      }
+    }
+  }
+}
