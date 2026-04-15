@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use octos_agent::{
-    initialize_and_commit, write_workspace_policy, WorkspacePolicy, WorkspaceProjectKind,
+    WorkspacePolicy, WorkspaceProjectKind, initialize_and_commit, write_workspace_policy,
 };
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -126,6 +126,15 @@ pub fn slides_creation_reply(project_name: &str) -> String {
 /// Generate the slides-specific system prompt for a session.
 fn slides_system_prompt(project_name: &str) -> String {
     let slug = slugify(project_name);
+    let delete_cached_png_instruction = if cfg!(windows) {
+        format!(
+            "  shell(\"if exist slides/{slug}/output/imgs/slide-NN.png del /q slides\\\\{slug}\\\\output\\\\imgs\\\\slide-NN.png\") for each changed slide N"
+        )
+    } else {
+        format!(
+            "  shell(\"rm -f slides/{slug}/output/imgs/slide-NN.png\") for each changed slide N"
+        )
+    };
     format!(
         r#"You are a slides designer for the "{project_name}" project.
 Project dir: slides/{slug}/
@@ -145,15 +154,19 @@ RULES:
 - ALWAYS use input parameter: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
 - NEVER pass slides array inline. ALWAYS use the input file.
 - On failure: report error, do NOT retry via shell.
+- If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
 - Read slides/{slug}/memory.md before each response for context.
 - Workspace policy lives at slides/{slug}/.octos-workspace.toml.
+- Runtime owns workspace contract enforcement: git snapshots, required source files, and required output artifacts.
+- Treat the workspace contract as authoritative for ready/not-ready state. Do NOT invent alternate completion criteria.
+- Runtime-owned revision history lives in local git. Do NOT create ad hoc versioned JS filenames as the main history mechanism.
+
+PROMPT-OWNED GUIDANCE:
 - Maintain a version header at the top of slides/{slug}/script.js:
   // version: v{{NNN}}_{{desc}}
   // updated_at: YYYY-MM-DD
   // change_summary: <one line>
-- Local git is already initialized in slides/{slug}/ and is the primary revision history.
-- Do NOT create ad hoc versioned JS filenames as the main history mechanism.
-- On every meaningful edit: increment NNN, update the script.js version header, append the same version tag to changelog.md, and rely on git auto-commits for revision history.
+- When you intentionally record a human-readable revision, keep the script.js version header and changelog.md aligned.
 - After edits: update memory.md.
 - If the user asks for change history, inspect it with shell("git -C slides/{slug} log --oneline -- script.js changelog.md memory.md").
 
@@ -197,19 +210,22 @@ Custom styles persist in styles/ and appear as templates for future projects.
 INCREMENTAL UPDATES:
 - script.js is the SINGLE SOURCE OF TRUTH — never recreate, always edit
 - To update slides: read → edit changed slides only → delete their cached PNGs → regenerate
-  shell("rm -f slides/{slug}/output/imgs/slide-NN.png") for each changed slide N
+{delete_cached_png_instruction}
   (slide-01.png = slides[0], slide-02.png = slides[1], etc.)
 - Skipping PNG deletion causes mofa to reuse stale images
 - New slides need no PNG deletion (no cache yet)
 
 TASK STATUS CHECK:
 When user asks about progress ("做完了吗", "done?", "status"):
-  glob("slides/{slug}/output/imgs/slide-*.png") to count generated slides
-  glob("slides/{slug}/output/*.pptx") to check if PPTX exists
-  shell("ps aux | grep mofa_slides | grep -v grep") to check if still generating
-Report: X/N slides done, PPTX ready/not ready, generation running/finished.
+  use check_background_tasks({{"include_completed": true}}) to inspect the current session's execution state
+  use check_workspace_contract({{"project": "slides/{slug}"}}) to inspect deliverable truth
+  task state tells you what happened in execution
+  workspace state tells you what is true about the deliverable
+  treat the workspace contract as the definition of ready/not-ready
+  count generated slides from the contract's preview artifact matches
+Report: X previews present, PPTX ready/not ready, generation running/verifying/delivering/completed/failed based on supervisor state, and list any failed contract checks or missing artifacts.
 
-Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file
+Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file, check_background_tasks, check_workspace_contract
 "#
     )
 }
@@ -943,6 +959,21 @@ mod tests {
         assert!(reply.unwrap().contains("untitled"));
         // Scaffolding happens in session_actor, not here
         assert!(!tmp.path().join("slides/untitled/script.js").is_file());
+    }
+
+    #[test]
+    fn slides_prompt_uses_task_and_workspace_state_for_status_checks() {
+        let prompt = slides_system_prompt("Deck");
+        assert!(prompt.contains("check_background_tasks"));
+        assert!(prompt.contains("check_workspace_contract"));
+        assert!(prompt.contains("task state tells you what happened in execution"));
+        assert!(prompt.contains("workspace state tells you what is true about the deliverable"));
+        assert!(prompt.contains("If `mofa_slides` is not available"));
+        assert!(prompt.contains("Runtime owns workspace contract enforcement"));
+        assert!(prompt.contains("PROMPT-OWNED GUIDANCE"));
+        assert!(!prompt.contains("glob(\"slides/{slug}/output/*.pptx\")"));
+        assert!(!prompt.contains("On every meaningful edit: increment NNN"));
+        assert!(!prompt.contains("ps aux | grep mofa_slides | grep -v grep"));
     }
 
     #[test]

@@ -5,24 +5,32 @@
 //! to the wrong chat.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
-use octos_agent::tools::{MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry};
-use octos_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
+use octos_agent::tools::{
+    BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
+    SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
+};
+use octos_agent::{
+    Agent, AgentConfig, HookContext, HookExecutor, TaskSupervisor, TokenTracker,
+    TurnAttachmentContext, WorkspacePolicy, workspace_policy_path, write_workspace_policy,
+};
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
 use octos_core::{
-    InboundMessage, Message, MessageRole, OutboundMessage, SessionKey, MAIN_PROFILE_ID,
-    METADATA_SENDER_USER_ID,
+    InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
+    OutboundMessage, SessionKey,
 };
 use octos_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
     ResponsivenessObserver,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -34,6 +42,8 @@ use crate::status_layers::{StatusComposer, UserStatusConfig};
 pub struct DispatchParams<'a> {
     pub message: InboundMessage,
     pub image_media: Vec<String>,
+    pub attachment_media: Vec<String>,
+    pub attachment_prompt: Option<String>,
     pub session_key: SessionKey,
     pub reply_channel: &'a str,
     pub reply_chat_id: &'a str,
@@ -122,6 +132,89 @@ fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::
 /// Flushed when the user switches to that session via `/s`.
 pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
 
+/// Shared lookup table for session-scoped background task supervisors.
+#[derive(Default, Clone)]
+pub struct SessionTaskQueryStore {
+    supervisors: Arc<StdMutex<HashMap<String, SessionTaskQueryEntry>>>,
+}
+
+struct SessionTaskQueryEntry {
+    supervisor: Weak<TaskSupervisor>,
+    data_dir: PathBuf,
+}
+
+fn task_response_path(data_dir: &Path, path: &str) -> String {
+    octos_bus::file_handle::encode_profile_file_handle(data_dir, Path::new(path))
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn sanitize_task_for_response(
+    data_dir: &Path,
+    task: &octos_agent::BackgroundTask,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": task.id,
+        "tool_name": task.tool_name,
+        "tool_call_id": task.tool_call_id,
+        "status": task.status,
+        "started_at": task.started_at,
+        "updated_at": task.updated_at,
+        "completed_at": task.completed_at,
+        "runtime_state": task.runtime_state,
+        "runtime_detail": task.runtime_detail,
+        "output_files": task.output_files.iter().map(|path| task_response_path(data_dir, path)).collect::<Vec<_>>(),
+        "error": task.error,
+        "session_key": task.session_key,
+    })
+}
+
+impl SessionTaskQueryStore {
+    pub fn register(
+        &self,
+        session_key: &SessionKey,
+        supervisor: &Arc<TaskSupervisor>,
+        data_dir: &Path,
+    ) {
+        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(
+            session_key.to_string(),
+            SessionTaskQueryEntry {
+                supervisor: Arc::downgrade(supervisor),
+                data_dir: data_dir.to_path_buf(),
+            },
+        );
+    }
+
+    pub fn query_json(&self, session_key: &str) -> serde_json::Value {
+        let upgraded = {
+            let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.get(session_key).and_then(|entry| {
+                entry
+                    .supervisor
+                    .upgrade()
+                    .map(|supervisor| (supervisor, entry.data_dir.clone()))
+            }) {
+                Some(entry) => Some(entry),
+                None => {
+                    guard.remove(session_key);
+                    None
+                }
+            }
+        };
+
+        match upgraded {
+            Some((supervisor, data_dir)) => serde_json::Value::Array(
+                supervisor
+                    .get_tasks_for_session(session_key)
+                    .iter()
+                    .map(|task| sanitize_task_for_response(&data_dir, task))
+                    .collect(),
+            ),
+            None => serde_json::json!([]),
+        }
+    }
+}
+
 fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
     sender_user_id
         .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
@@ -134,6 +227,43 @@ fn git_turn_summary(content: &str) -> String {
         "agent turn update".to_string()
     } else {
         compact
+    }
+}
+
+fn merge_attachment_prompt_summaries(
+    existing: Option<String>,
+    incoming: Option<String>,
+) -> Option<String> {
+    match (existing, incoming) {
+        (Some(mut existing), Some(incoming)) => {
+            if !incoming.is_empty() {
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(&incoming);
+            }
+            Some(existing)
+        }
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
+    }
+}
+
+fn merge_optional_text(existing: Option<String>, incoming: Option<String>) -> Option<String> {
+    match (existing, incoming) {
+        (Some(mut existing), Some(incoming)) => {
+            if !incoming.is_empty() {
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(&incoming);
+            }
+            Some(existing)
+        }
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
     }
 }
 
@@ -157,29 +287,66 @@ async fn snapshot_workspace_turn_for_path(
                     "workspace turn snapshot committed"
                 );
             }
-            if report.enforced_failures.is_empty() {
+            if report.enforced_failures.is_empty() && report.validation_failures.is_empty() {
                 return None;
             }
 
-            let repo_labels = report
-                .enforced_failures
-                .iter()
-                .map(|failure| failure.repo_label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let first_error = report
-                .enforced_failures
-                .first()
-                .map(|failure| failure.error.as_str())
-                .unwrap_or("unknown error");
-            warn!(
-                session = %session_key,
-                failures = ?report.enforced_failures,
-                "workspace turn snapshot enforcement failed"
-            );
-            Some(format!(
-                "Workspace versioning failed for {repo_labels}. Turn snapshot was not recorded.\nError: {first_error}"
-            ))
+            if !report.validation_failures.is_empty() {
+                warn!(
+                    session = %session_key,
+                    failures = ?report.validation_failures,
+                    "workspace contract validation failed"
+                );
+            }
+
+            let enforcement_notice = if report.enforced_failures.is_empty() {
+                None
+            } else {
+                let repo_labels = report
+                    .enforced_failures
+                    .iter()
+                    .map(|failure| failure.repo_label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let first_error = report
+                    .enforced_failures
+                    .first()
+                    .map(|failure| failure.error.as_str())
+                    .unwrap_or("unknown error");
+                warn!(
+                    session = %session_key,
+                    failures = ?report.enforced_failures,
+                    "workspace turn snapshot enforcement failed"
+                );
+                Some(format!(
+                    "Workspace versioning failed for {repo_labels}. Turn snapshot was not recorded.\nError: {first_error}"
+                ))
+            };
+
+            let validation_notice = if report.validation_failures.is_empty() {
+                None
+            } else {
+                let failures = report
+                    .validation_failures
+                    .iter()
+                    .map(|failure| {
+                        format!(
+                            "{} [{}] {}: {}",
+                            failure.repo_label,
+                            match failure.phase {
+                                octos_agent::WorkspaceValidationPhase::TurnEnd => "turn_end",
+                                octos_agent::WorkspaceValidationPhase::Completion => "completion",
+                            },
+                            failure.check,
+                            failure.reason
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(format!("Workspace contract validation failed:\n{failures}"))
+            };
+
+            merge_optional_text(enforcement_notice, validation_notice)
         }
         Ok(Err(error)) => {
             warn!(
@@ -232,6 +399,8 @@ pub enum ActorMessage {
     Inbound {
         message: InboundMessage,
         image_media: Vec<String>,
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
     },
     /// Result from a background subagent task — injected as a system message
     /// into the conversation without triggering an extra LLM call.
@@ -240,6 +409,8 @@ pub enum ActorMessage {
         task_label: String,
         /// The subagent's final output.
         content: String,
+        /// Delivery semantics for this result.
+        kind: BackgroundResultKind,
     },
     /// Background task status changed — push to SSE.
     TaskStatusChanged {
@@ -336,6 +507,8 @@ impl ActorRegistry {
         let DispatchParams {
             message,
             image_media,
+            attachment_media,
+            attachment_prompt,
             session_key,
             reply_channel,
             reply_chat_id,
@@ -382,6 +555,8 @@ impl ActorRegistry {
         let actor_msg = ActorMessage::Inbound {
             message,
             image_media,
+            attachment_media,
+            attachment_prompt,
         };
 
         match handle.tx.try_send(actor_msg) {
@@ -576,6 +751,8 @@ pub struct ActorFactory {
     pub plugin_dirs: Vec<std::path::PathBuf>,
     /// Extra environment variables for plugin processes in subagents.
     pub plugin_extra_env: Vec<(String, String)>,
+    /// Session-scoped background task lookup for API inspection.
+    pub task_query_store: SessionTaskQueryStore,
 }
 
 /// Trait for creating per-session ToolRegistry instances.
@@ -669,6 +846,18 @@ impl ActorFactory {
                 "failed to create per-user workspace: {e}, falling back to shared cwd"
             );
         }
+        let session_policy_path = workspace_policy_path(&user_workspace);
+        if !session_policy_path.exists() {
+            if let Err(error) =
+                write_workspace_policy(&user_workspace, &WorkspacePolicy::for_session())
+            {
+                warn!(
+                    session = %session_key,
+                    path = %session_policy_path.display(),
+                    "failed to write session workspace policy: {error}"
+                );
+            }
+        }
 
         // send_file resolves relative paths against user_workspace (same as
         // write_file/read_file) so the LLM can write+send in one flow.
@@ -684,8 +873,15 @@ impl ActorFactory {
         let mut tools = self
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
+        let supervisor = tools.supervisor();
+        self.task_query_store
+            .register(&session_key, &supervisor, &self.data_dir);
         tools.rebind_plugin_work_dirs(&user_workspace);
         tools.set_session_key(session_key.to_string());
+        tools.register(CheckBackgroundTasksTool::new(
+            supervisor.clone(),
+            session_key.to_string(),
+        ));
         tools.register(message_tool);
         tools.register(send_file_tool);
 
@@ -713,12 +909,13 @@ impl ActorFactory {
         // Wire direct background result injection (bypasses InboundMessage relay)
         let bg_tx = tx.clone();
         spawn_tool = spawn_tool.with_background_result_sender(Arc::new(
-            move |task_label: String, content: String| {
+            move |payload: BackgroundResultPayload| {
                 let tx = bg_tx.clone();
                 Box::pin(async move {
                     tx.send(ActorMessage::BackgroundResult {
-                        task_label,
-                        content,
+                        task_label: payload.task_label,
+                        content: payload.content,
+                        kind: payload.kind,
                     })
                     .await
                     .is_ok()
@@ -730,12 +927,13 @@ impl ActorFactory {
 
         // Wire background result sender for spawn_only tool lifecycle notifications
         let bg_tx2 = tx.clone();
-        tools.set_background_result_sender(Arc::new(move |task_label: String, content: String| {
+        tools.set_background_result_sender(Arc::new(move |payload: BackgroundResultPayload| {
             let tx = bg_tx2.clone();
             Box::pin(async move {
                 tx.send(ActorMessage::BackgroundResult {
-                    task_label,
-                    content,
+                    task_label: payload.task_label,
+                    content: payload.content,
+                    kind: payload.kind,
                 })
                 .await
                 .is_ok()
@@ -745,8 +943,10 @@ impl ActorFactory {
         // Wire supervisor on_change callback to push task status via SSE.
         // Uses try_send to avoid blocking the sync Mutex context.
         let status_tx = tx.clone();
-        tools.supervisor().set_on_change(move |task| {
-            if let Ok(json) = serde_json::to_string(task) {
+        let task_data_dir = self.data_dir.clone();
+        supervisor.set_on_change(move |task| {
+            let task_json = sanitize_task_for_response(&task_data_dir, task);
+            if let Ok(json) = serde_json::to_string(&task_json) {
                 let _ = status_tx.try_send(ActorMessage::TaskStatusChanged { task_json: json });
             }
         });
@@ -817,6 +1017,11 @@ impl ActorFactory {
                         }
                     }
                 }
+                let cyberpunk_alias = ws_styles.join("cyberpunk-neon.toml");
+                let blade_runner = ws_styles.join("nb-br.toml");
+                if !cyberpunk_alias.exists() && blade_runner.is_file() {
+                    std::fs::copy(&blade_runner, &cyberpunk_alias).ok();
+                }
             } else {
                 warn!(
                     session = %session_key,
@@ -825,6 +1030,7 @@ impl ActorFactory {
                 );
             }
         }
+        let slides_generation_available = !is_slides || tools.get("mofa_slides").is_some();
 
         if is_site {
             let topic = session_key.topic().unwrap_or("site");
@@ -856,6 +1062,14 @@ impl ActorFactory {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         });
+        if is_slides && !slides_generation_available {
+            system_prompt.push_str(
+                "\n\n## Slides Generation Availability\n\n\
+                 `mofa_slides` is not available on this host. You may still design and edit slide projects, \
+                 but you must tell the user that PPTX/image generation is unavailable here. \
+                 Do NOT retry generation via shell, run_pipeline, or alternative binaries.",
+            );
+        }
         if has_deferred {
             let groups = tools.deferred_groups();
             let mut tool_names = Vec::new();
@@ -1143,7 +1357,12 @@ impl SessionActor {
             tokio::select! {
                 msg = self.inbox.recv() => {
                     match msg {
-                        Some(ActorMessage::Inbound { message, image_media }) => {
+                        Some(ActorMessage::Inbound {
+                            message,
+                            image_media,
+                            attachment_media,
+                            attachment_prompt,
+                        }) => {
                             // Update cron tool context with current channel/chat_id
                             // so new cron jobs inherit the correct delivery target.
                             if let Some(ref cron) = self.cron_tool {
@@ -1189,27 +1408,55 @@ impl SessionActor {
                             }
 
                             // Drain any queued messages according to queue mode
-                            let (final_message, final_media) =
-                                self.drain_queue(message, image_media).await;
+                            let (
+                                final_message,
+                                final_media,
+                                final_attachment_media,
+                                final_attachment_prompt,
+                            ) = self
+                                .drain_queue(
+                                    message,
+                                    image_media,
+                                    attachment_media,
+                                    attachment_prompt,
+                                )
+                                .await;
 
-                            // Copy uploaded media files into the agent's sandboxed
-                            // working directory so read_file can access them.
-                            let final_media = self.copy_media_to_workspace(final_media);
+                            // Copy non-image attachments into the agent workspace so
+                            // tools can resolve them by filename without path hints.
+                            let final_attachment_media =
+                                self.copy_media_to_workspace(final_attachment_media);
 
                             // Use speculative path for API channel (web client) and
                             // Speculative queue mode. The speculative path spawns the
                             // agent call and handles overflow messages concurrently,
                             // so users aren't blocked during long tool calls (pipelines).
                             if self.queue_mode == QueueMode::Speculative || self.channel == "api" {
-                                self.process_inbound_speculative(final_message, final_media).await;
+                                self.process_inbound_speculative(
+                                    final_message,
+                                    final_media,
+                                    final_attachment_media,
+                                    final_attachment_prompt,
+                                )
+                                .await;
                             } else {
-                                self.process_inbound(final_message, final_media).await;
+                                self.process_inbound(
+                                    final_message,
+                                    final_media,
+                                    final_attachment_media,
+                                    final_attachment_prompt,
+                                )
+                                .await;
                             }
                         }
-                        Some(ActorMessage::BackgroundResult { task_label, content }) => {
+                        Some(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                            kind,
+                        }) => {
                             // Lightweight notification for spawn_only tool completions
                             // (e.g. fm_tts success/failure) — send directly, no LLM turn.
-                            if content.starts_with('✓') || content.starts_with('✗') {
+                            if kind == BackgroundResultKind::Notification {
                                 tracing::info!(task = %task_label, "spawn_only notification: {}", content);
                                 let _ = self.out_tx.send(octos_core::OutboundMessage {
                                     channel: self.channel.clone(),
@@ -1220,25 +1467,7 @@ impl SessionActor {
                                     metadata: serde_json::json!({}),
                                 }).await;
                             } else {
-                                // Full background result (from spawn subagent) — inject + rewrite
-                                self.inject_background_result(&task_label, &content, false).await;
-                                let rewrite_msg = octos_core::InboundMessage {
-                                    channel: self.channel.clone(),
-                                    sender_id: "system".to_string(),
-                                    chat_id: self.chat_id.clone(),
-                                    content: format!(
-                                        "[REWRITE] The background task \"{task_label}\" has completed. \
-                                         Rewrite the raw report above into a clean, well-structured, \
-                                         readable message for the user. Keep all key findings, data, \
-                                         and citations. Use proper Markdown formatting. \
-                                         Match the language of the original research request."
-                                    ),
-                                    timestamp: chrono::Utc::now(),
-                                    media: vec![],
-                                    metadata: serde_json::json!({}),
-                                    message_id: None,
-                                };
-                                self.process_inbound(rewrite_msg, vec![]).await;
+                                self.inject_background_result(&task_label, &content).await;
                             }
                         }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
@@ -1778,12 +2007,18 @@ impl SessionActor {
         &mut self,
         message: InboundMessage,
         image_media: Vec<String>,
-    ) -> (InboundMessage, Vec<String>) {
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
+    ) -> (InboundMessage, Vec<String>, Vec<String>, Option<String>) {
         match self.queue_mode {
-            QueueMode::Followup | QueueMode::Speculative => (message, image_media),
+            QueueMode::Followup | QueueMode::Speculative => {
+                (message, image_media, attachment_media, attachment_prompt)
+            }
             QueueMode::Collect => {
                 let mut combined_content = message.content.clone();
                 let mut combined_media = image_media;
+                let mut combined_attachment_media = attachment_media;
+                let mut combined_attachment_prompt = attachment_prompt;
                 let mut count = 0u32;
 
                 // Non-blocking drain of queued inbound messages
@@ -1792,6 +2027,8 @@ impl SessionActor {
                         Ok(ActorMessage::Inbound {
                             message: queued,
                             image_media: queued_media,
+                            attachment_media: queued_attachment_media,
+                            attachment_prompt: queued_attachment_prompt,
                         }) => {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling batch");
@@ -1802,13 +2039,32 @@ impl SessionActor {
                             combined_content
                                 .push_str(&format!("\n---\nQueued #{count}: {}", queued.content));
                             combined_media.extend(queued_media);
+                            combined_attachment_media.extend(queued_attachment_media);
+                            combined_attachment_prompt = merge_attachment_prompt_summaries(
+                                combined_attachment_prompt,
+                                queued_attachment_prompt,
+                            );
                         }
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
                             content,
+                            kind,
                         }) => {
-                            self.inject_background_result(&task_label, &content, true)
-                                .await;
+                            if kind == BackgroundResultKind::Notification {
+                                let _ = self
+                                    .out_tx
+                                    .send(OutboundMessage {
+                                        channel: self.channel.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        content,
+                                        reply_to: None,
+                                        media: vec![],
+                                        metadata: serde_json::json!({}),
+                                    })
+                                    .await;
+                            } else {
+                                self.inject_background_result(&task_label, &content).await;
+                            }
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
@@ -1822,7 +2078,12 @@ impl SessionActor {
                 }
                 let mut msg = message;
                 msg.content = combined_content;
-                (msg, combined_media)
+                (
+                    msg,
+                    combined_media,
+                    combined_attachment_media,
+                    combined_attachment_prompt,
+                )
             }
             QueueMode::Steer | QueueMode::Interrupt => {
                 // Coalescing delay: give rapid follow-up messages time to arrive
@@ -1830,6 +2091,8 @@ impl SessionActor {
 
                 let mut latest_message = message;
                 let mut latest_media = image_media;
+                let mut latest_attachment_media = attachment_media;
+                let mut latest_attachment_prompt = attachment_prompt;
 
                 // Non-blocking drain: keep only the newest inbound message
                 loop {
@@ -1837,6 +2100,8 @@ impl SessionActor {
                         Ok(ActorMessage::Inbound {
                             message: queued,
                             image_media: queued_media,
+                            attachment_media: queued_attachment_media,
+                            attachment_prompt: queued_attachment_prompt,
                         }) => {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling");
@@ -1846,13 +2111,29 @@ impl SessionActor {
                             debug!(session = %self.session_key, "steer: replacing with newer message");
                             latest_message = queued;
                             latest_media = queued_media;
+                            latest_attachment_media = queued_attachment_media;
+                            latest_attachment_prompt = queued_attachment_prompt;
                         }
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
                             content,
+                            kind,
                         }) => {
-                            self.inject_background_result(&task_label, &content, true)
-                                .await;
+                            if kind == BackgroundResultKind::Notification {
+                                let _ = self
+                                    .out_tx
+                                    .send(OutboundMessage {
+                                        channel: self.channel.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        content,
+                                        reply_to: None,
+                                        media: vec![],
+                                        metadata: serde_json::json!({}),
+                                    })
+                                    .await;
+                            } else {
+                                self.inject_background_result(&task_label, &content).await;
+                            }
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
@@ -1864,7 +2145,12 @@ impl SessionActor {
                         Err(_) => break,
                     }
                 }
-                (latest_message, latest_media)
+                (
+                    latest_message,
+                    latest_media,
+                    latest_attachment_media,
+                    latest_attachment_prompt,
+                )
             }
         }
     }
@@ -1876,10 +2162,9 @@ impl SessionActor {
     /// retrieve the full report via `recall_memory("<slug>")`.
     /// Inject a background task result into the conversation context.
     ///
-    /// When `notify` is true, sends a preview notification directly to the user.
-    /// When false, the caller is responsible for triggering an LLM rewrite turn
-    /// that will produce a clean user-facing message.
-    async fn inject_background_result(&self, task_label: &str, content: &str, notify: bool) {
+    /// Sends a preview notification directly to the user and injects the result
+    /// into session history for subsequent turns.
+    async fn inject_background_result(&self, task_label: &str, content: &str) {
         const SUMMARY_THRESHOLD: usize = 1000;
         const SUMMARY_CHARS: usize = 800;
 
@@ -1941,21 +2226,19 @@ impl SessionActor {
             }
         }
 
-        if notify {
-            // Send raw preview directly (used when agent is busy and will see
-            // the injected context on its next turn).
-            let _ = self
-                .out_tx
-                .send(OutboundMessage {
-                    channel: self.channel.clone(),
-                    chat_id: self.chat_id.clone(),
-                    content: notification,
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                })
-                .await;
-        }
+        // Send raw preview directly; the injected context is available on the
+        // next turn without forcing a synthetic rewrite prompt.
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: notification,
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await;
     }
 
     /// Copy media files from their original location (e.g. profile media_dir)
@@ -1965,12 +2248,15 @@ impl SessionActor {
         media
             .into_iter()
             .map(|path| {
-                let src = std::path::Path::new(&path);
+                let resolved = octos_bus::file_handle::resolve_upload_reference(&path)
+                    .map(|candidate| candidate.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let src = std::path::Path::new(&resolved);
                 if !src.exists() {
-                    return path;
+                    return resolved;
                 }
                 let Some(filename) = src.file_name() else {
-                    return path;
+                    return resolved;
                 };
                 let dest = self.user_workspace.join(filename);
                 match std::fs::copy(src, &dest) {
@@ -1990,11 +2276,48 @@ impl SessionActor {
                             error = %e,
                             "failed to copy media to workspace, using original path"
                         );
-                        path
+                        resolved
                     }
                 }
             })
             .collect()
+    }
+
+    fn build_turn_attachment_context(
+        &self,
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
+    ) -> TurnAttachmentContext {
+        let mut audio_attachment_paths = Vec::new();
+        let mut file_attachment_paths = Vec::new();
+        for path in &attachment_media {
+            if octos_bus::media::is_audio(path) {
+                audio_attachment_paths.push(path.clone());
+            } else {
+                file_attachment_paths.push(path.clone());
+            }
+        }
+
+        TurnAttachmentContext {
+            attachment_paths: attachment_media,
+            audio_attachment_paths,
+            file_attachment_paths,
+            prompt_summary: attachment_prompt,
+        }
+    }
+
+    fn persisted_user_content(
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) -> String {
+        if inbound.content.is_empty() && !image_media.is_empty() {
+            "[User sent an image]".to_string()
+        } else if inbound.content.is_empty() && !attachment_media.is_empty() {
+            "[User sent attachments]".to_string()
+        } else {
+            inbound.content.clone()
+        }
     }
 
     /// Speculative processing: runs the LLM call but monitors the inbox.
@@ -2006,6 +2329,8 @@ impl SessionActor {
         &mut self,
         inbound: InboundMessage,
         image_media: Vec<String>,
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
     ) {
         // Reset overflow cancellation from any prior command handling (#21).
         self.overflow_cancelled.store(false, Ordering::Release);
@@ -2026,6 +2351,9 @@ impl SessionActor {
             "speculative: entering concurrent processing"
         );
 
+        let persisted_user_content =
+            Self::persisted_user_content(&inbound, &image_media, &attachment_media);
+
         // ── Setup (needs &mut self briefly for permit + reporter) ────────
 
         let _permit = match self.semaphore.acquire().await {
@@ -2039,11 +2367,7 @@ impl SessionActor {
         // so overflow reads see it in context (chronological ordering).
         let user_msg = Message {
             role: MessageRole::User,
-            content: if inbound.content.is_empty() && !image_media.is_empty() {
-                "[User sent an image]".to_string()
-            } else {
-                inbound.content.clone()
-            },
+            content: persisted_user_content,
             media: image_media.clone(),
             tool_calls: None,
             tool_call_id: None,
@@ -2148,6 +2472,7 @@ impl SessionActor {
         let agent = Arc::clone(&self.agent);
         let content = inbound.content.clone();
         let media = image_media;
+        let attachments = self.build_turn_attachment_context(attachment_media, attachment_prompt);
         let tracker = Arc::clone(&token_tracker);
         let session_timeout = self.session_timeout;
 
@@ -2177,7 +2502,13 @@ impl SessionActor {
             let start = Instant::now();
             let result = tokio::time::timeout(
                 session_timeout,
-                agent.process_message_tracked(&content, &history_for_agent, media, &tracker),
+                agent.process_message_tracked_with_attachments(
+                    &content,
+                    &history_for_agent,
+                    media,
+                    attachments,
+                    &tracker,
+                ),
             )
             .await;
             eprintln!(
@@ -2218,7 +2549,12 @@ impl SessionActor {
                 // New message arrived in inbox
                 msg = self.inbox.recv() => {
                     match msg {
-                        Some(ActorMessage::Inbound { message, image_media: _ }) => {
+                        Some(ActorMessage::Inbound {
+                            message,
+                            image_media: _,
+                            attachment_media: _,
+                            attachment_prompt: _,
+                        }) => {
                             if octos_core::is_abort_trigger(&message.content) {
                                 self.cancelled.store(true, Ordering::Release);
                                 self.send_reply(octos_core::abort_response(&message.content)).await;
@@ -2231,6 +2567,25 @@ impl SessionActor {
                                 continue;
                             }
                             let elapsed = started.elapsed();
+
+                            if self.queue_mode == QueueMode::Interrupt {
+                                // Interrupt mode: abort the primary agent task
+                                // so the new message can be processed immediately.
+                                info!(
+                                    session = %self.session_key,
+                                    elapsed_ms = elapsed.as_millis(),
+                                    "interrupt: aborting primary task for new message"
+                                );
+                                agent_task.abort();
+                                self.cancelled.store(true, Ordering::Release);
+
+                                // Process the interrupting message as overflow
+                                // (same as speculative, but the primary is now dead)
+                                self.serve_overflow(&message, &overflow_history);
+                                overflow_served = true;
+                                continue;
+                            }
+
                             info!(
                                 session = %self.session_key,
                                 elapsed_ms = elapsed.as_millis(),
@@ -2242,8 +2597,12 @@ impl SessionActor {
                             self.serve_overflow(&message, &overflow_history);
                             overflow_served = true;
                         }
-                        Some(ActorMessage::BackgroundResult { task_label, content }) => {
-                            if content.starts_with('✓') || content.starts_with('✗') {
+                        Some(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                            kind,
+                        }) => {
+                            if kind == BackgroundResultKind::Notification {
                                 let _ = self.out_tx.send(octos_core::OutboundMessage {
                                     channel: self.channel.clone(),
                                     chat_id: self.chat_id.clone(),
@@ -2253,7 +2612,7 @@ impl SessionActor {
                                     metadata: serde_json::json!({}),
                                 }).await;
                             } else {
-                                self.inject_background_result(&task_label, &content, true).await;
+                                self.inject_background_result(&task_label, &content).await;
                             }
                         }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
@@ -2385,9 +2744,19 @@ impl SessionActor {
         let completion_meta = match &agent_result {
             Ok(Ok(cr)) => {
                 info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), bg_tasks, "agent completed, saving messages");
+                let provider_metadata = cr.provider_metadata.clone();
+                let model_label = provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.display_label())
+                    .unwrap_or_else(|| {
+                        format!("{}/{}", self.agent.provider_name(), self.agent.model_id())
+                    });
                 serde_json::json!({
                     "_completion": true,
-                    "model": format!("{}/{}", self.agent.provider_name(), self.agent.model_id()),
+                    "model": model_label,
+                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
+                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
+                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
                     "tokens_in": cr.token_usage.input_tokens,
                     "tokens_out": cr.token_usage.output_tokens,
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
@@ -2938,7 +3307,13 @@ impl SessionActor {
         });
     }
 
-    async fn process_inbound(&mut self, inbound: InboundMessage, image_media: Vec<String>) {
+    async fn process_inbound(
+        &mut self,
+        inbound: InboundMessage,
+        image_media: Vec<String>,
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
+    ) {
         // Capture the platform message ID for reply threading
         let inbound_message_id = inbound.message_id.clone();
 
@@ -2947,6 +3322,9 @@ impl SessionActor {
             Ok(p) => p,
             Err(_) => return, // semaphore closed
         };
+
+        let persisted_user_content =
+            Self::persisted_user_content(&inbound, &image_media, &attachment_media);
 
         // Get conversation history
         let max_history = self.max_history.load(Ordering::Acquire);
@@ -3037,10 +3415,11 @@ impl SessionActor {
         let llm_start = Instant::now();
         let result = tokio::time::timeout(
             self.session_timeout,
-            self.agent.process_message_tracked(
+            self.agent.process_message_tracked_with_attachments(
                 &inbound.content,
                 &history,
                 image_media,
+                self.build_turn_attachment_context(attachment_media, attachment_prompt),
                 &token_tracker,
             ),
         )
@@ -3109,7 +3488,12 @@ impl SessionActor {
         // Capture annotation data before match moves result
         let annotation_data: Option<(String, u32, u32, u64)> = if let Ok(Ok(ref cr)) = result {
             Some((
-                format!("{}/{}", self.agent.provider_name(), self.agent.model_id()),
+                cr.provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.display_label())
+                    .unwrap_or_else(|| {
+                        format!("{}/{}", self.agent.provider_name(), self.agent.model_id())
+                    }),
                 cr.token_usage.input_tokens,
                 cr.token_usage.output_tokens,
                 llm_latency.as_secs(),
@@ -3134,8 +3518,18 @@ impl SessionActor {
                         }
                     }
 
+                    let mut persisted_user_message = false;
                     for msg in &conv_response.messages {
-                        if let Err(e) = handle.add_message(msg.clone()).await {
+                        let message_to_save =
+                            if !persisted_user_message && msg.role == MessageRole::User {
+                                persisted_user_message = true;
+                                let mut sanitized = msg.clone();
+                                sanitized.content = persisted_user_content.clone();
+                                sanitized
+                            } else {
+                                msg.clone()
+                            };
+                        if let Err(e) = handle.add_message(message_to_save).await {
                             warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                         }
                     }
@@ -3430,6 +3824,44 @@ mod tests {
         assert!(resolved.is_none());
     }
 
+    #[test]
+    fn session_task_query_store_hides_absolute_output_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        let workspace = data_dir
+            .join("users")
+            .join("api%3Asession")
+            .join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let output = workspace.join("voice.mp3");
+        std::fs::write(&output, b"audio").unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_id = supervisor.register("fm_tts", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            octos_agent::TaskRuntimeState::DeliveringOutputs,
+            Some("send_file".to_string()),
+        );
+        supervisor.mark_completed(&task_id, vec![output.to_string_lossy().to_string()]);
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let payload = store.query_json(&session_key.to_string());
+        let tasks = payload.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["runtime_state"], "completed");
+        assert!(tasks[0]["runtime_detail"].is_null());
+        let files = tasks[0]["output_files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        let handle = files[0].as_str().unwrap();
+        assert!(handle.starts_with("pf/"));
+        assert!(!handle.starts_with("/"));
+    }
+
     // ── Mock providers for speculative overflow tests ────────────────────
 
     /// Mock LLM provider with configurable delay per call.
@@ -3518,6 +3950,26 @@ mod tests {
                 message_id: None,
             },
             image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        }
+    }
+
+    fn make_attachment_inbound(summary: &str, attachment_path: &str) -> ActorMessage {
+        ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "cli".to_string(),
+                chat_id: "test".to_string(),
+                sender_id: "user".to_string(),
+                content: String::new(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata: serde_json::json!({}),
+                message_id: None,
+            },
+            image_media: vec![],
+            attachment_media: vec![attachment_path.to_string()],
+            attachment_prompt: Some(summary.to_string()),
         }
     }
 
@@ -3951,6 +4403,7 @@ mod tests {
         tx.send(ActorMessage::BackgroundResult {
             task_label: "research".to_string(),
             content: "Background research completed with 5 findings.".to_string(),
+            kind: BackgroundResultKind::Report,
         })
         .await
         .unwrap();
@@ -3992,6 +4445,134 @@ mod tests {
                 .any(|m| m.content.contains("Background task") && m.content.contains("research"));
             assert!(has_bg_msg, "background result not found in session history");
         }
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_followup_background_result_notifies_without_rewrite_turn() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_secs(4), make_response("primary done"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(make_inbound("long task")).await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "research".to_string(),
+            content: "Background research completed with 5 findings.".to_string(),
+            kind: BackgroundResultKind::Report,
+        })
+        .await
+        .unwrap();
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while responses.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => responses.push(msg.content),
+                _ => break,
+            }
+        }
+
+        assert!(
+            responses
+                .iter()
+                .any(|r| r.contains("research") && r.contains("completed")),
+            "background notification not found in: {:?}",
+            responses
+        );
+        assert!(
+            responses.iter().any(|r| r.contains("primary done")),
+            "primary response not found in: {:?}",
+            responses
+        );
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Background task") && m.content.contains("research")),
+            "background result not found in session history"
+        );
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("[REWRITE]")),
+            "rewrite prompt leaked into session history: {:?}",
+            session.messages
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_attachment_hints_do_not_persist_in_session_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(
+                Duration::from_millis(50),
+                make_response("attachment processed"),
+            )],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(make_attachment_inbound(
+            "[Attached files]\n- report.pdf",
+            "/tmp/uploads/report.pdf",
+        ))
+        .await
+        .unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("response timeout")
+            .expect("channel closed");
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let contents = session
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            contents
+                .iter()
+                .any(|content| *content == "[User sent attachments]"),
+            "generic attachment placeholder missing from history: {:?}",
+            contents
+        );
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("[Attached files]")),
+            "transient attachment prompt leaked into history: {:?}",
+            contents
+        );
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("report.pdf")),
+            "attachment filename leaked into history: {:?}",
+            contents
+        );
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -4427,6 +5008,7 @@ mod tests {
             memory_store: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            task_query_store: SessionTaskQueryStore::default(),
         };
 
         let registry = ActorRegistry::new(
@@ -4460,6 +5042,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4500,6 +5084,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk,
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4540,6 +5126,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg1,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4564,6 +5152,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg2,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk,
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4611,6 +5201,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",

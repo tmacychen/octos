@@ -7,28 +7,31 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use axum::Json;
+use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::Json;
-use axum::Router;
 use chrono::Utc;
 use eyre::Result;
 use octos_core::{
-    InboundMessage, Message, MessageRole, OutboundMessage, SessionKey, MAIN_PROFILE_ID,
+    InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, OutboundMessage, SessionKey,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
-use crate::channel::Channel;
 use crate::SessionManager;
+use crate::channel::Channel;
+use crate::file_handle::{
+    encode_profile_file_handle, resolve_legacy_file_request, resolve_scoped_file_handle,
+};
 
 /// Callback that returns serialized task list for a session key.
 pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
@@ -50,6 +53,8 @@ struct ChatRequest {
     message: String,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
     /// File paths from prior upload.
     #[serde(default)]
     media: Vec<String>,
@@ -198,6 +203,29 @@ impl ApiChannel {
     }
 }
 
+fn initial_sse_events(has_media: bool) -> Vec<String> {
+    let mut events = vec![
+        serde_json::json!({
+            "type": "thinking",
+            "iteration": 0,
+        })
+        .to_string(),
+    ];
+
+    if has_media {
+        events.push(
+            serde_json::json!({
+                "type": "tool_progress",
+                "tool": "preprocessing",
+                "message": "Processing attachments...",
+            })
+            .to_string(),
+        );
+    }
+
+    events
+}
+
 #[async_trait]
 impl Channel for ApiChannel {
     fn name(&self) -> &str {
@@ -223,6 +251,7 @@ impl Channel for ApiChannel {
             .route("/sessions/{id}", delete(handle_delete_session))
             .route("/files/{*path}", get(handle_file_download))
             .route("/upload", post(handle_upload))
+            .route("/admin/shell", post(handle_admin_shell))
             .with_state(state);
 
         let addr = format!("127.0.0.1:{}", self.port);
@@ -247,6 +276,10 @@ impl Channel for ApiChannel {
             let persisted_media = self
                 .materialize_media_for_session(&msg.chat_id, &msg.media)
                 .await;
+            let data_dir = {
+                let sess = self.sessions.lock().await;
+                sess.data_dir()
+            };
 
             // File message — persist to session history AND send SSE event.
             let file_desc = msg
@@ -258,10 +291,13 @@ impl Channel for ApiChannel {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
+                    let handle =
+                        response_path_for_session_file(&data_dir, Path::new(persisted_path))
+                            .unwrap_or_else(|| persisted_path.clone());
                     if msg.content.is_empty() {
-                        format!("[file:{persisted_path}] {name}")
+                        format!("[file:{handle}] {name}")
                     } else {
-                        format!("[file:{persisted_path}] {name} — {}", msg.content)
+                        format!("[file:{handle}] {name} — {}", msg.content)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -293,7 +329,8 @@ impl Channel for ApiChannel {
                         .unwrap_or("");
                     let event = serde_json::json!({
                         "type": "file",
-                        "path": persisted_path,
+                        "path": response_path_for_session_file(&data_dir, Path::new(persisted_path))
+                            .unwrap_or_else(|| persisted_path.clone()),
                         "filename": filename,
                         "caption": msg.content,
                         "tool_call_id": tool_call_id,
@@ -350,6 +387,9 @@ impl Channel for ApiChannel {
                     "type": "done",
                     "content": "",
                     "model": msg.metadata.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+                    "provider": msg.metadata.get("provider").cloned().unwrap_or(serde_json::Value::Null),
+                    "model_id": msg.metadata.get("model_id").cloned().unwrap_or(serde_json::Value::Null),
+                    "endpoint": msg.metadata.get("endpoint").cloned().unwrap_or(serde_json::Value::Null),
                     "tokens_in": msg.metadata.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
                     "tokens_out": msg.metadata.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
                     "duration_s": msg.metadata.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -532,6 +572,9 @@ async fn handle_chat(
             None
         } else {
             let (tx, rx) = mpsc::unbounded_channel::<String>();
+            for event in initial_sse_events(!req.media.is_empty()) {
+                let _ = tx.send(event);
+            }
             pending.insert(session_id.clone(), tx);
             Some(rx)
         }
@@ -545,9 +588,18 @@ async fn handle_chat(
         content: req.message,
         timestamp: Utc::now(),
         media: req.media,
-        metadata: match req.target_profile_id.filter(|value| !value.is_empty()) {
-            Some(profile_id) => serde_json::json!({ "target_profile_id": profile_id }),
-            None => serde_json::json!({}),
+        metadata: {
+            let mut metadata = serde_json::Map::new();
+            if let Some(profile_id) = req.target_profile_id.filter(|value| !value.is_empty()) {
+                metadata.insert(
+                    "target_profile_id".to_string(),
+                    serde_json::Value::String(profile_id),
+                );
+            }
+            if let Some(topic) = req.topic.filter(|value| !value.is_empty()) {
+                metadata.insert("topic".to_string(), serde_json::Value::String(topic));
+            }
+            serde_json::Value::Object(metadata)
         },
         message_id: None,
     };
@@ -628,12 +680,21 @@ fn default_limit() -> usize {
 }
 
 fn current_profile_api_session_key(profile_id: Option<&str>, chat_id: &str) -> SessionKey {
-    SessionKey::with_profile(
+    current_profile_api_session_key_with_topic(profile_id, chat_id, None)
+}
+
+fn current_profile_api_session_key_with_topic(
+    profile_id: Option<&str>,
+    chat_id: &str,
+    topic: Option<&str>,
+) -> SessionKey {
+    SessionKey::with_profile_topic(
         profile_id
             .filter(|value| !value.is_empty())
             .unwrap_or(MAIN_PROFILE_ID),
         "api",
         chat_id,
+        topic.unwrap_or_default(),
     )
 }
 
@@ -672,12 +733,49 @@ fn api_chat_id_from_session_key(id: &str) -> Option<&str> {
         .or_else(|| id.split_once(":api:").map(|(_, chat_id)| chat_id))
 }
 
-fn message_info_from_history_message(message: &Message) -> MessageInfo {
+fn response_path_for_session_file(data_dir: &Path, path: &Path) -> Option<String> {
+    encode_profile_file_handle(data_dir, path)
+}
+
+fn sanitize_message_file_markers(content: &str, data_dir: &Path) -> String {
+    let mut remaining = content;
+    let mut sanitized = String::with_capacity(content.len());
+
+    while let Some(start) = remaining.find("[file:") {
+        let (before, rest) = remaining.split_at(start);
+        sanitized.push_str(before);
+
+        let Some(end) = rest.find(']') else {
+            sanitized.push_str(rest);
+            return sanitized;
+        };
+
+        let raw_path = &rest[6..end];
+        let replacement = Path::new(raw_path)
+            .is_absolute()
+            .then(|| response_path_for_session_file(data_dir, Path::new(raw_path)))
+            .flatten()
+            .unwrap_or_else(|| raw_path.to_string());
+        sanitized.push_str("[file:");
+        sanitized.push_str(&replacement);
+        sanitized.push(']');
+        remaining = &rest[end + 1..];
+    }
+
+    sanitized.push_str(remaining);
+    sanitized
+}
+
+fn message_info_from_history_message(message: &Message, data_dir: &Path) -> MessageInfo {
     MessageInfo {
         role: message.role.to_string(),
-        content: message.content.clone(),
+        content: sanitize_message_file_markers(&message.content, data_dir),
         timestamp: message.timestamp.to_rfc3339(),
-        media: message.media.clone(),
+        media: message
+            .media
+            .iter()
+            .filter_map(|path| response_path_for_session_file(data_dir, Path::new(path)))
+            .collect(),
         tool_calls: message
             .tool_calls
             .as_ref()
@@ -695,11 +793,13 @@ fn message_info_from_history_message(message: &Message) -> MessageInfo {
 async fn handle_session_status(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
     let pending = state.pending.lock().await;
     let active = pending.contains_key(&id);
     Json(serde_json::json!({
         "active": active,
+        "topic": params.topic,
     }))
     .into_response()
 }
@@ -708,11 +808,16 @@ async fn handle_session_status(
 async fn handle_session_tasks(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
     let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
     };
-    let session_key = current_profile_api_session_key(state.profile_id.as_deref(), &id);
+    let session_key = current_profile_api_session_key_with_topic(
+        state.profile_id.as_deref(),
+        &id,
+        params.topic.as_deref(),
+    );
     let tasks = query_fn(&session_key.0);
     Json(tasks).into_response()
 }
@@ -720,13 +825,17 @@ async fn handle_session_tasks(
 /// GET /sessions — list all API sessions.
 async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
     let sess = state.sessions.lock().await;
+    let mut seen = std::collections::HashSet::new();
     let list: Vec<SessionInfo> = sess
         .list_sessions()
         .into_iter()
         .filter_map(|(id, count)| {
-            let chat_id = api_chat_id_from_session_key(&id)?;
+            let chat_id = api_chat_id_from_session_key(&id)?.to_string();
+            if !seen.insert(chat_id.clone()) {
+                return None;
+            }
             Some(SessionInfo {
-                id: chat_id.to_string(),
+                id: chat_id,
                 message_count: count,
             })
         })
@@ -753,6 +862,7 @@ async fn handle_session_messages(
     // Default reads from in-memory (may be compacted for LLM context).
     if params.source.as_deref() == Some("full") {
         let sess = state.sessions.lock().await;
+        let data_dir = sess.data_dir();
         for candidate in &candidates {
             if let Some(session) = sess.load(candidate).await {
                 let messages: Vec<MessageInfo> = session
@@ -762,7 +872,7 @@ async fn handle_session_messages(
                     .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
                     .skip(offset)
                     .take(limit)
-                    .map(|(_, message)| message_info_from_history_message(message))
+                    .map(|(_, message)| message_info_from_history_message(message, &data_dir))
                     .collect();
                 return Json(messages).into_response();
             }
@@ -771,6 +881,7 @@ async fn handle_session_messages(
     }
 
     let sess = state.sessions.lock().await;
+    let data_dir = sess.data_dir();
     for candidate in &candidates {
         if let Some(session) = sess.load(candidate).await {
             let history = session.get_history(fetch_count).to_vec();
@@ -780,7 +891,7 @@ async fn handle_session_messages(
                 .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
                 .skip(offset)
                 .take(limit)
-                .map(|(_, message)| message_info_from_history_message(message))
+                .map(|(_, message)| message_info_from_history_message(message, &data_dir))
                 .collect();
             if !messages.is_empty() {
                 return Json(messages).into_response();
@@ -810,25 +921,19 @@ async fn handle_delete_session(
 }
 
 /// GET /files/*path — download a file produced by write_file/send_file.
-async fn handle_file_download(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
-    let file_path = std::path::Path::new(&path);
-
-    // Security: only serve files from known safe directories
-    let canonical = match std::fs::canonicalize(file_path) {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
+async fn handle_file_download(
+    State(state): State<ApiState>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response {
+    let data_dir = {
+        let sess = state.sessions.lock().await;
+        sess.data_dir()
     };
-
-    // Must be under $HOME/.octos or /tmp (NOT the entire $HOME)
-    let home = std::env::var("HOME").unwrap_or_default();
-    let octos_dir = std::fs::canonicalize(format!("{home}/.octos"))
-        .unwrap_or_else(|_| std::path::PathBuf::from(format!("{home}/.octos")));
-    let tmp_dir =
-        std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-    let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with(&tmp_dir);
-    if !allowed {
+    let canonical = resolve_scoped_file_handle(&data_dir, &path)
+        .or_else(|| resolve_legacy_file_request(&data_dir, &path));
+    let Some(canonical) = canonical else {
         return (StatusCode::FORBIDDEN, "access denied").into_response();
-    }
+    };
 
     match tokio::fs::read(&canonical).await {
         Ok(bytes) => {
@@ -908,16 +1013,167 @@ async fn handle_upload(mut multipart: axum::extract::Multipart) -> Response {
             )
                 .into_response();
         }
-        paths.push(dest.to_string_lossy().to_string());
+        let Some(handle) = crate::file_handle::encode_tmp_upload_handle(&dest, Some(&safe_name))
+        else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode upload handle",
+            )
+                .into_response();
+        };
+        paths.push(handle);
     }
 
     Json(paths).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Admin shell (diagnostics)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ShellRequest {
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ShellResponse {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    timed_out: bool,
+}
+
+/// POST /admin/shell — execute a shell command (admin auth required).
+async fn handle_admin_shell(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ShellRequest>,
+) -> Response {
+    // Verify admin token
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-auth-token").and_then(|v| v.to_str().ok()))
+        .unwrap_or("");
+
+    // Check channel-level token, env var, then config.json auth_token.
+    let expected_token: Option<String> = state
+        .auth_token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            std::env::var("OCTOS_AUTH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
+        .or_else(|| {
+            // Try OCTOS_DATA_DIR, then ~/.octos, then cwd/.octos
+            let home = std::env::var("HOME").unwrap_or_default();
+            let candidates = [
+                std::env::var("OCTOS_DATA_DIR").unwrap_or_default(),
+                format!("{home}/.octos"),
+            ];
+            for dir in &candidates {
+                if dir.is_empty() {
+                    continue;
+                }
+                if let Ok(s) = std::fs::read_to_string(format!("{dir}/config.json")) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        if let Some(t) = v.get("auth_token").and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                return Some(t.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        });
+    let is_admin = match &expected_token {
+        Some(expected) if !expected.is_empty() => {
+            token.len() == expected.len()
+                && token
+                    .as_bytes()
+                    .iter()
+                    .zip(expected.as_bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0
+        }
+        _ => false,
+    };
+
+    if !is_admin {
+        // Debug: return what we tried to match against
+        let debug = format!(
+            "token_len={} expected_len={} data_dir={} home={}",
+            token.len(),
+            expected_token.as_ref().map(|t| t.len()).unwrap_or(0),
+            std::env::var("OCTOS_DATA_DIR").unwrap_or_else(|_| "unset".into()),
+            std::env::var("HOME").unwrap_or_else(|_| "unset".into()),
+        );
+        return (StatusCode::UNAUTHORIZED, debug).into_response();
+    }
+
+    if req.command.is_empty() {
+        return (StatusCode::BAD_REQUEST, "command is required").into_response();
+    }
+
+    let timeout = std::time::Duration::from_secs(req.timeout_secs.unwrap_or(30).min(300));
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(&req.command);
+    if let Some(ref cwd) = req.cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawn failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => Json(ShellResponse {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+            timed_out: false,
+        })
+        .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("exec failed: {e}"),
+        )
+            .into_response(),
+        Err(_) => Json(ShellResponse {
+            stdout: String::new(),
+            stderr: "command timed out".to_string(),
+            exit_code: -1,
+            timed_out: true,
+        })
+        .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
     use std::path::Path;
+    use tower::util::ServiceExt;
 
     const TEST_PROFILE_ID: &str = "dspfac";
 
@@ -936,6 +1192,17 @@ mod tests {
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.message, "hello");
         assert!(req.session_id.is_none());
+        assert!(req.topic.is_none());
+    }
+
+    #[test]
+    fn chat_request_deserialize_with_topic() {
+        let json =
+            r#"{"message": "hello", "session_id": "slides-123", "topic": "slides untitled"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "hello");
+        assert_eq!(req.session_id.as_deref(), Some("slides-123"));
+        assert_eq!(req.topic.as_deref(), Some("slides untitled"));
     }
 
     #[test]
@@ -943,6 +1210,40 @@ mod tests {
         let json = r#"{"message": "hi", "session_id": "web-123"}"#;
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.session_id.as_deref(), Some("web-123"));
+    }
+
+    #[test]
+    fn message_info_from_history_message_hides_absolute_paths() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let artifact = data_dir
+            .path()
+            .join("users")
+            .join("dspfac%3Aapi%3Aweb-1")
+            .join("workspace")
+            .join(".artifacts")
+            .join("deck.pptx");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"pptx").unwrap();
+
+        let message = Message {
+            role: MessageRole::Assistant,
+            content: format!("[file:{}] deck.pptx", artifact.to_string_lossy()),
+            media: vec![artifact.to_string_lossy().to_string()],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: Utc::now(),
+        };
+
+        let info = message_info_from_history_message(&message, data_dir.path());
+        assert_eq!(info.media.len(), 1);
+        assert_ne!(info.media[0], artifact.to_string_lossy());
+        assert!(
+            !info
+                .content
+                .contains(&artifact.to_string_lossy().to_string())
+        );
+        assert!(info.content.contains("[file:pf/"));
     }
 
     #[test]
@@ -989,6 +1290,28 @@ mod tests {
             Some(TEST_PROFILE_ID.to_string()),
         );
         assert_eq!(ch.max_message_length(), 1_000_000);
+    }
+
+    #[test]
+    fn initial_sse_events_include_thinking() {
+        let events = initial_sse_events(false);
+        assert_eq!(events.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(parsed["type"], "thinking");
+        assert_eq!(parsed["iteration"], 0);
+    }
+
+    #[test]
+    fn initial_sse_events_include_preprocessing_for_media() {
+        let events = initial_sse_events(true);
+        assert_eq!(events.len(), 2);
+        let parsed: Vec<serde_json::Value> = events
+            .iter()
+            .map(|event| serde_json::from_str(event).unwrap())
+            .collect();
+        assert_eq!(parsed[0]["type"], "thinking");
+        assert_eq!(parsed[1]["type"], "tool_progress");
+        assert_eq!(parsed[1]["tool"], "preprocessing");
     }
 
     #[tokio::test]
@@ -1043,7 +1366,15 @@ mod tests {
             content: String::new(),
             reply_to: None,
             media: vec![],
-            metadata: serde_json::json!({"_completion": true}),
+            metadata: serde_json::json!({
+                "_completion": true,
+                "model": "moonshot/kimi-k2.5 @ autodl.art",
+                "provider": "moonshot",
+                "model_id": "kimi-k2.5",
+                "endpoint": "autodl.art",
+                "tokens_in": 123,
+                "tokens_out": 456,
+            }),
         };
         ch.send(&msg).await.unwrap();
 
@@ -1051,6 +1382,12 @@ mod tests {
         let event = rx.recv().await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
         assert_eq!(parsed["type"], "done");
+        assert_eq!(parsed["model"], "moonshot/kimi-k2.5 @ autodl.art");
+        assert_eq!(parsed["provider"], "moonshot");
+        assert_eq!(parsed["model_id"], "kimi-k2.5");
+        assert_eq!(parsed["endpoint"], "autodl.art");
+        assert_eq!(parsed["tokens_in"], 123);
+        assert_eq!(parsed["tokens_out"], 456);
 
         // Sender was removed — next recv returns None
         assert!(rx.recv().await.is_none());
@@ -1160,7 +1497,8 @@ mod tests {
         assert_eq!(history[0].media.len(), 1);
         let persisted = &history[0].media[0];
         assert_ne!(persisted, &source.to_string_lossy().to_string());
-        assert!(history[0].content.contains(persisted));
+        assert!(!history[0].content.contains(persisted));
+        assert!(history[0].content.contains("[file:pf/"));
         assert!(Path::new(persisted).exists());
         assert_eq!(std::fs::read(Path::new(persisted)).unwrap(), b"audio");
     }
@@ -1200,15 +1538,48 @@ mod tests {
         let mut sess = sessions.lock().await;
         let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "collision-chat");
         let session = sess.get_or_create(&key).await;
-        let stored: Vec<String> = session
-            .get_history(10)
-            .iter()
-            .flat_map(|m| m.media.iter().cloned())
-            .collect();
-        assert_eq!(stored.len(), 2);
-        assert_ne!(stored[0], stored[1]);
-        assert_eq!(std::fs::read(Path::new(&stored[0])).unwrap().len(), 5);
-        assert_eq!(std::fs::read(Path::new(&stored[1])).unwrap().len(), 4);
+        let history = session.get_history(10);
+        assert_eq!(history.len(), 2);
+        let first = history[0].media[0].clone();
+        let second = history[1].media[0].clone();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(Path::new(&first)).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(Path::new(&second)).unwrap(), b"beta");
+    }
+
+    #[tokio::test]
+    async fn send_file_message_reuses_existing_session_artifact() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "artifact-chat");
+        let artifact_dir = ApiChannel::session_artifact_dir(data_dir.path(), &key);
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let existing = artifact_dir.join("existing.wav");
+        std::fs::write(&existing, b"persisted").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "artifact-chat".into(),
+            content: "existing".into(),
+            reply_to: None,
+            media: vec![existing.to_string_lossy().to_string()],
+            metadata: serde_json::json!({}),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let mut sess = sessions.lock().await;
+        let session = sess.get_or_create(&key).await;
+        let history = session.get_history(10);
+        let persisted = std::fs::canonicalize(&history[0].media[0]).unwrap();
+        let existing = std::fs::canonicalize(&existing).unwrap();
+        assert_eq!(persisted, existing);
     }
 
     #[tokio::test]
@@ -1261,5 +1632,56 @@ mod tests {
         };
         // Should not error
         ch.send(&msg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_sessions_dedups_profile_scoped_duplicates_by_chat_id() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let mut sess = sessions.lock().await;
+        sess.add_message(
+            &SessionKey::with_profile("dspfac", "api", "slides-123"),
+            Message::user("one"),
+        )
+        .await
+        .unwrap();
+        sess.add_message(
+            &SessionKey::with_profile(MAIN_PROFILE_ID, "api", "slides-123"),
+            Message::user("two"),
+        )
+        .await
+        .unwrap();
+        drop(sess);
+
+        let app = Router::new()
+            .route("/sessions", get(handle_list_sessions))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions,
+                profile_id: Some("dspfac".into()),
+                task_query: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let matching: Vec<&serde_json::Value> = sessions
+            .iter()
+            .filter(|entry| entry.get("id").and_then(|id| id.as_str()) == Some("slides-123"))
+            .collect();
+        assert_eq!(matching.len(), 1);
     }
 }

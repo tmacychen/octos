@@ -1,8 +1,12 @@
 //! Background task lifecycle management for spawn_only tools.
 //!
-//! The `TaskSupervisor` tracks background tasks from spawn to completion,
-//! replacing the bare `AtomicU32` counter with rich task state. This enables
-//! API endpoints to report per-task status, output files, and errors.
+//! The `TaskSupervisor` is a status store that tracks background tasks from
+//! spawn to completion. It does NOT enforce workspace contracts — that
+//! responsibility belongs to `workspace_contract::enforce()`, which runs
+//! inline in `execution.rs` BEFORE the supervisor status is updated.
+//!
+//! The supervisor only sees truth-checked states: `Completed` means the
+//! workspace contract was satisfied, `Failed` means it was not.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,6 +25,40 @@ pub enum TaskStatus {
     Failed,
 }
 
+impl TaskStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Spawned | Self::Running)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Fine-grained runtime phase of a background task.
+///
+/// `status` remains the coarse externally stable summary, while
+/// `runtime_state` tracks where the task is inside the workspace/runtime
+/// lifecycle. This lets the agent and UI distinguish "tool is still running"
+/// from "tool finished but outputs are still being verified/delivered".
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRuntimeState {
+    Spawned,
+    ExecutingTool,
+    ResolvingOutputs,
+    VerifyingOutputs,
+    DeliveringOutputs,
+    CleaningUp,
+    Completed,
+    Failed,
+}
+
 /// A tracked background task spawned by a spawn_only tool.
 #[derive(Debug, Clone, Serialize)]
 pub struct BackgroundTask {
@@ -28,7 +66,11 @@ pub struct BackgroundTask {
     pub tool_name: String,
     pub tool_call_id: String,
     pub status: TaskStatus,
+    pub runtime_state: TaskRuntimeState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_detail: Option<String>,
     pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub output_files: Vec<String>,
     pub error: Option<String>,
@@ -92,7 +134,10 @@ impl TaskSupervisor {
             tool_name: tool_name.to_string(),
             tool_call_id: tool_call_id.to_string(),
             status: TaskStatus::Spawned,
+            runtime_state: TaskRuntimeState::Spawned,
+            runtime_detail: None,
             started_at: Utc::now(),
+            updated_at: Utc::now(),
             completed_at: None,
             output_files: Vec::new(),
             error: None,
@@ -109,6 +154,32 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Running;
+                task.runtime_state = TaskRuntimeState::ExecutingTool;
+                task.runtime_detail = None;
+                task.updated_at = Utc::now();
+                Some(task.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref task) = snapshot {
+            self.notify_change(task);
+        }
+    }
+
+    /// Update the fine-grained runtime state while keeping the coarse status.
+    pub fn mark_runtime_state(
+        &self,
+        task_id: &str,
+        runtime_state: TaskRuntimeState,
+        runtime_detail: Option<String>,
+    ) {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.runtime_state = runtime_state;
+                task.runtime_detail = runtime_detail;
+                task.updated_at = Utc::now();
                 Some(task.clone())
             } else {
                 None
@@ -125,6 +196,9 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Completed;
+                task.runtime_state = TaskRuntimeState::Completed;
+                task.runtime_detail = None;
+                task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
                 task.output_files = output_files;
                 Some(task.clone())
@@ -143,6 +217,9 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Failed;
+                task.runtime_state = TaskRuntimeState::Failed;
+                task.runtime_detail = None;
+                task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
                 task.error = Some(error);
                 Some(task.clone())
@@ -168,7 +245,7 @@ impl TaskSupervisor {
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks
             .values()
-            .filter(|t| t.status != TaskStatus::Completed && t.status != TaskStatus::Failed)
+            .filter(|t| t.status.is_active())
             .cloned()
             .collect()
     }
@@ -192,13 +269,9 @@ impl TaskSupervisor {
     /// Number of active (non-completed, non-failed) tasks.
     pub fn task_count(&self) -> usize {
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks
-            .values()
-            .filter(|t| t.status != TaskStatus::Completed && t.status != TaskStatus::Failed)
-            .count()
+        tasks.values().filter(|t| t.status.is_active()).count()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,7 +287,9 @@ mod tests {
         assert_eq!(tasks[0].tool_name, "tts");
         assert_eq!(tasks[0].tool_call_id, "call-123");
         assert_eq!(tasks[0].status, TaskStatus::Spawned);
+        assert_eq!(tasks[0].runtime_state, TaskRuntimeState::Spawned);
         assert!(tasks[0].completed_at.is_none());
+        assert!(tasks[0].updated_at >= tasks[0].started_at);
     }
 
     #[test]
@@ -225,10 +300,22 @@ mod tests {
         supervisor.mark_running(&id);
         let task = &supervisor.get_all_tasks()[0];
         assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.runtime_state, TaskRuntimeState::ExecutingTool);
+
+        supervisor.mark_runtime_state(
+            &id,
+            TaskRuntimeState::DeliveringOutputs,
+            Some("send_file".to_string()),
+        );
+        let task = &supervisor.get_all_tasks()[0];
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.runtime_state, TaskRuntimeState::DeliveringOutputs);
+        assert_eq!(task.runtime_detail.as_deref(), Some("send_file"));
 
         supervisor.mark_completed(&id, vec!["output.mp3".to_string()]);
         let task = &supervisor.get_all_tasks()[0];
         assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.runtime_state, TaskRuntimeState::Completed);
         assert!(task.completed_at.is_some());
         assert_eq!(task.output_files, vec!["output.mp3"]);
     }
@@ -243,6 +330,7 @@ mod tests {
 
         let task = &supervisor.get_all_tasks()[0];
         assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.runtime_state, TaskRuntimeState::Failed);
         assert_eq!(task.error.as_deref(), Some("connection refused"));
         assert!(task.completed_at.is_some());
     }

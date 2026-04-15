@@ -9,38 +9,40 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use colored::Colorize;
 use eyre::{Result, WrapErr};
 use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{
-    create_bus, ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager,
+    ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager, create_bus,
 };
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
     QosCatalog, RetryProvider, SwappableProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tracing::{info, warn};
 
 use super::build_system_prompt;
 use super::message_preprocessing;
-use super::profile_factory::{build_plugin_env, ProfileActorFactoryBuilder};
+use super::profile_factory::{ProfileActorFactoryBuilder, build_plugin_env};
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
 use crate::commands::{load_prompt, resolve_data_dir};
-use crate::config::{detect_provider, Config};
+use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
 use crate::qos_catalog::{
     load_seed_qos_catalog, materialize_runtime_qos_catalog, persist_qos_catalog,
 };
-use crate::session_actor::{ActorFactory, ActorRegistry, SnapshotToolRegistryFactory};
+use crate::session_actor::{
+    ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
+};
 use crate::status_layers::StatusComposer;
 
 #[cfg(feature = "matrix")]
@@ -81,6 +83,7 @@ pub(super) struct GatewayRuntime {
     config_rx: tokio::sync::watch::Receiver<Option<ConfigChange>>,
     tool_config: Arc<octos_agent::ToolConfigStore>,
     shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
 
     // Status
     status_indicators: Arc<HashMap<String, Arc<StatusComposer>>>,
@@ -515,6 +518,8 @@ impl GatewayRuntime {
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let shutdown_notify = Arc::new(Notify::new());
+        let shutdown_notify_clone = shutdown_notify.clone();
         #[cfg(feature = "matrix")]
         let mut matrix_channel: Option<Arc<octos_bus::MatrixChannel>> = None;
 
@@ -555,7 +560,16 @@ impl GatewayRuntime {
 
             // Load plugins with a dedicated work directory for output files
             let plugin_work_dir = data_dir.join("skill-output");
-            let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&data_dir);
+            let mut plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&data_dir);
+            // Include bundled app-skills and platform skills (bootstrapped into project_dir)
+            let bundled_dir = project_dir.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
+            if bundled_dir.exists() && !plugin_dirs.contains(&bundled_dir) {
+                plugin_dirs.push(bundled_dir);
+            }
+            let platform_dir = project_dir.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
+            if platform_dir.exists() && !plugin_dirs.contains(&platform_dir) {
+                plugin_dirs.push(platform_dir);
+            }
             plugin_result = octos_agent::PluginLoadResult::default();
             if !plugin_dirs.is_empty() {
                 match octos_agent::PluginLoader::load_into_with_work_dir(
@@ -715,11 +729,7 @@ impl GatewayRuntime {
                     }
                 }
 
-                if registered > 0 {
-                    Some(router)
-                } else {
-                    None
-                }
+                if registered > 0 { Some(router) } else { None }
             };
 
             // Capture config for per-session SpawnTool and PipelineTool creation
@@ -971,6 +981,7 @@ impl GatewayRuntime {
         // Pending message buffer for inactive sessions
         let pending_messages: crate::session_actor::PendingMessages =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let task_query_store = SessionTaskQueryStore::default();
 
         // Build ActorFactory with all shared resources
         let actor_factory = ActorFactory {
@@ -1014,6 +1025,7 @@ impl GatewayRuntime {
                 false,
             )
             .unwrap_or_else(|_| llm_for_compaction.clone()),
+            task_query_store: task_query_store.clone(),
         };
         let profile_factory_builder =
             profile_store
@@ -1044,6 +1056,7 @@ impl GatewayRuntime {
                     plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
                     no_retry: cmd.no_retry,
                     sandbox_config: sandbox_config.clone(),
+                    task_query_store: task_query_store.clone(),
                 });
 
         // Start config watcher for hot-reload
@@ -1088,6 +1101,10 @@ impl GatewayRuntime {
                 media_dir: &media_dir,
                 data_dir: &data_dir,
                 session_mgr: &session_mgr,
+                task_query: Some(Arc::new({
+                    let store = task_query_store.clone();
+                    move |session_key: &str| store.query_json(session_key)
+                })),
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
@@ -1144,6 +1161,7 @@ impl GatewayRuntime {
                 println!();
                 println!("{}", "Shutting down gateway...".yellow());
                 shutdown_clone.store(true, Ordering::Release);
+                shutdown_notify_clone.notify_waiters();
             }
         });
 
@@ -1262,6 +1280,7 @@ impl GatewayRuntime {
             config_rx,
             tool_config,
             shutdown,
+            shutdown_notify,
             status_indicators,
             persona_service,
             heartbeat_service,
@@ -1274,9 +1293,25 @@ impl GatewayRuntime {
 
     pub(super) async fn run(mut self) -> Result<()> {
         let mut profile_prompt_cache: HashMap<String, Option<String>> = HashMap::new();
+        let shutdown_notify = self.shutdown_notify.clone();
 
         // Main loop: dispatch inbound messages to concurrent tasks
-        while let Some(mut inbound) = self.agent_handle.recv_inbound().await {
+        loop {
+            let mut inbound = tokio::select! {
+                _ = shutdown_notify.notified() => {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                inbound = self.agent_handle.recv_inbound() => {
+                    match inbound {
+                        Some(inbound) => inbound,
+                        None => break,
+                    }
+                }
+            };
+
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -1319,6 +1354,8 @@ impl GatewayRuntime {
             )
             .await;
             let image_media = media_result.image_media;
+            let attachment_media = media_result.attachment_media;
+            let attachment_prompt = media_result.attachment_prompt;
 
             // Route cron-triggered messages to their target channel
             let (reply_channel, reply_chat_id) = message_preprocessing::resolve_reply_target(
@@ -1370,7 +1407,19 @@ impl GatewayRuntime {
                 "",
             );
             let base_key_str = base_session_key.base_key().to_string();
-            let session_key = {
+            let explicit_topic = inbound
+                .metadata
+                .get("topic")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty());
+            let session_key = if let Some(topic) = explicit_topic {
+                build_profiled_session_key(
+                    dispatch_profile_id.as_deref(),
+                    &inbound.channel,
+                    &inbound.chat_id,
+                    topic,
+                )
+            } else {
                 let store = self.active_sessions.read().await;
                 store.resolve_session_key(&base_key_str)
             };
@@ -1591,6 +1640,8 @@ impl GatewayRuntime {
                 .dispatch(crate::session_actor::DispatchParams {
                     message: inbound,
                     image_media,
+                    attachment_media,
+                    attachment_prompt,
                     session_key,
                     reply_channel: &reply_channel,
                     reply_chat_id: &reply_chat_id,

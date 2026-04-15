@@ -3,25 +3,29 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::Extension;
+use axum::Json;
 use axum::extract::State;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
-use axum::Json;
 use futures::stream::StreamExt;
-use octos_agent::Agent;
-use octos_core::{AgentId, Message, SessionKey, MAIN_PROFILE_ID};
+use octos_agent::{Agent, inspect_workspace_contract};
+use octos_bus::file_handle::{
+    encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
+    resolve_scoped_file_handle,
+};
+use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
 use serde::{Deserialize, Serialize};
 
+use super::AppState;
 use super::auth_handlers::ADMIN_PROFILE_ID;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
 use super::sse::ChannelReporter;
-use super::AppState;
-use crate::project_templates::{read_site_project_metadata, SiteProjectMetadata};
+use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
 
 /// POST /api/chat -- send a message, get a response.
 /// When `stream: true`, returns SSE events. Otherwise returns JSON.
@@ -30,6 +34,8 @@ pub struct ChatRequest {
     pub message: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub topic: Option<String>,
     #[serde(default)]
     pub stream: bool,
     /// File paths from prior `/api/upload` call.
@@ -55,22 +61,91 @@ pub(crate) struct ContentFileEntry {
     group: String,
 }
 
+pub(crate) fn response_path_for_profile_file(
+    base_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<String> {
+    encode_profile_file_handle(base_dir, path)
+        .or_else(|| encode_tmp_upload_handle(path, path.file_name().and_then(|name| name.to_str())))
+}
+
+fn resolve_scoped_download_path(
+    base_dir: &std::path::Path,
+    request_path: &str,
+) -> Option<std::path::PathBuf> {
+    resolve_scoped_file_handle(base_dir, request_path)
+        .or_else(|| resolve_legacy_file_request(base_dir, request_path))
+}
+
 /// Maximum message length (1MB).
 const MAX_MESSAGE_LEN: usize = 1_048_576;
+
+fn request_host(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(strip_port_from_host(&raw).to_string())
+}
+
+fn strip_port_from_host(host: &str) -> &str {
+    if let Some(stripped) = host.strip_prefix('[') {
+        return stripped.split(']').next().unwrap_or(host);
+    }
+
+    if host.matches(':').count() == 1 {
+        return host.split(':').next().unwrap_or(host);
+    }
+
+    host
+}
+
+fn is_local_request_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn resolve_profile_id_candidate(state: &AppState, candidate: &str) -> Option<String> {
+    state
+        .profile_store
+        .as_ref()
+        .and_then(|store| store.resolve_routable_profile_id(candidate).ok().flatten())
+}
+
+fn routed_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    if let Some(host) = request_host(headers) {
+        if !is_local_request_host(&host) {
+            if let Some(candidate) = host.split('.').next() {
+                if let Some(profile_id) = resolve_profile_id_candidate(state, candidate) {
+                    return Some(profile_id);
+                }
+            }
+        }
+    }
+
+    headers
+        .get("x-profile-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|candidate| resolve_profile_id_candidate(state, candidate))
+}
 
 /// Resolve API port for a specific profile, or fall back to first available.
 /// Profile is identified by X-Profile-Id header (set by Caddy from subdomain).
 async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(String, u16)> {
     let pm = state.process_manager.as_ref()?;
 
-    // Check X-Profile-Id header first (set by reverse proxy from subdomain)
-    if let Some(profile_id) = headers
-        .get("x-profile-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-    {
-        if let Some(port) = pm.api_port(profile_id).await {
-            return Some((profile_id.to_string(), port));
+    if let Some(profile_id) = routed_profile_id_from_headers(state, headers) {
+        if let Some(port) = pm.api_port(&profile_id).await {
+            return Some((profile_id, port));
         }
         tracing::warn!(profile = profile_id, "no API port for requested profile");
     }
@@ -79,16 +154,17 @@ async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(Stri
     pm.first_api_port().await
 }
 
-fn api_profile_id_from_headers(headers: &HeaderMap) -> &str {
-    headers
-        .get("x-profile-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(MAIN_PROFILE_ID)
+fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String {
+    routed_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
 }
 
-fn standalone_api_session_key(headers: &HeaderMap, session_id: &str) -> SessionKey {
-    SessionKey::with_profile(api_profile_id_from_headers(headers), "api", session_id)
+fn standalone_api_session_key(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: &str,
+) -> SessionKey {
+    let profile_id = api_profile_id_from_headers(state, headers);
+    SessionKey::with_profile(&profile_id, "api", session_id)
 }
 
 pub async fn chat(
@@ -107,6 +183,7 @@ pub async fn chat(
             Some(&profile_id),
             &req.message,
             req.session_id.as_deref(),
+            req.topic.as_deref(),
             &req.media,
         )
         .await;
@@ -169,8 +246,12 @@ async fn chat_sync(
         "chat: processing message"
     );
 
-    let session_key =
-        standalone_api_session_key(&headers, req.session_id.as_deref().unwrap_or("default"));
+    let session_key = standalone_api_session_key_with_topic(
+        &state,
+        &headers,
+        req.session_id.as_deref().unwrap_or("default"),
+        req.topic.as_deref(),
+    );
 
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
@@ -224,7 +305,8 @@ async fn chat_streaming(
         "chat: streaming message"
     );
 
-    let session_key = standalone_api_session_key(&headers, &session_id);
+    let session_key =
+        standalone_api_session_key_with_topic(&state, &headers, &session_id, req.topic.as_deref());
 
     // Load history before spawning
     let history: Vec<Message> = {
@@ -277,9 +359,14 @@ async fn chat_streaming(
                 }
 
                 // Send final done event (field names match what octos-web expects)
+                let provider_metadata = response.provider_metadata.clone();
                 let done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
+                    "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
+                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
+                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
+                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
                 });
@@ -348,7 +435,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
 
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
-        let prefix = format!("{}:api:", api_profile_id_from_headers(&headers));
+        let prefix = format!("{}:api:", api_profile_id_from_headers(&state, &headers));
         all.extend(sess.list_sessions().into_iter().filter_map(|(id, count)| {
             let chat_id = id.strip_prefix(&prefix)?;
             Some(SessionInfo {
@@ -405,21 +492,35 @@ pub struct PaginationParams {
     pub topic: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct TopicQueryParams {
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
 fn default_page_limit() -> usize {
     100
 }
 
 fn standalone_api_session_key_with_topic(
+    state: &AppState,
     headers: &HeaderMap,
     session_id: &str,
     topic: Option<&str>,
 ) -> SessionKey {
-    SessionKey::with_profile_topic(
-        api_profile_id_from_headers(headers),
-        "api",
-        session_id,
-        topic.unwrap_or_default(),
-    )
+    let profile_id = api_profile_id_from_headers(state, headers);
+    SessionKey::with_profile_topic(&profile_id, "api", session_id, topic.unwrap_or_default())
+}
+
+fn append_topic_query(path: &mut String, topic: Option<&str>) {
+    if let Some(topic) = topic.filter(|value| !value.is_empty()) {
+        path.push_str(if path.contains('?') {
+            "&topic="
+        } else {
+            "?topic="
+        });
+        path.push_str(&octos_bus::session::encode_path_component(topic));
+    }
 }
 
 fn session_messages_proxy_path(
@@ -439,10 +540,7 @@ fn session_messages_proxy_path(
         path.push_str("&since_seq=");
         path.push_str(&since_seq.to_string());
     }
-    if let Some(topic) = topic.filter(|value| !value.is_empty()) {
-        path.push_str("&topic=");
-        path.push_str(&octos_bus::session::encode_path_component(topic));
-    }
+    append_topic_query(&mut path, topic);
     path
 }
 
@@ -465,7 +563,12 @@ pub async fn session_messages(
                 Some(n) => n,
                 None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
             };
-            let key = standalone_api_session_key_with_topic(&headers, &id, params.topic.as_deref());
+            let key = standalone_api_session_key_with_topic(
+                &state,
+                &headers,
+                &id,
+                params.topic.as_deref(),
+            );
             let mut sess = sessions.lock().await;
             let session = sess.get_or_create(&key).await;
             let messages: Vec<MessageInfo> = session
@@ -518,10 +621,12 @@ pub async fn session_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
     // Proxy to gateway (session actors live there)
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let path = format!("/sessions/{id}/status");
+        let mut path = format!("/sessions/{id}/status");
+        append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
 
@@ -537,10 +642,12 @@ pub async fn session_tasks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
     // Proxy to gateway (task supervisor lives there)
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let path = format!("/sessions/{id}/tasks");
+        let mut path = format!("/sessions/{id}/tasks");
+        append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
 
@@ -556,7 +663,11 @@ pub struct SessionFileInfo {
     pub modified_at: String,
 }
 
-fn collect_session_files(root: &std::path::Path, out: &mut Vec<SessionFileInfo>) {
+fn collect_session_files(
+    root: &std::path::Path,
+    data_dir: &std::path::Path,
+    out: &mut Vec<SessionFileInfo>,
+) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -571,7 +682,7 @@ fn collect_session_files(root: &std::path::Path, out: &mut Vec<SessionFileInfo>)
             if entry.file_name() == ".git" {
                 continue;
             }
-            collect_session_files(&path, out);
+            collect_session_files(&path, data_dir, out);
             continue;
         }
 
@@ -583,9 +694,12 @@ fn collect_session_files(root: &std::path::Path, out: &mut Vec<SessionFileInfo>)
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let Some(handle) = response_path_for_profile_file(data_dir, &path) else {
+            continue;
+        };
         out.push(SessionFileInfo {
             filename,
-            path: path.to_string_lossy().to_string(),
+            path: handle,
             size_bytes: metadata.len(),
             modified_at: modified_rfc3339(&metadata),
         });
@@ -612,7 +726,7 @@ pub async fn session_files(
     let mut files = Vec::new();
     for workspace in api_session_workspace_dirs(&data_dir, &id) {
         if workspace.exists() {
-            collect_session_files(&workspace, &mut files);
+            collect_session_files(&workspace, &data_dir, &mut files);
         }
     }
 
@@ -625,37 +739,81 @@ pub async fn session_files(
     Json(files).into_response()
 }
 
+pub async fn session_workspace_contract(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let data_dir = if let Some(sessions) = &state.sessions {
+        let sess = sessions.lock().await;
+        sess.data_dir()
+    } else {
+        let identity = identity.as_ref().map(|ext| &ext.0);
+        match resolve_profile_data_dir(&state, &headers, identity).await {
+            Ok(data_dir) => data_dir,
+            Err(response) => return response,
+        }
+    };
+
+    let mut statuses = Vec::new();
+    for workspace in api_session_workspace_dirs(&data_dir, &id) {
+        if !workspace.exists() {
+            continue;
+        }
+        let Ok(repos) = octos_agent::list_workspace_repos(&workspace) else {
+            continue;
+        };
+        statuses.extend(repos.iter().map(inspect_workspace_contract));
+    }
+
+    statuses.sort_by(|left, right| left.repo_label.cmp(&right.repo_label));
+    statuses.dedup_by(|left, right| left.repo_label == right.repo_label);
+    Json(statuses).into_response()
+}
+
+async fn resolve_file_access_data_dir(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Result<std::path::PathBuf, Response> {
+    if let Some(sessions) = &state.sessions {
+        let sess = sessions.lock().await;
+        return Ok(sess.data_dir());
+    }
+
+    resolve_profile_data_dir(state, headers, identity).await
+}
+
 /// DELETE /api/sessions/:id -- delete a session.
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    // Clear from the standalone store if available.
     if let Some(sessions) = &state.sessions {
-        let key = standalone_api_session_key(&headers, &id);
+        let key = standalone_api_session_key(&state, &headers, &id);
         let mut sess = sessions.lock().await;
-        return match sess.clear(&key).await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(e) => {
-                tracing::error!(error = %e, "delete session failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
-        };
+        if let Err(e) = sess.clear(&key).await {
+            tracing::error!(error = %e, "delete session from standalone store failed");
+        }
     }
 
-    // Proxy to gateway
+    // Also proxy delete to gateway — sessions may live in the gateway's
+    // SessionManager (per-profile data dir), not just the serve process's store.
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
         let path = format!("/sessions/{id}");
-        return super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+        let _ = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
     }
 
-    (StatusCode::SERVICE_UNAVAILABLE, "Sessions not available").into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// POST /api/upload -- upload files, returns paths for use in /api/chat media field.
 ///
 /// Accepts multipart/form-data with one or more `file` fields.
-/// Returns JSON array of server-side file paths.
+/// Returns JSON array of server-side upload handles.
 pub async fn upload(
     State(_state): State<Arc<AppState>>,
     mut multipart: axum::extract::Multipart,
@@ -725,7 +883,11 @@ pub async fn upload(
         })?;
 
         tracing::info!(path = %dest.display(), size = data.len(), "file uploaded");
-        paths.push(dest.to_string_lossy().to_string());
+        let handle = encode_tmp_upload_handle(&dest, Some(&safe_name)).ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to encode upload handle".into(),
+        ))?;
+        paths.push(handle);
     }
 
     if paths.is_empty() {
@@ -886,10 +1048,16 @@ pub async fn upload_site_files(
             .and_then(|value| value.to_str())
             .unwrap_or(&safe_name)
             .to_string();
+        let Some(handle) = response_path_for_profile_file(&data_dir, &destination) else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode uploaded file handle".into(),
+            ));
+        };
 
         saved.push(ContentFileEntry {
             filename: saved_name.clone(),
-            path: destination.to_string_lossy().to_string(),
+            path: handle,
             size: meta.len(),
             modified: modified_rfc3339(&meta),
             category: categorize(&saved_name),
@@ -902,48 +1070,40 @@ pub async fn upload_site_files(
 
 /// GET /api/files?path=... -- serve files by query parameter (for absolute paths).
 pub async fn serve_file_by_query(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let Some(filename) = params.get("path") else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    serve_file_impl(filename).await
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
+    };
+    serve_file_impl(&data_dir, filename).await
 }
 
 /// GET /api/files/:filename -- serve uploaded files and pipeline report files.
-pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<String>) -> Response {
-    serve_file_impl(&filename).await
+pub async fn serve_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> Response {
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
+    };
+    serve_file_impl(&data_dir, &filename).await
 }
 
-async fn serve_file_impl(filename: &str) -> Response {
-    // Try as an absolute path first (for pipeline-generated files)
-    let file_path = std::path::Path::new(&filename);
-    let path = if file_path.is_absolute() {
-        // Security: only serve files under $HOME/.octos or /tmp
-        // (NOT the entire $HOME — prevent reading arbitrary user files)
-        let canonical = match std::fs::canonicalize(file_path) {
-            Ok(p) => p,
-            Err(_) => return StatusCode::NOT_FOUND.into_response(),
-        };
-        let home = std::env::var("HOME").unwrap_or_default();
-        let octos_dir = std::fs::canonicalize(format!("{home}/.octos"))
-            .unwrap_or_else(|_| std::path::PathBuf::from(format!("{home}/.octos")));
-        let tmp_dir =
-            std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with(&tmp_dir);
-        if !allowed {
-            return (StatusCode::FORBIDDEN, "access denied").into_response();
-        }
-        canonical
-    } else {
-        // Relative path — serve from uploads dir
-        let safe_name = filename.replace(['/', '\\', '\0', '~'], "_");
-        let upload_dir = std::env::temp_dir().join("octos-uploads");
-        let path = upload_dir.join(&safe_name);
-        if !path.exists() || !path.starts_with(&upload_dir) {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        path
+async fn serve_file_impl(data_dir: &std::path::Path, filename: &str) -> Response {
+    let Some(path) = resolve_scoped_download_path(data_dir, filename) else {
+        return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
 
     let data = match tokio::fs::read(&path).await {
@@ -1038,14 +1198,14 @@ async fn resolve_profile_data_dir(
 ) -> Result<std::path::PathBuf, Response> {
     if let Some((_profile_id, _port)) = resolve_api_port(state, headers).await {
         if let Some(ref ps) = state.profile_store {
-            let header_profile_id = headers.get("x-profile-id").and_then(|v| v.to_str().ok());
+            let header_profile_id = routed_profile_id_from_headers(state, headers);
             let identity_profile_id = match identity {
                 Some(AuthIdentity::User { id, .. }) => Some(id.as_str()),
                 Some(AuthIdentity::Admin) => Some(ADMIN_PROFILE_ID),
                 None => None,
             };
 
-            if let Some(pid) = header_profile_id.or(identity_profile_id) {
+            if let Some(pid) = header_profile_id.as_deref().or(identity_profile_id) {
                 match ps.get(pid) {
                     Ok(Some(profile)) => return Ok(ps.resolve_data_dir(&profile)),
                     Ok(None) => {
@@ -1453,11 +1613,7 @@ fn resolve_preview_asset_path(
                 Some(nested_index)
             } else if !request_path.contains('.') {
                 let html = candidate.with_extension("html");
-                if html.exists() {
-                    Some(html)
-                } else {
-                    None
-                }
+                if html.exists() { Some(html) } else { None }
             } else {
                 None
             }
@@ -1799,14 +1955,14 @@ pub async fn list_content_files(
         if lower.starts_with('_') {
             return false;
         } // _report.md, _search_results.md, _sources.json
-          // Skip intermediates
+        // Skip intermediates
         if lower.starts_with("panel-") {
             return false;
         }
         if lower.contains("-ref.") {
             return false;
         } // mofa reference images
-          // Only keep meaningful output extensions
+        // Only keep meaningful output extensions
         matches!(
             lower.rsplit('.').next().unwrap_or(""),
             "md" | "markdown"
@@ -1843,6 +1999,7 @@ pub async fn list_content_files(
     }
 
     fn collect_files_recursive(
+        data_dir: &std::path::Path,
         current_dir: &std::path::Path,
         display_root: &str,
         relative_dir: &std::path::Path,
@@ -1866,6 +2023,7 @@ pub async fn list_content_files(
                 let mut next_relative = relative_dir.to_path_buf();
                 next_relative.push(&name);
                 collect_files_recursive(
+                    data_dir,
                     &path,
                     display_root,
                     &next_relative,
@@ -1893,11 +2051,14 @@ pub async fn list_content_files(
                     relative_dir.to_string_lossy().replace('\\', "/")
                 )
             };
+            let Some(handle) = response_path_for_profile_file(data_dir, &path) else {
+                continue;
+            };
 
             files.push(ContentFile {
                 category: categorize(&name),
                 filename: name,
-                path: path.to_string_lossy().to_string(),
+                path: handle,
                 size: meta.len(),
                 modified: modified_rfc3339(&meta),
                 group,
@@ -1918,6 +2079,7 @@ pub async fn list_content_files(
         let display_dir = display_dir_for_scan(dir_name);
         let allow_nested_dirs = display_dir != "research";
         collect_files_recursive(
+            &data_dir,
             &dir_path,
             &display_dir,
             std::path::Path::new(""),
@@ -2141,6 +2303,7 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                     &ChatRequest {
                         message: content.clone(),
                         session_id: Some(session_id.clone()),
+                        topic: None,
                         stream: true,
                         media: media.clone(),
                     },
@@ -2309,9 +2472,14 @@ async fn ws_standalone_agent(
                     }
                 }
 
+                let provider_metadata = response.provider_metadata.clone();
                 let done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
+                    "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
+                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
+                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
+                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
                 });
@@ -2478,6 +2646,31 @@ mod tests {
     }
 
     #[test]
+    fn response_path_for_profile_file_hides_absolute_paths() {
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("slides/demo/output/deck.pptx");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"pptx").unwrap();
+
+        let handle = response_path_for_profile_file(base.path(), &file).expect("handle");
+
+        assert_ne!(handle, file.to_string_lossy());
+        assert!(handle.ends_with("/deck.pptx"));
+    }
+
+    #[test]
+    fn resolve_scoped_download_path_denies_other_profile_absolute_path() {
+        let current = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_file = other.path().join("secret.txt");
+        std::fs::write(&other_file, b"secret").unwrap();
+
+        assert!(
+            resolve_scoped_download_path(current.path(), &other_file.to_string_lossy()).is_none()
+        );
+    }
+
+    #[test]
     fn resolve_preview_asset_path_falls_back_to_root_route_for_legacy_relative_links() {
         let base = std::env::temp_dir().join(format!(
             "octos-preview-fallback-{}",
@@ -2570,6 +2763,26 @@ mod tests {
         assert_eq!(
             path,
             "/sessions/slides-123/messages?limit=100&offset=5&source=full&since_seq=8&topic=slides%20untitled-deck"
+        );
+    }
+
+    #[test]
+    fn append_topic_query_uses_question_mark_for_clean_path() {
+        let mut path = "/sessions/slides-123/tasks".to_string();
+        append_topic_query(&mut path, Some("slides untitled-deck"));
+        assert_eq!(
+            path,
+            "/sessions/slides-123/tasks?topic=slides%20untitled-deck"
+        );
+    }
+
+    #[test]
+    fn append_topic_query_uses_ampersand_when_query_exists() {
+        let mut path = "/sessions/slides-123/messages?limit=100".to_string();
+        append_topic_query(&mut path, Some("slides untitled-deck"));
+        assert_eq!(
+            path,
+            "/sessions/slides-123/messages?limit=100&topic=slides%20untitled-deck"
         );
     }
 

@@ -27,10 +27,8 @@ pub struct TenantConfig {
     pub name: String,
     /// Subdomain for tunnel routing (defaults to `id` at creation).
     pub subdomain: String,
-    /// Legacy per-tenant tunnel auth token from the old FRPS auth model.
-    ///
-    /// Kept only for backward-compatible deserialization of existing tenant
-    /// JSON files. New shared-token flows should leave this empty.
+    /// Per-tenant tunnel auth token (UUID). Used as `auth.token` in frpc.toml.
+    /// The frps plugin verifies `md5(tunnel_token + timestamp)` during Login.
     #[serde(default)]
     pub tunnel_token: String,
     /// Allocated SSH tunnel port on the VPS (6001–6999).
@@ -195,7 +193,7 @@ impl TenantStore {
         bail!("SSH port pool exhausted ({SSH_PORT_START}–{SSH_PORT_END})")
     }
 
-    /// Legacy helper for the old per-tenant tunnel auth model.
+    /// Find a tenant by its tunnel auth token.
     pub fn find_by_tunnel_token(&self, token: &str) -> Result<Option<TenantConfig>> {
         let all = self.list()?;
         Ok(all.into_iter().find(|t| t.tunnel_token == token))
@@ -357,7 +355,14 @@ mod tests {
         );
         assert!(config.contains("serverAddr = \"163.192.33.32\""));
         assert!(config.contains("serverPort = 7000"));
-        assert!(config.contains("auth.token = \"shared-frps-token-123\""));
+        assert!(
+            config.contains("auth.token = \"\""),
+            "auth.token must be empty — plugin authenticates via metadatas.token"
+        );
+        assert!(
+            config.contains("token = \"shared-frps-token-123\""),
+            "per-tenant token must land in [metadatas] token, not auth.token"
+        );
         assert!(config.contains("\"alice.octos-cloud.org\""));
         assert!(config.contains("localPort = 8080"));
         assert!(config.contains("remotePort = 6001"));

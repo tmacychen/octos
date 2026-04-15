@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use eyre::{Result, WrapErr};
@@ -12,6 +13,26 @@ pub struct WorkspacePolicy {
     pub workspace: WorkspacePolicyWorkspace,
     pub version_control: WorkspaceVersionControlPolicy,
     pub tracking: WorkspaceTrackingPolicy,
+    #[serde(default)]
+    pub validation: ValidationPolicy,
+    #[serde(default)]
+    pub artifacts: WorkspaceArtifactsPolicy,
+    #[serde(default)]
+    pub spawn_tasks: BTreeMap<String, WorkspaceSpawnTaskPolicy>,
+}
+
+/// Tiered validation checks run at different points in the turn lifecycle.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationPolicy {
+    /// Tier 1: cheap checks run every turn (< 100ms). e.g. file_exists, build exit code.
+    #[serde(default)]
+    pub on_turn_end: Vec<String>,
+    /// Tier 2: medium checks run when source files change (1-5s). e.g. preview render.
+    #[serde(default)]
+    pub on_source_change: Vec<String>,
+    /// Tier 3: expensive checks run on completion/publish only (10-30s). e.g. Playwright.
+    #[serde(default)]
+    pub on_completion: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +45,7 @@ pub struct WorkspacePolicyWorkspace {
 pub enum WorkspacePolicyKind {
     Slides,
     Sites,
+    Session,
 }
 
 impl WorkspacePolicyKind {
@@ -31,6 +53,7 @@ impl WorkspacePolicyKind {
         match self {
             Self::Slides => "slides",
             Self::Sites => "sites",
+            Self::Session => "session",
         }
     }
 
@@ -73,6 +96,24 @@ pub struct WorkspaceTrackingPolicy {
     pub ignore: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceArtifactsPolicy {
+    #[serde(flatten)]
+    pub entries: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceSpawnTaskPolicy {
+    #[serde(default)]
+    pub artifact: Option<String>,
+    #[serde(default)]
+    pub on_verify: Vec<String>,
+    #[serde(default)]
+    pub on_complete: Vec<String>,
+    #[serde(default)]
+    pub on_failure: Vec<String>,
+}
+
 impl WorkspacePolicy {
     pub fn for_kind(kind: WorkspaceProjectKind) -> Self {
         match kind {
@@ -96,6 +137,27 @@ impl WorkspacePolicy {
                         ".DS_Store".into(),
                     ],
                 },
+                validation: ValidationPolicy {
+                    on_turn_end: vec![
+                        "file_exists:script.js".into(),
+                        "file_exists:memory.md".into(),
+                        "file_exists:changelog.md".into(),
+                    ],
+                    on_source_change: Vec::new(),
+                    on_completion: vec![
+                        "file_exists:output/*.pptx".into(),
+                        "file_exists:output/**/manifest.json".into(),
+                        "file_exists:output/**/slide-*.png".into(),
+                    ],
+                },
+                artifacts: WorkspaceArtifactsPolicy {
+                    entries: BTreeMap::from([
+                        ("deck".into(), "output/*.pptx".into()),
+                        ("manifest".into(), "output/**/manifest.json".into()),
+                        ("previews".into(), "output/**/slide-*.png".into()),
+                    ]),
+                },
+                spawn_tasks: BTreeMap::new(),
             },
             WorkspaceProjectKind::Sites => Self {
                 workspace: WorkspacePolicyWorkspace {
@@ -121,7 +183,47 @@ impl WorkspacePolicy {
                         ".DS_Store".into(),
                     ],
                 },
+                validation: ValidationPolicy::default(),
+                artifacts: WorkspaceArtifactsPolicy::default(),
+                spawn_tasks: BTreeMap::new(),
             },
+        }
+    }
+
+    pub fn for_session() -> Self {
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert("primary_audio".into(), "*.mp3".into());
+
+        let tts_contract = WorkspaceSpawnTaskPolicy {
+            artifact: Some("primary_audio".into()),
+            on_verify: vec![
+                "file_exists:$artifact".into(),
+                "file_size_min:$artifact:1024".into(),
+            ],
+            on_complete: vec!["send_file:$artifact".into()],
+            on_failure: vec!["notify_user:TTS generation failed".into()],
+        };
+
+        let mut spawn_tasks = BTreeMap::new();
+        spawn_tasks.insert("fm_tts".into(), tts_contract.clone());
+        spawn_tasks.insert("voice_synthesize".into(), tts_contract);
+
+        Self {
+            workspace: WorkspacePolicyWorkspace {
+                kind: WorkspacePolicyKind::Session,
+            },
+            version_control: WorkspaceVersionControlPolicy {
+                provider: WorkspaceVersionControlProvider::Git,
+                auto_init: false,
+                trigger: WorkspaceSnapshotTrigger::TurnEnd,
+                fail_on_error: false,
+            },
+            tracking: WorkspaceTrackingPolicy {
+                ignore: vec!["tmp/**".into(), ".DS_Store".into()],
+            },
+            validation: ValidationPolicy::default(),
+            artifacts: WorkspaceArtifactsPolicy { entries: artifacts },
+            spawn_tasks,
         }
     }
 }
@@ -179,9 +281,64 @@ mod tests {
     }
 
     #[test]
+    fn slides_policy_has_default_contract() {
+        let policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+
+        assert_eq!(
+            policy.validation.on_turn_end,
+            vec![
+                "file_exists:script.js",
+                "file_exists:memory.md",
+                "file_exists:changelog.md",
+            ]
+        );
+        assert_eq!(
+            policy.validation.on_completion,
+            vec![
+                "file_exists:output/*.pptx",
+                "file_exists:output/**/manifest.json",
+                "file_exists:output/**/slide-*.png",
+            ]
+        );
+        assert_eq!(
+            policy.artifacts.entries.get("deck").map(String::as_str),
+            Some("output/*.pptx")
+        );
+        assert_eq!(
+            policy.artifacts.entries.get("manifest").map(String::as_str),
+            Some("output/**/manifest.json")
+        );
+        assert_eq!(
+            policy.artifacts.entries.get("previews").map(String::as_str),
+            Some("output/**/slide-*.png")
+        );
+    }
+
+    #[test]
     fn default_site_policy_tracks_build_outputs_as_ignored() {
         let policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Sites);
         assert!(policy.tracking.ignore.iter().any(|item| item == "dist/**"));
         assert!(policy.tracking.ignore.iter().any(|item| item == ".next/**"));
+    }
+
+    #[test]
+    fn session_policy_declares_tts_contract() {
+        let policy = WorkspacePolicy::for_session();
+        assert_eq!(policy.workspace.kind, WorkspacePolicyKind::Session);
+        assert_eq!(
+            policy
+                .artifacts
+                .entries
+                .get("primary_audio")
+                .map(String::as_str),
+            Some("*.mp3")
+        );
+        let task = policy.spawn_tasks.get("fm_tts").expect("fm_tts contract");
+        assert_eq!(task.artifact.as_deref(), Some("primary_audio"));
+        assert!(
+            task.on_complete
+                .iter()
+                .any(|action| action == "send_file:$artifact")
+        );
     }
 }

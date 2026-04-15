@@ -16,6 +16,7 @@ use super::auth_handlers;
 use super::frps_plugin;
 use super::handlers;
 use super::metrics;
+use super::purge;
 use super::static_files;
 use super::user_admin;
 use super::webhook_proxy;
@@ -96,6 +97,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/status", get(handlers::session_status))
         .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
         .route("/api/sessions/{id}/files", get(handlers::session_files))
+        .route(
+            "/api/sessions/{id}/workspace-contract",
+            get(handlers::session_workspace_contract),
+        )
         .route("/api/sessions/{id}", delete(handlers::delete_session))
         .route("/api/status", get(handlers::status));
 
@@ -163,6 +168,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(auth_handlers::my_sub_accounts),
         )
         .route(
+            "/api/my/profile/accounts",
+            post(auth_handlers::create_my_sub_account),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}",
+            get(auth_handlers::my_sub_account),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}",
+            put(auth_handlers::update_my_sub_account),
+        )
+        .route(
             "/api/my/profile/accounts/{id}/start",
             post(auth_handlers::start_my_sub_gateway),
         )
@@ -186,6 +203,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/profiles/{id}", get(admin::get_profile))
         .route("/api/admin/profiles/{id}", put(admin::update_profile))
         .route("/api/admin/profiles/{id}", delete(admin::delete_profile))
+        .route(
+            "/api/admin/profiles/{id}/purge",
+            post(purge::purge_profile_handler),
+        )
+        .route(
+            "/api/admin/profiles/by-node/{node_name}/purge",
+            post(purge::purge_by_node_handler),
+        )
         .route("/api/admin/profiles/{id}/start", post(admin::start_gateway))
         .route("/api/admin/profiles/{id}/stop", post(admin::stop_gateway))
         .route(
@@ -240,8 +265,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // User management
         .route("/api/admin/users", get(user_admin::list_users))
-        .route("/api/admin/users", post(user_admin::create_user))
         .route("/api/admin/users/{id}", delete(user_admin::delete_user))
+        .route(
+            "/api/admin/allowed-emails",
+            get(user_admin::list_allowed_emails),
+        )
+        .route(
+            "/api/admin/allowed-emails",
+            post(user_admin::add_allowed_email),
+        )
+        .route(
+            "/api/admin/allowed-emails/{email}",
+            delete(user_admin::delete_allowed_email),
+        )
         // Session & cron diagnostics
         .route(
             "/api/admin/profiles/{id}/sessions",
@@ -755,6 +791,7 @@ mod tests {
             profile_store: None,
             process_manager: None,
             user_store: None,
+            allowlist_store: None,
             auth_manager: None,
             http_client: reqwest::Client::new(),
             config_path: None,
@@ -762,6 +799,7 @@ mod tests {
             alerts_enabled: None,
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(store),
+            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
             frps_server: Some("127.0.0.1".into()),
             frps_port: Some(7000),
