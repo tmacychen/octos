@@ -34,6 +34,7 @@ use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
 use crate::commands::{load_prompt, resolve_data_dir};
+use octos_core::MAIN_PROFILE_ID;
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
