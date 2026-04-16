@@ -7,6 +7,15 @@ conftest.py 中的 fixture 对同目录下所有测试文件自动生效。
 
 import time
 import pytest
+import asyncio
+
+
+@pytest.fixture
+def event_loop():
+    """Create an instance of the default event loop for each test case."""
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
 
 
 @pytest.fixture(autouse=True)

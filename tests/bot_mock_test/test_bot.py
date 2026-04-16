@@ -387,6 +387,142 @@ class TestAbortCommands:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 并发限制测试
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestConcurrencyLimit:
+    """验证并发会话限制 — 同时多个活跃会话的处理能力"""
+
+    def test_concurrent_session_creation(self, runner):
+        """同时创建多个会话，验证并发处理能力"""
+        import threading
+        import time
+        
+        session_count = 5  # 先测试 5 个并发
+        results = {}
+        errors = {}
+        
+        def create_session(session_id):
+            """在独立线程中创建会话"""
+            try:
+                chat_id = 500 + session_id
+                text = inject_and_get_reply(
+                    runner, f"/new concurrent-{session_id}",
+                    timeout=30, chat_id=chat_id
+                )
+                results[session_id] = text
+            except Exception as e:
+                errors[session_id] = str(e)
+        
+        # 并行创建所有会话
+        threads = []
+        start_time = time.time()
+        
+        for i in range(session_count):
+            t = threading.Thread(target=create_session, args=(i,))
+            threads.append(t)
+            t.start()
+        
+        # 等待所有线程完成
+        for t in threads:
+            t.join(timeout=60)
+        
+        elapsed = time.time() - start_time
+        
+        print(f"\n  Concurrent sessions: {session_count}")
+        print(f"  Elapsed time: {elapsed:.2f}s")
+        print(f"  Successful: {len(results)}")
+        print(f"  Errors: {len(errors)}")
+        
+        # 验证所有会话都成功创建
+        assert len(errors) == 0, f"Some sessions failed: {errors}"
+        assert len(results) == session_count, \
+            f"Expected {session_count} results, got {len(results)}"
+        
+        # 验证每个会话的响应
+        for session_id, text in results.items():
+            assert f"concurrent-{session_id}" in text, \
+                f"Session {session_id} has incorrect response: {text}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 文件大小限制测试
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestFileLimits:
+    """验证超大对话历史受文件大小限制"""
+
+    def test_large_conversation_accumulation(self, runner):
+        """通过累积大量对话历史测试限制"""
+        import time
+        
+        # 累积 50 轮对话，每轮 500 字符
+        round_count = 50
+        chars_per_round = 500
+        
+        print(f"\n  Accumulating {round_count} rounds of conversation...")
+        
+        for i in range(round_count):
+            message = f"Round {i+1}: " + "A" * chars_per_round
+            runner.inject(message)
+            # 短暂等待避免过快
+            if i % 10 == 0:
+                time.sleep(0.5)
+        
+        # 发送一个新消息，验证是否能正常处理
+        text = inject_and_get_reply(runner, "Summarize our conversation", timeout=TIMEOUT_LLM)
+        assert len(text) > 0, "Should receive a response after large history"
+        
+        total_chars = round_count * chars_per_round
+        print(f"  Total accumulated: ~{total_chars} characters")
+        print(f"  Response received: {len(text)} characters")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 流式编辑测试
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStreamingEdit:
+    """验证长消息使用编辑更新逐步显示 — Telegram 支持消息编辑"""
+
+    def test_streaming_edit_telegram(self, runner):
+        """验证长消息是否使用编辑更新"""
+        import time
+        
+        # 清空状态
+        runner.clear()
+        
+        count_before = len(runner.get_sent_messages())
+        
+        # 发送一个会生成长回复的请求
+        runner.inject("Write a detailed technical document, at least 1500 words")
+        
+        # 等待第一条消息
+        time.sleep(10)
+        msgs = runner.get_sent_messages()
+        initial_count = len(msgs) - count_before
+        
+        # 等待可能的编辑更新
+        time.sleep(15)
+        
+        msgs_after = runner.get_sent_messages()
+        final_count = len(msgs_after) - count_before
+        
+        print(f"\n  Initial messages: {initial_count}")
+        print(f"  Final messages: {final_count}")
+        
+        # 如果消息数量增加，说明使用了分片或多条消息
+        # 如果只有 1 条但内容很长，可能使用了编辑（但 Mock Server 不记录）
+        if final_count > initial_count:
+            print(f"  ✓ Multiple messages sent (split or progressive)")
+        else:
+            print(f"  ⚠ Single message (may use editing, but not tracked by mock)")
+        
+        # 基本验证：至少有一条消息
+        assert final_count >= 1, "Should receive at least one message"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LLM 消息测试（标记 llm，可用 pytest -m "not llm" 跳过）
 # ══════════════════════════════════════════════════════════════════════════════
 

@@ -79,6 +79,7 @@ class MockTelegramServer:
             "supports_inline_queries": False,
         }
         self._commands_registered = []
+        self._edit_history: list[dict] = []  # Record all edit operations for testing
         
     def _setup_routes(self):
         """Set up FastAPI routes"""
@@ -233,6 +234,19 @@ class MockTelegramServer:
         async def edit_message_text(token: str, request: Request):
             """Edit a message"""
             data = await request.json()
+            
+            # Record edit operation for testing
+            import time
+            edit_record = {
+                "message_id": data.get("message_id"),
+                "chat_id": data.get("chat_id"),
+                "text": data.get("text", ""),
+                "timestamp": time.time(),
+            }
+            self._edit_history.append(edit_record)
+            
+            logger.info(f"✏️ Message edited: {data.get('text', '')[:50]}...")
+            
             return {
                 "ok": True,
                 "result": {
@@ -458,8 +472,17 @@ class MockTelegramServer:
         """Clear all stored updates and messages"""
         self._updates.clear()
         self._sent_messages.clear()
+        self._edit_history.clear()
         # 注意：不重置 _next_update_id
         # bot 的长轮询基于 update_id offset，重置会导致新消息被 bot 忽略
+    
+    def get_edit_history(self) -> list[dict]:
+        """Get all message edit operations (for testing)"""
+        return self._edit_history.copy()
+    
+    def clear_edit_history(self):
+        """Clear edit history"""
+        self._edit_history.clear()
     
     def get_last_message(self) -> SentMessage | None:
         """Get the most recent message sent by the bot"""
