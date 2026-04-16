@@ -19,7 +19,7 @@ from test_helpers import inject_and_get_reply
 # ── 超时配置 ──────────────────────────────────────────────────────────────────
 TIMEOUT_COMMAND = 30   # 本地命令，无需 LLM (增加到 30s 以应对多语言处理)
 TIMEOUT_LLM     = 90   # 需要调用 LLM API (增加到 90s 以应对网络延迟和 stream edit 问题)
-TIMEOUT_ABORT   = 60   # Abort 命令需要更长时间（LLM 可能正在生成长文本）
+TIMEOUT_ABORT   = 120  # Abort 命令需要更长时间（LLM 生成长文本 + 流式编辑）
 TIMEOUT_LARGE   = 180  # 大对话累积测试需要极长时间（25KB 上下文）
 
 
