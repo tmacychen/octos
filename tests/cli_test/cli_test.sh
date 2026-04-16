@@ -1,17 +1,42 @@
 #!/usr/bin/env bash
-# Octos CLI Automated Test Script
-# For Linux/macOS
+# Octos CLI Automated Test Script — invoked by run_tests.sh
+#
+# Do NOT run this script directly. Use:
+#   tests/run_tests.sh --test cli [args...]
+#
+# CLI test arguments:
+#   -v, --verbose       Verbose output
+#   -o, --output-dir    Output directory (default: test-results)
+#   -c, --config        Test config file (default: cli_test/test_cases.json)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/test_cases.json"
 
+# ── Must be invoked from run_tests.sh ────────────────────────────────────────
+if [[ -z "${OCTOS_TEST_DIR:-}" ]]; then
+    echo ""
+    echo -e "\033[0;31m  ❌ This script cannot be run directly.\033[0m"
+    echo ""
+    echo "  Please use the unified test runner:"
+    echo ""
+    echo "    tests/run_tests.sh --test cli [args...]"
+    echo ""
+    echo "  Available args: -v | -o <dir> | -c <file>"
+    echo ""
+    exit 1
+fi
+
 # Default values
 OCTOS_BINARY="octos"
 OUTPUT_DIR="test-results"
 VERBOSE=false
 CANCELLED=false
+
+# Unified test runner presets
+TEST_DIR="${OCTOS_TEST_DIR:-/tmp/octos_test}"
+LOG_DIR="${OCTOS_LOG_DIR:-$TEST_DIR/logs}"
 
 # Counters
 TOTAL=0
@@ -25,7 +50,6 @@ declare -a RESULTS=()
 TEST_DATE=$(date '+%Y-%m-%d %H:%M:%S')
 REPORT_DATE=$(date '+%Y-%m-%d_%H%M')
 LOG_FILE=""
-TEST_DIR=""
 CURRENT_CATEGORY=""
 
 # Colors (if terminal supports)
@@ -47,19 +71,13 @@ fi
 
 usage() {
     cat << EOF
-Usage: $0 [OPTIONS]
+Do NOT run directly. Use:
+  tests/run_tests.sh --test cli [args...]
 
-Options:
-    -b, --binary NAME       Octos binary name (default: octos)
+Arguments:
+    -v, --verbose           Verbose output
     -o, --output-dir DIR    Output directory (default: test-results)
     -c, --config FILE       Test config file (default: test_cases.json)
-    -v, --verbose           Verbose output
-    -h, --help              Show this help message
-
-Examples:
-    $0                                    # Run with defaults
-    $0 -v                                  # Verbose output
-    $0 -b ./target/release/octos -v       # Custom binary with verbose
 EOF
 }
 
@@ -74,12 +92,6 @@ verbose_log() {
     log "$msg"
     if [[ "$VERBOSE" == true ]]; then
         echo -e "${GRAY}[$msg]${NC}"
-    fi
-}
-
-cleanup() {
-    if [[ -n "${TEST_DIR:-}" ]] && [[ -d "$TEST_DIR" ]]; then
-        rm -rf "$TEST_DIR"
     fi
 }
 
@@ -133,15 +145,15 @@ run_cli_test() {
     verbose_log "[EXEC] octos $cmd_args"
 
     local stdout stderr exit_code
-    if timeout "$timeout" bash -c "\"$OCTOS_BINARY\" $cmd_args" > /tmp/octos_stdout_$$.txt 2> /tmp/octos_stderr_$$.txt; then
+    if timeout "$timeout" bash -c "\"$OCTOS_BINARY\" $cmd_args" > "$TEMP_DIR/octos_stdout_$$.txt" 2> "$TEMP_DIR/octos_stderr_$$.txt"; then
         exit_code=0
     else
         exit_code=$?
     fi
 
-    stdout=$(cat /tmp/octos_stdout_$$.txt 2>/dev/null || echo "")
-    stderr=$(cat /tmp/octos_stderr_$$.txt 2>/dev/null || echo "")
-    rm -f /tmp/octos_stdout_$$.txt /tmp/octos_stderr_$$.txt
+    stdout=$(cat "$TEMP_DIR/octos_stdout_$$.txt" 2>/dev/null || echo "")
+    stderr=$(cat "$TEMP_DIR/octos_stderr_$$.txt" 2>/dev/null || echo "")
+    rm -f "$TEMP_DIR/octos_stdout_$$.txt" "$TEMP_DIR/octos_stderr_$$.txt"
 
     local actual="$stdout$stderr"
     local passed=false
@@ -354,15 +366,12 @@ main() {
         esac
     done
 
-    # Setup directories
+    # Setup directories — use unified test directory
     mkdir -p "$OUTPUT_DIR"
-    LOGS_DIR="${OUTPUT_DIR}/logs"
-    mkdir -p "$LOGS_DIR"
-    LOG_FILE="${LOGS_DIR}/test_$(date '+%Y%m%d_%H%M').log"
-
-    TEST_DIR=$(mktemp -d)
     TEMP_DIR="${TEST_DIR}/temp"
     mkdir -p "$TEMP_DIR"
+
+    LOG_FILE="$LOG_DIR/cli_test.log"
 
     echo -e "${CYAN}========================================${NC}"
     echo -e "${CYAN}Octos CLI Automated Test${NC}"
@@ -381,11 +390,13 @@ main() {
     log ""
 
     # Check if binary exists
-    if ! command -v "$OCTOS_BINARY" &> /dev/null; then
-        echo -e "${RED}[ERROR] Binary not found: $OCTOS_BINARY${NC}"
-        echo -e "${YELLOW}Please run: cargo build --all-features${NC}"
-        log "[ERROR] Binary not found: $OCTOS_BINARY"
-        exit 1
+    if [[ ! -x "$OCTOS_BINARY" ]]; then
+        if ! command -v "$OCTOS_BINARY" &> /dev/null; then
+            echo -e "${RED}[ERROR] Binary not found: $OCTOS_BINARY${NC}"
+            echo -e "${YELLOW}Please run: tests/run_tests.sh --test cli${NC}"
+            log "[ERROR] Binary not found: $OCTOS_BINARY"
+            exit 1
+        fi
     fi
 
     echo -e "${GRAY}Test workspace: $TEST_DIR${NC}"
@@ -459,9 +470,6 @@ main() {
 
     log "========================================"
     log "SUMMARY: Total=$TOTAL Passed=$PASSED Failed=$FAILED PassRate=${pass_rate}%"
-
-    # Cleanup
-    cleanup
 
     # Remove cancel handler
     trap - SIGINT SIGTERM
