@@ -476,32 +476,31 @@ class TestConcurrencyLimit:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestFileLimits:
-    """验证会话文件大小限制 (10MB)"""
+    """验证会话文件大小限制 (10MB 累计)
+    
+    根据 octos-bus/src/session.rs:
+    - MAX_SESSION_FILE_SIZE = 10 MB
+    - 这是整个会话文件的累计大小限制，不是单条消息限制
+    - 达到限制后，新消息不再保存到磁盘（但仍可响应）
+    """
 
     @pytest.mark.slow
     def test_large_message_handling(self, runner):
-        """验证 octos 处理大消息的能力
+        """验证 octos 能处理较大的单条消息
         
-        根据 octos-bus/src/session.rs:
-        const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;  // 10 MB
-        
-        测试策略：
-        1. 发送一个较大的消息（1MB）
-        2. 观察 octos 是否正常处理
-        3. 如果正常，说明限制可能更高或只在文件加载时检查
-        
-        注意：标记为 @pytest.mark.slow，因为需要传输大量数据
+        注意：octos 对单条消息没有明确的大小限制，
+        限制的是整个会话文件的累计大小（10MB）。
+        此测试验证 octos 能正常处理 1MB 级别的消息。
         """
         import time
         
-        # 生成 1MB 的消息（合理的大小，不会太慢）
+        # 生成 1MB 的消息
         message_size = 1 * 1024 * 1024  # 1MB
         large_message = "A" * message_size
         
-        print(f"\n  Sending {message_size / (1024*1024):.1f}MB message...")
+        print(f"\n  Sending {message_size / (1024*1024):.1f}MB single message...")
         start_time = time.time()
         
-        # 发送大消息
         try:
             text = inject_and_get_reply(runner, large_message, timeout=TIMEOUT_COMMAND)
             elapsed = time.time() - start_time
@@ -523,8 +522,11 @@ class TestFileLimits:
         
         测试策略：
         1. 发送多条中等大小的消息（100KB each）
-        2. 验证会话仍然正常工作
-        3. 不测试真正的 10MB 限制（太慢），而是验证累积不会导致崩溃
+        2. 累积到约 1MB 总量
+        3. 验证会话仍然正常工作
+        
+        注意：此测试不达到真正的 10MB 限制（太慢），
+        而是验证累积过程不会导致崩溃。
         """
         import time
         
@@ -533,6 +535,7 @@ class TestFileLimits:
         message_size = 100 * 1024  # 100KB per message
         
         print(f"\n  Accumulating {message_count} messages of {message_size / 1024:.0f}KB each...")
+        print(f"  Total: ~{message_count * message_size / (1024*1024):.1f}MB")
         
         for i in range(message_count):
             message = f"Message {i+1}: " + "B" * (message_size - 20)
