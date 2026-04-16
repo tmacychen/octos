@@ -57,9 +57,11 @@ class MockTelegramServer:
     Implements the most common endpoints used by the octos bot.
     """
     
-    def __init__(self, host: str = "127.0.0.1", port: int = 5000):
+    def __init__(self, host: str = "127.0.0.1", port: int = 5000, 
+                 max_message_length: int = 4096):
         self.host = host
         self.port = port
+        self.max_message_length = max_message_length  # Telegram limit: 4096 chars
         self.app = FastAPI(title="Telegram Mock API")
         self._setup_routes()
         
@@ -123,6 +125,14 @@ class MockTelegramServer:
             
             if not chat_id:
                 raise HTTPException(status_code=400, detail="chat_id is required")
+            
+            # Check message length limit (simulate Telegram's 4096 char limit)
+            if len(text) > self.max_message_length:
+                logger.warning(f"⚠️ Message too long: {len(text)} > {self.max_message_length}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Message is too long. Maximum length is {self.max_message_length} characters, got {len(text)}"
+                )
             
             message_id = self._next_update_id + 1000
             self._sent_messages.append(SentMessage(
