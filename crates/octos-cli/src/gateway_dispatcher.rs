@@ -549,7 +549,7 @@ impl GatewayDispatcher {
         if cmd != "/soul" && !cmd.starts_with("/soul ") {
             return None;
         }
-        let base_data_dir = match &self.data_dir {
+        let data_dir = match &self.data_dir {
             Some(d) => d,
             None => {
                 let _ = self
@@ -564,27 +564,10 @@ impl GatewayDispatcher {
             }
         };
 
-        // Per-user soul storage: {data_dir}/users/{chat_id}/soul.md
-        let user_data_dir = base_data_dir.join("users").join(reply_chat_id);
-        
-        // Ensure the user directory exists
-        if let Err(e) = std::fs::create_dir_all(&user_data_dir) {
-            warn!("failed to create user data dir {:?}: {}", user_data_dir, e);
-            let _ = self
-                .out_tx
-                .send(make_reply(
-                    reply_channel,
-                    reply_chat_id,
-                    format!("Failed to create user directory: {e}"),
-                ))
-                .await;
-            return Some(DispatchResult::Handled);
-        }
-
         let arg = cmd.strip_prefix("/soul").unwrap_or("").trim();
 
         if arg.is_empty() || arg.eq_ignore_ascii_case("show") {
-            let reply = match crate::soul_service::read_soul(&user_data_dir) {
+            let reply = match crate::soul_service::read_soul(data_dir) {
                 Some(content) => format!("🪶 Current soul:\n\n{content}"),
                 None => "No custom soul set. Using default.".to_string(),
             };
@@ -593,7 +576,7 @@ impl GatewayDispatcher {
                 .send(make_reply(reply_channel, reply_chat_id, reply))
                 .await;
         } else if arg.eq_ignore_ascii_case("reset") {
-            match crate::soul_service::remove_soul(&user_data_dir) {
+            match crate::soul_service::remove_soul(data_dir) {
                 Ok(()) => {
                     let _ = self
                         .out_tx
@@ -617,9 +600,9 @@ impl GatewayDispatcher {
                 }
             }
         } else {
-            match crate::soul_service::write_soul(&user_data_dir, arg) {
+            match crate::soul_service::write_soul(data_dir, arg) {
                 Ok(()) => {
-                    info!(soul_len = arg.len(), chat_id = reply_chat_id, "user soul updated");
+                    info!(soul_len = arg.len(), "user soul updated");
                     let _ = self
                         .out_tx
                         .send(make_reply(
