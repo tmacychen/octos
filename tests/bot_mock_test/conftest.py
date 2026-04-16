@@ -15,6 +15,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "llm: marks tests that require LLM API calls (may be slow)"
     )
+    config.addinivalue_line(
+        "markers", "slow: marks tests that are slow (large data transfer, etc.)"
+    )
 
 
 @pytest.fixture
