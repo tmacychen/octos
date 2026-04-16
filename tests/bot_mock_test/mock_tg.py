@@ -233,15 +233,39 @@ class MockTelegramServer:
         @app.api_route("/bot{token}/EditMessageText", methods=["GET", "POST"])
         async def edit_message_text(token: str, request: Request):
             """Edit a message"""
+            # Log raw request for debugging
+            logger.info(f"✏️ Edit request received - method={request.method}, url={request.url}")
+            
+            # Try to parse as JSON first
             try:
                 data = await request.json()
+                logger.info(f"✏️ Parsed as JSON: chat_id={data.get('chat_id')}, message_id={data.get('message_id')}")
             except Exception as e:
-                logger.error(f"✏️ Failed to parse edit request: {e}")
-                raise HTTPException(status_code=400, detail="Invalid JSON")
+                logger.warning(f"✏️ Not JSON, trying form data: {e}")
+                # Try form data
+                try:
+                    form_data = await request.form()
+                    data = dict(form_data)
+                    logger.info(f"✏️ Parsed as form data: chat_id={data.get('chat_id')}, message_id={data.get('message_id')}")
+                except Exception as e2:
+                    logger.error(f"✏️ Failed to parse request: {e2}")
+                    raise HTTPException(status_code=400, detail="Invalid request format")
             
             chat_id = data.get("chat_id")
             message_id = data.get("message_id")
             text = data.get("text", "")
+            
+            # Convert types if needed (teloxide might send integers)
+            if isinstance(chat_id, str):
+                try:
+                    chat_id = int(chat_id)
+                except ValueError:
+                    pass
+            if isinstance(message_id, str):
+                try:
+                    message_id = int(message_id)
+                except ValueError:
+                    pass
             
             # Validate required fields
             if not chat_id or not message_id:
@@ -261,13 +285,25 @@ class MockTelegramServer:
             }
             self._edit_history.append(edit_record)
             
-            logger.info(f"✏️ Message edited: chat_id={chat_id}, message_id={message_id}, text={text[:50]}...")
+            logger.info(f"✏️ Message edited successfully: chat_id={chat_id}, message_id={message_id}")
             
+            # Return a full Message object as per Telegram Bot API spec
+            import time
             return {
                 "ok": True,
                 "result": {
                     "message_id": message_id,
-                    "chat": {"id": chat_id},
+                    "from": {
+                        "id": 123456789,
+                        "is_bot": True,
+                        "first_name": "Octos Test Bot",
+                        "username": "octos_test_bot"
+                    },
+                    "chat": {
+                        "id": chat_id,
+                        "type": "private"
+                    },
+                    "date": int(time.time()),
                     "text": text,
                 }
             }
