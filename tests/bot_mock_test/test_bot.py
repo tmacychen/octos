@@ -556,6 +556,115 @@ class TestFileLimits:
         print(f"  ✓ Session stable after {message_count} messages ({message_count * message_size / (1024*1024):.1f}MB total)")
         assert len(final_text) > 0
 
+    @pytest.mark.slow
+    def test_session_file_size_limit_enforcement(self, runner):
+        """验证会话文件达到 10MB 限制后的行为
+        
+        根据 octos-bus/src/session.rs:
+        const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;  // 10 MB
+        
+        测试策略：
+        1. 使用专用的 chat_id (999) 避免干扰其他测试
+        2. 累积消息直到接近 10MB
+        3. 检查磁盘上的会话文件大小
+        4. 验证超过限制后 octos 仍能响应（但不保存）
+        
+        注意：这是一个慢测试，标记为 @pytest.mark.slow
+        """
+        import os
+        import time
+        
+        # 使用专用 chat_id 避免干扰
+        test_chat_id = 999
+        session_name = "size-limit-test"
+        
+        # 先创建新会话
+        init_text = inject_and_get_reply(
+            runner, f"/new {session_name}",
+            timeout=TIMEOUT_COMMAND,
+            chat_id=test_chat_id
+        )
+        assert session_name in init_text
+        print(f"\n  Created session: {session_name}")
+        
+        # 计算需要发送的消息数量以达到 ~10MB
+        # 每条消息约 500KB（包含 JSON 序列化开销）
+        message_size = 500 * 1024  # 500KB per message
+        target_messages = 22  # 22 * 500KB ≈ 11MB（超过 10MB 限制）
+        
+        print(f"  Sending {target_messages} messages of {message_size / 1024:.0f}KB each...")
+        print(f"  Target: ~{target_messages * message_size / (1024*1024):.1f}MB total")
+        
+        session_file_path = None
+        
+        for i in range(target_messages):
+            message = f"Size test message {i+1}: " + "X" * (message_size - 30)
+            
+            try:
+                text = inject_and_get_reply(
+                    runner, message,
+                    timeout=TIMEOUT_COMMAND,
+                    chat_id=test_chat_id
+                )
+                
+                # 每 5 条消息检查一次文件大小
+                if (i + 1) % 5 == 0:
+                    current_mb = (i + 1) * message_size / (1024 * 1024)
+                    print(f"    Progress: {i+1}/{target_messages} messages (~{current_mb:.1f}MB)")
+                    
+                    # 尝试找到会话文件并检查大小
+                    if session_file_path is None:
+                        # 查找会话文件
+                        sessions_dir = os.path.expanduser("~/.octos/users")
+                        user_dir_pattern = f"_main%3Atelegram%3A{test_chat_id}"
+                        
+                        for entry in os.listdir(sessions_dir):
+                            if user_dir_pattern in entry:
+                                session_file_path = os.path.join(
+                                    sessions_dir, entry, "sessions", f"{session_name}.jsonl"
+                                )
+                                break
+                    
+                    if session_file_path and os.path.exists(session_file_path):
+                        file_size_mb = os.path.getsize(session_file_path) / (1024 * 1024)
+                        print(f"    Session file size: {file_size_mb:.2f}MB")
+                        
+                        # 如果已经超过 10MB，记录但继续
+                        if file_size_mb > 10:
+                            print(f"    ⚠️  File exceeded 10MB limit!")
+                
+                # 短暂等待，避免过快
+                if i < target_messages - 1:
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                print(f"  ✗ Failed at message {i+1}: {type(e).__name__}: {str(e)[:100]}")
+                # 不立即失败，继续观察后续行为
+        
+        # 最终验证
+        if session_file_path and os.path.exists(session_file_path):
+            final_size_mb = os.path.getsize(session_file_path) / (1024 * 1024)
+            print(f"\n  Final session file size: {final_size_mb:.2f}MB")
+            print(f"  Session file path: {session_file_path}")
+            
+            # 验证文件大小应该在 10MB 左右（可能略超或略低，取决于实现）
+            # octos 应该阻止文件显著超过 10MB
+            assert final_size_mb < 12, \
+                f"Session file too large: {final_size_mb:.2f}MB (expected < 12MB)"
+            
+            print(f"  ✓ Session file size within expected range (< 12MB)")
+        else:
+            print(f"\n  ⚠️  Could not locate session file for verification")
+        
+        # 验证 octos 仍然能响应（即使文件可能达到限制）
+        final_response = inject_and_get_reply(
+            runner, "Final check",
+            timeout=TIMEOUT_COMMAND,
+            chat_id=test_chat_id
+        )
+        assert len(final_response) > 0
+        print(f"  ✓ octos still responds after accumulating ~{target_messages * message_size / (1024*1024):.1f}MB")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 流式编辑测试
