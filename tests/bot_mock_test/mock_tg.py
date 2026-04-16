@@ -236,20 +236,33 @@ class MockTelegramServer:
             # Log raw request for debugging
             logger.info(f"✏️ Edit request received - method={request.method}, url={request.url}")
             
-            # Try to parse as JSON first
+            data = {}
+            
+            # Try to parse as JSON first (POST with JSON body)
             try:
                 data = await request.json()
                 logger.info(f"✏️ Parsed as JSON: chat_id={data.get('chat_id')}, message_id={data.get('message_id')}")
             except Exception as e:
-                logger.warning(f"✏️ Not JSON, trying form data: {e}")
-                # Try form data
+                logger.debug(f"✏️ Not JSON: {e}")
+            
+            # If no JSON, try form data (POST with form-urlencoded)
+            if not data:
                 try:
                     form_data = await request.form()
                     data = dict(form_data)
-                    logger.info(f"✏️ Parsed as form data: chat_id={data.get('chat_id')}, message_id={data.get('message_id')}")
-                except Exception as e2:
-                    logger.error(f"✏️ Failed to parse request: {e2}")
-                    raise HTTPException(status_code=400, detail="Invalid request format")
+                    logger.info(f"✏️ Parsed as form data: keys={list(data.keys())}")
+                except Exception as e:
+                    logger.debug(f"✏️ Not form data: {e}")
+            
+            # If still no data, try query parameters (GET request)
+            if not data:
+                data = dict(request.query_params)
+                if data:
+                    logger.info(f"✏️ Parsed as query params: chat_id={data.get('chat_id')}, message_id={data.get('message_id')}")
+            
+            if not data:
+                logger.error("✏️ No data found in request")
+                raise HTTPException(status_code=400, detail="No data in request")
             
             chat_id = data.get("chat_id")
             message_id = data.get("message_id")
