@@ -383,7 +383,7 @@ except Exception as e:
     export PYTHONPATH="$SCRIPT_DIR"
     export MOCK_BASE_URL="http://127.0.0.1:$MOD_PORT"
 
-    "$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header
+    "$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes
     local test_exit=$?
 
     # ── 9. Cleanup ───────────────────────────────────────────────────────────

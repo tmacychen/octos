@@ -17,7 +17,7 @@ from test_helpers import inject_and_get_reply
 
 # ── 超时配置 ──────────────────────────────────────────────────────────────────
 TIMEOUT_COMMAND = 15   # 本地命令，无需 LLM
-TIMEOUT_LLM     = 30   # 需要调用 LLM API
+TIMEOUT_LLM     = 45   # 需要调用 LLM API (增加到 45s 以应对网络延迟)
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -201,7 +201,7 @@ class TestMultiUser:
 
 @pytest.mark.llm
 class TestLLMMessages:
-    """需要调用 LLM API，超时 TIMEOUT_LLM = 30s"""
+    """需要调用 LLM API，超时 TIMEOUT_LLM = 45s"""
 
     def test_regular_message(self, runner):
         text = inject_and_get_reply(runner, "Hello!", timeout=TIMEOUT_LLM)

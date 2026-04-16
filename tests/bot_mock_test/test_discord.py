@@ -17,7 +17,7 @@ from test_helpers import inject_and_get_reply
 
 # ── 超时配置 ──────────────────────────────────────────────────────────────────
 TIMEOUT_COMMAND = 20   # 本地命令，无需 LLM
-TIMEOUT_LLM     = 40   # 需要调用 LLM API
+TIMEOUT_LLM     = 50   # 需要调用 LLM API (增加到 50s，Discord Gateway 有额外开销)
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ class TestDiscordMultiUser:
 
 @pytest.mark.llm
 class TestDiscordLLMMessages:
-    """需要调用 LLM API，超时 TIMEOUT_LLM = 40s"""
+    """需要调用 LLM API，超时 TIMEOUT_LLM = 50s"""
 
     def test_regular_message(self, runner):
         """普通英文消息触发 LLM 回复"""

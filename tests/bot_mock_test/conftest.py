@@ -24,3 +24,26 @@ def message_baseline(runner):
             break
         prev = cur
     yield
+
+
+@pytest.fixture(autouse=True)
+def llm_test_setup(request, runner):
+    """为标记了 @pytest.mark.llm 的测试类自动清理状态。
+    
+    只在 TestLLMMessages 和 TestDiscordLLMMessages 类中生效。
+    """
+    # 检查当前测试是否属于 LLM 测试类
+    if hasattr(request.node, 'cls') and request.node.cls is not None:
+        class_name = request.node.cls.__name__
+        if class_name in ('TestLLMMessages', 'TestDiscordLLMMessages'):
+            # 在测试开始前清理状态
+            runner.clear()
+            # 重置到默认会话
+            from test_helpers import inject_and_get_reply
+            # 根据测试文件确定超时时间
+            if 'discord' in str(request.node.fspath):
+                timeout = 20  # Discord TIMEOUT_COMMAND
+            else:
+                timeout = 15  # Telegram TIMEOUT_COMMAND
+            inject_and_get_reply(runner, "/new", timeout=timeout)
+    yield

@@ -50,3 +50,8 @@ class BaseMockRunner:
             return resp.status_code == 200
         except Exception:
             return False
+
+    def clear(self) -> None:
+        """清除 Mock Server 中存储的所有消息和状态"""
+        resp = httpx.post(f"{self.base_url}/_clear", timeout=5)
+        resp.raise_for_status()
