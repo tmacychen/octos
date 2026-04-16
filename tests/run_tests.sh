@@ -233,6 +233,18 @@ if [[ -z "$ACTION" ]] || [[ "$ACTION" == "-h" ]] || [[ "$ACTION" == "--help" ]];
     exit 0
 fi
 
+# ── Validate command early (before building) ─────────────────────────────────
+case "$ACTION" in
+    all|--test)
+        # Valid commands, continue to env check and build
+        ;;
+    *)
+        err "Unknown command: $ACTION"
+        show_help
+        exit 1
+        ;;
+esac
+
 # ── Pre-flight env check ──────────────────────────────────────────────────────
 check_bot_env() {
     local missing=()
@@ -289,11 +301,6 @@ case "$ACTION" in
                 exit 1
                 ;;
         esac
-        ;;
-    *)
-        err "Unknown command: $ACTION"
-        show_help
-        exit 1
         ;;
 esac
 
