@@ -10,6 +10,13 @@ import pytest
 import asyncio
 
 
+def pytest_configure(config):
+    """注册自定义 pytest marks，避免警告。"""
+    config.addinivalue_line(
+        "markers", "llm: marks tests that require LLM API calls (may be slow)"
+    )
+
+
 @pytest.fixture
 def event_loop():
     """Create an instance of the default event loop for each test case."""

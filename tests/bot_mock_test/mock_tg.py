@@ -233,26 +233,42 @@ class MockTelegramServer:
         @app.api_route("/bot{token}/EditMessageText", methods=["GET", "POST"])
         async def edit_message_text(token: str, request: Request):
             """Edit a message"""
-            data = await request.json()
+            try:
+                data = await request.json()
+            except Exception as e:
+                logger.error(f"✏️ Failed to parse edit request: {e}")
+                raise HTTPException(status_code=400, detail="Invalid JSON")
+            
+            chat_id = data.get("chat_id")
+            message_id = data.get("message_id")
+            text = data.get("text", "")
+            
+            # Validate required fields
+            if not chat_id or not message_id:
+                logger.warning(f"✏️ Missing required fields: chat_id={chat_id}, message_id={message_id}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing required fields: chat_id={chat_id}, message_id={message_id}"
+                )
             
             # Record edit operation for testing
             import time
             edit_record = {
-                "message_id": data.get("message_id"),
-                "chat_id": data.get("chat_id"),
-                "text": data.get("text", ""),
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "text": text,
                 "timestamp": time.time(),
             }
             self._edit_history.append(edit_record)
             
-            logger.info(f"✏️ Message edited: {data.get('text', '')[:50]}...")
+            logger.info(f"✏️ Message edited: chat_id={chat_id}, message_id={message_id}, text={text[:50]}...")
             
             return {
                 "ok": True,
                 "result": {
-                    "message_id": data.get("message_id"),
-                    "chat": {"id": data.get("chat_id")},
-                    "text": data.get("text"),
+                    "message_id": message_id,
+                    "chat": {"id": chat_id},
+                    "text": text,
                 }
             }
         
