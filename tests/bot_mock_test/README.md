@@ -50,7 +50,7 @@ tests/bot_mock/
 ├── mock_discord.py         # Mock Discord 服务器 (REST + WebSocket Gateway)
 ├── runner.py               # BotTestRunner: Telegram pytest 辅助工具
 ├── runner_discord.py       # DiscordTestRunner: Discord pytest 辅助工具
-├── test_bot.py             # Telegram 测试用例 (26 个)
+├── test_telegram.py        # Telegram 测试用例 (45 个)
 ├── test_discord.py         # Discord 测试用例 (18 个)
 ├── requirements.txt
 ├── __init__.py
@@ -75,7 +75,7 @@ tests/bot_mock/
 │         ▲                                               │
 │         │  /_inject  /_sent_messages  /_clear           │
 │  ┌─────────────┐                                        │
-│  │ test_bot.py │  (pytest)                               │
+│  │ test_telegram.py │  (pytest)                               │
 │  └─────────────┘                                        │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -238,7 +238,7 @@ TestDiscordLLMMessages               # LLM 消息 (需 ANTHROPIC_API_KEY)
 
 ### 步骤
 
-1. 打开对应的测试文件（Telegram: `test_bot.py`, Discord: `test_discord.py`）
+1. 打开对应的测试文件（Telegram: `test_telegram.py`, Discord: `test_discord.py`）
 2. 在合适的 class 里添加 `test_` 开头的方法
 3. 使用 runner 的 `inject()` 发送消息
 4. 使用 `wait_for_reply()` 等待回复

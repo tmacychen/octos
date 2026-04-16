@@ -16,7 +16,7 @@ set BOT_BIN $PROJECT_ROOT/target/debug/octos
 
 # ── Available modules ─────────────────────────────────────────────────────────
 # Each module: name  alias  mock_port  test_file  feature  mock_class
-set -g MODULES "telegram|tg|5000|test_bot.py|telegram|mock_tg|MockTelegramServer" \
+set -g MODULES "telegram|tg|5000|test_telegram.py|telegram|mock_tg|MockTelegramServer" \
                "discord|dc|5001|test_discord.py|discord|mock_discord|MockDiscordServer"
 
 # ── Colors ───────────────────────────────────────────────────────────────────

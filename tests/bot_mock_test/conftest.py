@@ -59,7 +59,7 @@ def llm_test_setup(request, runner):
             runner.clear()
             # 重置到默认会话
             from test_helpers import inject_and_get_reply
-            # 根据测试文件确定超时时间（与 test_bot.py 中的 TIMEOUT_COMMAND 保持一致）
+            # 根据测试文件确定超时时间（与 test_telegram.py 中的 TIMEOUT_COMMAND 保持一致）
             if 'discord' in str(request.node.fspath):
                 timeout = 30  # Discord TIMEOUT_COMMAND
             else:

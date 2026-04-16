@@ -39,7 +39,7 @@ VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 # ── Available modules ────────────────────────────────────────────────────────
 # Each module: name|alias|port|test_file|feature|mock_module|mock_class
 MODULES=(
-    "telegram|tg|5000|test_bot.py|telegram|mock_tg|MockTelegramServer"
+    "telegram|tg|5000|test_telegram.py|telegram|mock_tg|MockTelegramServer"
     "discord|dc|5001|test_discord.py|discord|mock_discord|MockDiscordServer"
 )
 

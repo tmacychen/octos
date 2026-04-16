@@ -8,7 +8,7 @@ Telegram Bot 集成测试用例
 
 运行方式：
   fish tests/bot_mock/run_test.fish telegram    # 完整测试
-  pytest test_bot.py -v -m "not llm"            # 跳过 LLM 测试
+  pytest test_telegram.py -v -m "not llm"       # 跳过 LLM 测试
 """
 
 import pytest
