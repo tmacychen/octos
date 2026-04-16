@@ -274,26 +274,6 @@ class TestProfileMode:
 class TestMessageSplitting:
     """验证超长消息自动分片 — Telegram API 限制单条消息 4096 字符"""
 
-    def test_telegram_message_length_limit(self, runner):
-        """Mock Server 应拒绝超过 4096 字符的消息"""
-        # 生成 5000 字符的文本（超过 4096 限制）
-        long_text = "A" * 5000
-        
-        count_before = len(runner.get_sent_messages())
-        
-        # 直接调用 Mock Server API 测试长度限制
-        import httpx
-        try:
-            resp = httpx.post(
-                f"{runner.base_url}/_inject_long_message",
-                json={"text": long_text, "chat_id": 123},
-                timeout=5
-            )
-            # 如果 octos 正确处理了分片，应该能成功
-            print(f"\n  Long message handled: status={resp.status_code}")
-        except Exception as e:
-            print(f"\n  Long message test skipped: {e}")
-
     def test_normal_message_within_limit(self, runner):
         """正常长度的消息应能成功发送"""
         # 生成 1000 字符的文本（在限制内）
@@ -670,21 +650,9 @@ class TestFileLimits:
 # 流式编辑测试
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestStreamingEdit:
-    """验证长消息使用编辑更新逐步显示 — Telegram 支持消息编辑"""
-
-    @pytest.mark.skip(reason="Stream edit requires deep teloxide integration debugging - deferred")
-    def test_streaming_edit_telegram(self, runner):
-        """验证长消息是否使用编辑更新
-        
-        注意：此测试当前被跳过，因为需要深入调试 teloxide 集成。
-        当启用时，应该避免触发 LLM 生成长文本，而是使用 Mock 数据。
-        """
-        # TODO: 实现不依赖 LLM 的 stream edit 测试
-        # 可能方案：
-        # 1. Mock LLM 响应，直接返回预定义的长文本
-        # 2. 或者检查 octos 日志中的 edit 操作次数
-        pass
+# TODO: 实现 stream edit 测试
+# 当前 teloxide 集成需要深入调试，暂时跳过
+# 等修复后再添加具体的测试用例
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -693,12 +661,16 @@ class TestStreamingEdit:
 
 @pytest.mark.llm
 class TestLLMMessages:
-    """需要调用 LLM API，超时 TIMEOUT_LLM = 90s"""
+    """Smoke tests for LLM integration — 验证基本连通性"""
 
     def test_regular_message(self, runner):
+        """验证英文消息能收到 LLM 回复"""
         text = inject_and_get_reply(runner, "Hello!", timeout=TIMEOUT_LLM)
-        assert len(text) > 0
+        assert len(text) > 0, "Should receive a response from LLM"
+        print(f"\n  ✓ English message → {text[:50]}...")
 
     def test_chinese_message(self, runner):
+        """验证中文消息能收到 LLM 回复"""
         text = inject_and_get_reply(runner, "你好", timeout=TIMEOUT_LLM)
-        assert len(text) > 0
+        assert len(text) > 0, "Should receive a response from LLM"
+        print(f"\n  ✓ Chinese message → {text[:50]}...")
