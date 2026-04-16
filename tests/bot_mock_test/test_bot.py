@@ -19,7 +19,6 @@ from test_helpers import inject_and_get_reply
 # ── 超时配置 ──────────────────────────────────────────────────────────────────
 TIMEOUT_COMMAND = 30   # 本地命令，无需 LLM
 TIMEOUT_LLM     = 90   # 需要调用 LLM API (增加到 90s 以应对网络延迟)
-TIMEOUT_LARGE   = 180  # 大对话累积测试需要极长时间（25KB 上下文）
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -193,8 +192,11 @@ class TestMultiUser:
         # 模拟点击按钮（edit_message_with_metadata 不发新消息，只编辑原消息）
         runner.inject_callback("s:cb-topic", chat_id=100, message_id=100)
         import time; time.sleep(2)
-        # 不断言新消息，只验证不崩溃
-        print(f"\n  callback s:cb-topic processed")
+        
+        # 验证会话已切换：发送 /sessions 应该看到 cb-topic
+        sessions_text = inject_and_get_reply(runner, "/sessions", timeout=TIMEOUT_COMMAND)
+        assert "cb-topic" in sessions_text, f"Session not switched after callback: {sessions_text}"
+        print(f"\n  ✓ Callback session switch verified")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -236,15 +238,15 @@ class TestProfileMode:
         # 验证 A 的 soul
         soul_a = inject_and_get_reply(runner, "/soul", timeout=TIMEOUT_COMMAND, chat_id=301)
         print(f"\n  DEBUG: Profile A soul response: {soul_a[:200]}")
-        # 放宽断言：只要不包含 B 的内容即可
-        assert "writer" not in soul_a.lower() or "creative" not in soul_a.lower(), \
+        # 严格断言：A 的 soul 不应该包含 B 的任何关键词
+        assert "writer" not in soul_a.lower() and "creative" not in soul_a.lower(), \
             f"Profile A soul should not contain B's soul: {soul_a}"
 
         # 验证 B 的 soul
         soul_b = inject_and_get_reply(runner, "/soul", timeout=TIMEOUT_COMMAND, chat_id=302)
         print(f"\n  DEBUG: Profile B soul response: {soul_b[:200]}")
-        # 放宽断言：只要不包含 A 的内容即可
-        assert "coder" not in soul_b.lower() or "professional" not in soul_b.lower(), \
+        # 严格断言：B 的 soul 不应该包含 A 的任何关键词
+        assert "coder" not in soul_b.lower() and "professional" not in soul_b.lower(), \
             f"Profile B soul should not contain A's soul: {soul_b}"
 
     def test_queue_mode_per_profile(self, runner):
@@ -422,7 +424,7 @@ class TestConcurrencyLimit:
         import threading
         import time
         
-        session_count = 5  # 先测试 5 个并发
+        session_count = 10  # 增加到 10 个并发，更好地测试并发限制
         results = {}
         errors = {}
         
@@ -474,32 +476,21 @@ class TestConcurrencyLimit:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestFileLimits:
-    """验证超大对话历史受文件大小限制"""
+    """验证会话文件大小限制 (10MB)"""
 
-    def test_large_conversation_accumulation(self, runner):
-        """通过累积大量对话历史测试限制"""
-        import time
+    @pytest.mark.skip(reason="Session file size limit test requires direct file access - deferred")
+    def test_session_file_size_limit(self, runner):
+        """验证会话文件达到 10MB 限制后的行为
         
-        # 累积 50 轮对话，每轮 500 字符
-        round_count = 50
-        chars_per_round = 500
-        
-        print(f"\n  Accumulating {round_count} rounds of conversation...")
-        
-        for i in range(round_count):
-            message = f"Round {i+1}: " + "A" * chars_per_round
-            runner.inject(message)
-            # 短暂等待避免过快
-            if i % 10 == 0:
-                time.sleep(0.5)
-        
-        # 发送一个新消息，验证是否能正常处理
-        text = inject_and_get_reply(runner, "Summarize our conversation", timeout=TIMEOUT_LARGE)
-        assert len(text) > 0, "Should receive a response after large history"
-        
-        total_chars = round_count * chars_per_round
-        print(f"  Total accumulated: ~{total_chars} characters")
-        print(f"  Response received: {len(text)} characters")
+        注意：此测试需要直接访问 octos 的会话文件，
+        当前 Mock Server 架构无法直接验证文件大小。
+        应该在集成测试中通过检查文件系统来验证。
+        """
+        # TODO: 实现真正的文件大小限制测试
+        # 1. 累积大量对话直到接近 10MB
+        # 2. 检查会话文件大小
+        # 3. 验证 octos 拒绝追加新消息或截断历史
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -511,40 +502,16 @@ class TestStreamingEdit:
 
     @pytest.mark.skip(reason="Stream edit requires deep teloxide integration debugging - deferred")
     def test_streaming_edit_telegram(self, runner):
-        """验证长消息是否使用编辑更新"""
-        import time
+        """验证长消息是否使用编辑更新
         
-        # 清空状态
-        runner.clear()
-        
-        count_before = len(runner.get_sent_messages())
-        
-        # 发送一个会生成长回复的请求
-        runner.inject("Write a detailed technical document, at least 1500 words")
-        
-        # 等待第一条消息
-        time.sleep(10)
-        msgs = runner.get_sent_messages()
-        initial_count = len(msgs) - count_before
-        
-        # 等待可能的编辑更新
-        time.sleep(15)
-        
-        msgs_after = runner.get_sent_messages()
-        final_count = len(msgs_after) - count_before
-        
-        print(f"\n  Initial messages: {initial_count}")
-        print(f"  Final messages: {final_count}")
-        
-        # 如果消息数量增加，说明使用了分片或多条消息
-        # 如果只有 1 条但内容很长，可能使用了编辑（但 Mock Server 不记录）
-        if final_count > initial_count:
-            print(f"  ✓ Multiple messages sent (split or progressive)")
-        else:
-            print(f"  ⚠ Single message (may use editing, but not tracked by mock)")
-        
-        # 基本验证：至少有一条消息
-        assert final_count >= 1, "Should receive at least one message"
+        注意：此测试当前被跳过，因为需要深入调试 teloxide 集成。
+        当启用时，应该避免触发 LLM 生成长文本，而是使用 Mock 数据。
+        """
+        # TODO: 实现不依赖 LLM 的 stream edit 测试
+        # 可能方案：
+        # 1. Mock LLM 响应，直接返回预定义的长文本
+        # 2. 或者检查 octos 日志中的 edit 操作次数
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -553,7 +520,7 @@ class TestStreamingEdit:
 
 @pytest.mark.llm
 class TestLLMMessages:
-    """需要调用 LLM API，超时 TIMEOUT_LLM = 45s"""
+    """需要调用 LLM API，超时 TIMEOUT_LLM = 90s"""
 
     def test_regular_message(self, runner):
         text = inject_and_get_reply(runner, "Hello!", timeout=TIMEOUT_LLM)

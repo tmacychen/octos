@@ -58,8 +58,8 @@ def llm_test_setup(request, runner):
             from test_helpers import inject_and_get_reply
             # 根据测试文件确定超时时间（与 test_bot.py 中的 TIMEOUT_COMMAND 保持一致）
             if 'discord' in str(request.node.fspath):
-                timeout = 30  # Discord TIMEOUT_COMMAND (已增加)
+                timeout = 30  # Discord TIMEOUT_COMMAND
             else:
-                timeout = 30  # Telegram TIMEOUT_COMMAND (从 15s 增加到 30s)
+                timeout = 30  # Telegram TIMEOUT_COMMAND
             inject_and_get_reply(runner, "/new", timeout=timeout)
     yield
