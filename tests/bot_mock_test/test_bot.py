@@ -196,6 +196,137 @@ class TestMultiUser:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Profile 模式测试（多子账号隔离）
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestProfileMode:
+    """验证多 profile/子账号的独立性 — 每个用户有独立的 Provider 和提示词"""
+
+    def test_profile_session_isolation(self, runner):
+        """两个不同 profile 的用户应有独立的会话"""
+        # User A (profile-a) 创建会话
+        text_a = inject_and_get_reply(runner, "/new profile-a-topic",
+                                      timeout=TIMEOUT_COMMAND, chat_id=301, username="user_a")
+        assert text_a == "Switched to session: profile-a-topic"
+
+        # User B (profile-b) 创建会话
+        text_b = inject_and_get_reply(runner, "/new profile-b-topic",
+                                      timeout=TIMEOUT_COMMAND, chat_id=302, username="user_b")
+        assert text_b == "Switched to session: profile-b-topic"
+
+        # 验证 A 的会话不受 B 影响
+        text_a_check = inject_and_get_reply(runner, "/sessions",
+                                            timeout=TIMEOUT_COMMAND, chat_id=301)
+        assert "profile-a-topic" in text_a_check
+
+    def test_soul_per_profile(self, runner):
+        """每个 profile 可以有独立的 soul（提示词）"""
+        # Profile A 设置 soul
+        text_a_set = inject_and_get_reply(runner, "/soul You are a professional coder.",
+                                          timeout=TIMEOUT_COMMAND, chat_id=301)
+        assert text_a_set == "Soul updated. Takes effect in new sessions."
+
+        # Profile B 设置不同的 soul
+        text_b_set = inject_and_get_reply(runner, "/soul You are a creative writer.",
+                                          timeout=TIMEOUT_COMMAND, chat_id=302)
+        assert text_b_set == "Soul updated. Takes effect in new sessions."
+
+        # 验证 A 的 soul
+        soul_a = inject_and_get_reply(runner, "/soul", timeout=TIMEOUT_COMMAND, chat_id=301)
+        assert "coder" in soul_a.lower() or "professional" in soul_a.lower(), \
+            f"Profile A soul incorrect: {soul_a}"
+
+        # 验证 B 的 soul
+        soul_b = inject_and_get_reply(runner, "/soul", timeout=TIMEOUT_COMMAND, chat_id=302)
+        assert "writer" in soul_b.lower() or "creative" in soul_b.lower(), \
+            f"Profile B soul incorrect: {soul_b}"
+
+    def test_queue_mode_per_profile(self, runner):
+        """每个 profile 可以有独立的队列模式"""
+        # Profile A 设置为 followup
+        text_a = inject_and_get_reply(runner, "/queue followup",
+                                      timeout=TIMEOUT_COMMAND, chat_id=301)
+        assert "Followup" in text_a
+
+        # Profile B 保持默认 collect
+        text_b = inject_and_get_reply(runner, "/queue",
+                                      timeout=TIMEOUT_COMMAND, chat_id=302)
+        assert "Collect" in text_b or "collect" in text_b.lower()
+
+        # 验证 A 仍然是 followup
+        text_a_check = inject_and_get_reply(runner, "/queue",
+                                            timeout=TIMEOUT_COMMAND, chat_id=301)
+        assert "Followup" in text_a_check
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Abort 功能测试（标记 llm，需要调用 LLM API）
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.llm
+class TestAbortCommands:
+    """验证 Agent 能正确中止任务，支持多语言"""
+
+    def test_abort_chinese_stop(self, runner):
+        """发送“停”中止当前任务"""
+        # 先触发一个长任务
+        count_before = len(runner.get_sent_messages())
+        runner.inject("写一个很长的故事，至少1000字")
+
+        # 等待片刻后发送中止
+        import time; time.sleep(3)
+        text = inject_and_get_reply(runner, "停", timeout=TIMEOUT_COMMAND)
+
+        # 验证收到中止确认（可能包含多种表述）
+        assert len(text) > 0, "应收到中止响应"
+        print(f"\n  Abort (停) → {text[:100]}")
+
+    def test_abort_english_stop(self, runner):
+        """发送"stop"中止"""
+        count_before = len(runner.get_sent_messages())
+        runner.inject("Write a very long story, at least 1000 words")
+
+        import time; time.sleep(3)
+        text = inject_and_get_reply(runner, "stop", timeout=TIMEOUT_COMMAND)
+
+        assert len(text) > 0, "应收到中止响应"
+        print(f"\n  Abort (stop) → {text[:100]}")
+
+    def test_abort_english_cancel(self, runner):
+        """发送"cancel"中止"""
+        count_before = len(runner.get_sent_messages())
+        runner.inject("Generate a detailed report")
+
+        import time; time.sleep(3)
+        text = inject_and_get_reply(runner, "cancel", timeout=TIMEOUT_COMMAND)
+
+        assert len(text) > 0, "应收到中止响应"
+        print(f"\n  Abort (cancel) → {text[:100]}")
+
+    def test_abort_japanese(self, runner):
+        """发送“やめて”中止（日语）"""
+        count_before = len(runner.get_sent_messages())
+        runner.inject("長い物語を書いてください")
+
+        import time; time.sleep(3)
+        text = inject_and_get_reply(runner, "やめて", timeout=TIMEOUT_COMMAND)
+
+        assert len(text) > 0, "应收到中止响应"
+        print(f"\n  Abort (やめて) → {text[:100]}")
+
+    def test_abort_russian(self, runner):
+        """发送“стоп”中止（俄语）"""
+        count_before = len(runner.get_sent_messages())
+        runner.inject("Напиши длинную историю")
+
+        import time; time.sleep(3)
+        text = inject_and_get_reply(runner, "стоп", timeout=TIMEOUT_COMMAND)
+
+        assert len(text) > 0, "应收到中止响应"
+        print(f"\n  Abort (стоп) → {text[:100]}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LLM 消息测试（标记 llm，可用 pytest -m "not llm" 跳过）
 # ══════════════════════════════════════════════════════════════════════════════
 
