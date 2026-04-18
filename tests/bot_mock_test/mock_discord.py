@@ -581,6 +581,7 @@ class MockDiscordServer:
         """Return all messages sent by the bot."""
         return [
             {
+                "chat_id": m.channel_id,  # Alias for compatibility with BaseMockRunner
                 "channel_id": m.channel_id,
                 "text": m.content,
                 "message_id": m.message_id,
