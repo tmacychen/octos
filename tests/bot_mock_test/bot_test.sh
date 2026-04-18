@@ -349,7 +349,7 @@ except Exception as e:
 
     export "$EXTRA_ENV_VAR"="$EXTRA_ENV_VAL"
     # octos gateway output to log file only (not stdout)
-    "$BOT_BIN" gateway --config "$CONFIG_FILE" >> "$BOT_LOG" 2>&1 &
+    "$BOT_BIN" gateway --config "$CONFIG_FILE" --data-dir "$TEST_DIR" >> "$BOT_LOG" 2>&1 &
     BOT_PID=$!
     info "Bot PID: $BOT_PID"
 
@@ -405,7 +405,7 @@ except Exception as e:
     export MOCK_BASE_URL="http://127.0.0.1:$MOD_PORT"
 
     # Build pytest command
-    local pytest_cmd=("$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes)
+    local pytest_cmd=("$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes --capture=no)
     
     # If specific test case provided, add it to the command
     if [[ -n "$TEST_CASE" ]]; then

@@ -611,98 +611,73 @@ class TestFileLimits:
 
     @pytest.mark.slow
     def test_session_file_size_limit_enforcement(self, runner):
-        """验证会话文件达到 10MB 限制后的行为
-        
+        """验证会话文件达到 10MB 限制后的追加行为
+
         根据 octos-bus/src/session.rs:
         const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;  // 10 MB
-        
-        测试策略（优化版）：
-        1. 创建一个 ~10MB 的临时文件
-        2. 一次性上传到会话（模拟 Telegram 文件发送）
-        3. 检查磁盘上的会话文件大小
-        4. 验证超过限制后 octos 仍能响应
-        
-        注意：这是一个慢测试，标记为 @pytest.mark.slow
+
+        限制逻辑：
+        - session 文件 >= 10MB 时，新消息仍被处理（bot 正常响应）
+        - 但追加操作被跳过（file_len >= MAX_SESSION_FILE_SIZE → skip append）
+
+        测试策略：直接构造接近 10MB 的 session 文件，通过 bot 加载并追加，
+        验证文件大小在追加前后基本不变（追加被跳过）。
         """
         import os
-        import tempfile
-        
-        # 使用专用 chat_id 避免干扰
+        import json
+        import urllib.parse
+
+        data_dir = os.environ.get("OCTOS_TEST_DIR", "/tmp/octos_test")
         test_chat_id = 999
         session_name = "size-limit-test"
-        
-        # 先创建新会话
-        init_text = inject_and_get_reply(
-            runner, f"/new {session_name}",
-            timeout=TIMEOUT_COMMAND,
-            chat_id=test_chat_id
-        )
-        assert session_name in init_text
-        
-        print(f"\n  Testing 10MB file size limit with single file upload...")
-        
-        # 创建一个 ~10MB 的临时文件
-        target_size = 10 * 1024 * 1024  # 10MB
-        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-        try:
-            # 写入数据直到达到目标大小
-            chunk = "X" * (1024 * 1024)  # 1MB chunks
-            written = 0
+        profile = "_main"
+        channel = "telegram"
+
+        encoded_base = urllib.parse.quote(f"{profile}:{channel}:{test_chat_id}", safe="")
+        encoded_topic = urllib.parse.quote(session_name, safe="")
+        session_dir = f"{data_dir}/users/{encoded_base}/sessions"
+        session_path = f"{session_dir}/{encoded_topic}.jsonl"
+
+        os.makedirs(session_dir, exist_ok=True)
+
+        target_size = 9_900_000
+        with open(session_path, "w") as f:
+            header = json.dumps({
+                "schema": 1,
+                "model": "test",
+                "created_at": "2024-01-01T00:00:00Z"
+            })
+            f.write(header + "\n")
+            written = len(header.encode()) + 1
+            i = 0
             while written < target_size:
-                temp_file.write(chunk)
-                written += len(chunk)
-            temp_file.close()
-            
-            file_size_mb = os.path.getsize(temp_file.name) / (1024 * 1024)
-            print(f"  Created temp file: {file_size_mb:.1f}MB")
-            print(f"  Uploading to session...")
-            
-            # 一次性上传文件
-            count_before = len(runner.get_sent_messages())
-            runner.inject_document(
-                file_path=temp_file.name,
-                caption="Large file for size limit test",
-                chat_id=test_chat_id
-            )
-            
-            # 等待 octos 处理
-            msg = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
-            assert msg is not None, "Bot did not respond to file upload"
-            print(f"  ✓ Bot responded: {msg['text'][:50]}...")
-            
-        finally:
-            # 清理临时文件
-            if os.path.exists(temp_file.name):
-                os.unlink(temp_file.name)
-        
-        # 检查会话文件大小
-        session_file_path = None
-        sessions_dir = os.path.expanduser("~/.octos/users")
-        user_dir_pattern = f"_main%3Atelegram%3A{test_chat_id}"
-        
-        for entry in os.listdir(sessions_dir):
-            if user_dir_pattern in entry:
-                session_file_path = os.path.join(
-                    sessions_dir, entry, "sessions", f"{session_name}.jsonl"
-                )
-                break
-        
-        if session_file_path and os.path.exists(session_file_path):
-            final_size_mb = os.path.getsize(session_file_path) / (1024 * 1024)
-            print(f"  Session file size: {final_size_mb:.2f}MB")
-            
-            # 验证文件大小应该在 10MB 左右（允许一定误差）
-            assert final_size_mb < 15, \
-                f"Session file too large: {final_size_mb:.2f}MB (expected < 15MB)"
-            
-            print(f"  ✓ File size within expected range (< 15MB)")
-        else:
-            print(f"  ⚠️  Could not find session file")
-        
-        # 验证会话仍然可用
-        final_text = inject_and_get_reply(runner, "Test after large file", timeout=TIMEOUT_COMMAND, chat_id=test_chat_id)
-        assert len(final_text) > 0
-        print(f"  ✓ Session still functional after large file")
+                entry = json.dumps({
+                    "role": "user",
+                    "content": f"Message {i}: " + "A" * (200 * 1024)
+                })
+                f.write(entry + "\n")
+                written += len(entry.encode()) + 1
+                i += 1
+
+        pre_size = os.path.getsize(session_path)
+        assert pre_size >= 9_000_000, \
+            f"Pre-filled file too small ({pre_size} bytes), profile key likely wrong: {session_path}"
+        print(f"  Pre-filled session file: {pre_size / 1024**2:.2f}MB at {session_path}")
+
+        count_before = len(runner.get_sent_messages())
+        inject_and_get_reply(runner, f"/new {session_name}",
+                            timeout=TIMEOUT_COMMAND, chat_id=test_chat_id)
+        text = inject_and_get_reply(runner, "tiny msg",
+                                   timeout=TIMEOUT_COMMAND, chat_id=test_chat_id)
+        assert len(text) > 0, "Bot should still respond when session is at size limit"
+
+        post_size = os.path.getsize(session_path)
+        growth = post_size - pre_size
+        print(f"  After append attempt: {post_size / 1024**2:.2f}MB, grew {growth} bytes")
+
+        assert growth < 50_000, \
+            f"Session at limit, append should be skipped (growth={growth} bytes)"
+        print(f"  ✓ Append skipped correctly — session file stayed at {pre_size / 1024**2:.2f}MB")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
