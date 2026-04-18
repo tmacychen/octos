@@ -383,11 +383,11 @@ except Exception as e:
     echo "╚══════════════════════════════════════════════════════════════╝" >> $BOT_LOG
     echo "" >> $BOT_LOG
 
-    # Run tests with output synced to log
+    # Run tests with output synced to log (both stdout and stderr)
     # Use a subshell to ensure clean pipe closure
     begin
         $VENV_PYTHON -m pytest $SCRIPT_DIR/$MOD_TEST_FILE -v --tb=short --no-header
-    end | tee -a $BOT_LOG
+    end > >(tee -a $BOT_LOG) 2> >(tee -a $BOT_LOG >&2)
     set -l TEST_EXIT $pipestatus[1]
 
     # Print test results summary to log
