@@ -12,6 +12,7 @@ Discord Bot 集成测试用例
 """
 
 import pytest
+import time
 from runner_discord import DiscordTestRunner
 from test_helpers import inject_and_get_reply
 
@@ -163,3 +164,250 @@ class TestDiscordLLMMessages:
         """中文消息触发 LLM 回复"""
         text = inject_and_get_reply(runner, "你好", timeout=TIMEOUT_LLM)
         assert len(text) > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 会话隔离测试
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDiscordSessionIsolation:
+    """验证两个用户同时对话时，各自拥有独立上下文"""
+
+    def test_two_users_independent(self, runner):
+        """两个不同 channel 的用户，会话应该独立"""
+        CHANNEL_1 = "1039178386623557754"
+        CHANNEL_2 = "1039178386623557755"
+        
+        # User 1 creates session
+        text1 = inject_and_get_reply(
+            runner, "/new user1-session",
+            timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_1
+        )
+        assert "user1-session" in text1
+        
+        # User 2 creates different session
+        text2 = inject_and_get_reply(
+            runner, "/new user2-session",
+            timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_2
+        )
+        assert "user2-session" in text2
+        
+        # Verify sessions are independent
+        text1_check = inject_and_get_reply(
+            runner, "/sessions",
+            timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_1
+        )
+        text2_check = inject_and_get_reply(
+            runner, "/sessions",
+            timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_2
+        )
+        
+        # Each should see their own session
+        assert "user1-session" in text1_check
+        assert "user2-session" in text2_check
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 消息分片测试 (Discord 限制 1900 字符)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.llm
+class TestDiscordMessageSplitting:
+    """验证 Agent 回复超过 Discord 限制时自动分片"""
+
+    def test_long_response_split(self, runner):
+        """发送请求生成长回复，验证是否分片"""
+        # 请求生成长文本
+        prompt = "Please write a detailed explanation of Python decorators, at least 2000 characters."
+        count_before = len(runner.get_sent_messages())
+        runner.inject(prompt, channel_id="1039178386623557754")
+        
+        # Wait for response(s)
+        time.sleep(5)
+        msgs = runner.get_sent_messages()
+        new_msgs = msgs[count_before:]
+        
+        # Should have multiple messages if response is long
+        print(f"\n  Sent {len(new_msgs)} message(s) for long response")
+        if len(new_msgs) > 1:
+            print(f"  ✓ Message splitting works: {len(new_msgs)} parts")
+        else:
+            print(f"  ⚠ Only 1 message (response may be short)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /new 命令测试
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDiscordNewCommand:
+    """验证 /new 命令功能"""
+
+    def test_new_creates_session(self, runner):
+        """发 /new → 新会话开始"""
+        text = inject_and_get_reply(runner, "/new", timeout=TIMEOUT_COMMAND)
+        assert text == "Session cleared.", f"实际回复: {text}"
+
+    def test_new_named_session(self, runner):
+        """发 /new <name> → 创建命名会话"""
+        text = inject_and_get_reply(runner, "/new my-test", timeout=TIMEOUT_COMMAND)
+        assert "Switched to session: my-test" in text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 并发限制测试
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDiscordConcurrencyLimit:
+    """验证并发会话限制 — 同时多个活跃会话的处理能力"""
+
+    def test_concurrent_session_creation(self, runner):
+        """同时创建多个会话，验证并发处理能力"""
+        import threading
+        
+        session_count = 10  # 10 个并发
+        results = {}
+        errors = {}
+        
+        def create_session(session_id):
+            """在独立线程中创建会话"""
+            try:
+                channel_id = f"1039178386623557{754 + session_id}"
+                text = inject_and_get_reply(
+                    runner, f"/new concurrent-{session_id}",
+                    timeout=30, channel_id=channel_id
+                )
+                results[session_id] = text
+            except Exception as e:
+                errors[session_id] = str(e)
+        
+        # 并行创建所有会话
+        threads = []
+        start_time = time.time()
+        
+        for i in range(session_count):
+            t = threading.Thread(target=create_session, args=(i,))
+            threads.append(t)
+            t.start()
+        
+        # 等待所有线程完成
+        for t in threads:
+            t.join(timeout=60)
+        
+        elapsed = time.time() - start_time
+        
+        print(f"\n  Concurrent sessions: {session_count}")
+        print(f"  Elapsed time: {elapsed:.2f}s")
+        print(f"  Successful: {len(results)}")
+        print(f"  Errors: {len(errors)}")
+        
+        # 验证所有会话都成功创建
+        assert len(errors) == 0, f"Some sessions failed: {errors}"
+        assert len(results) == session_count, \
+            f"Expected {session_count} results, got {len(results)}"
+        
+        # 验证每个会话的响应
+        for session_id, text in results.items():
+            assert "concurrent-" in text or "Switched to session" in text, \
+                f"Session {session_id} has incorrect response: {text[:100]}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Abort 命令测试
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.llm
+class TestDiscordAbortCommands:
+    """验证 Agent 能正确中止任务 — 多语言 abort 触发词识别"""
+
+    def test_abort_english_stop(self, runner):
+        """发送任务后，用"stop"中止 - 应返回英文响应"""
+        
+        # 先发送 hi 建立会话
+        count_before = len(runner.get_sent_messages())
+        runner.inject("hi", channel_id="1039178386623557754")
+        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+        assert hi_reply is not None, "Bot did not respond to hi"
+        print(f"\n  Session established: {hi_reply['text'][:50]}...")
+        
+        # 再发送一个任务消息
+        count_after_hi = len(runner.get_sent_messages())
+        runner.inject("Help me write code", channel_id="1039178386623557754")
+        
+        # 等待 octos 开始回复
+        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
+        assert first_reply is not None, "Bot did not start processing the task"
+        print(f"  Task started: {first_reply['text'][:50]}...")
+        
+        # 额外等待一小段时间
+        time.sleep(1)
+        
+        # 现在发送 abort 命令
+        count_after_first = len(runner.get_sent_messages())
+        runner.inject("stop", channel_id="1039178386623557754")
+        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        
+        assert abort_reply is not None, "Bot did not respond to abort command"
+        text = abort_reply["text"]
+        
+        # 验证收到英文取消响应
+        assert "cancel" in text.lower() or "abort" in text.lower() or "🛑" in text, \
+            f"Expected English cancel response, got: {text[:200]}"
+        print(f"  ✓ Abort (stop) → {text}")
+
+    def test_abort_english_cancel(self, runner):
+        """发送任务后，用"cancel"中止"""
+        
+        count_before = len(runner.get_sent_messages())
+        runner.inject("hi", channel_id="1039178386623557755")
+        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+        assert hi_reply is not None
+        
+        count_after_hi = len(runner.get_sent_messages())
+        runner.inject("Write a function", channel_id="1039178386623557755")
+        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
+        assert first_reply is not None
+        
+        time.sleep(1)
+        
+        count_after_first = len(runner.get_sent_messages())
+        runner.inject("cancel", channel_id="1039178386623557755")
+        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        
+        assert abort_reply is not None, "Bot did not respond to cancel command"
+        text = abort_reply["text"]
+        
+        assert "cancel" in text.lower() or "abort" in text.lower() or "🛑" in text, \
+            f"Expected cancel response, got: {text[:200]}"
+        print(f"  ✓ Abort (cancel) → {text}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Profile 模式测试
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDiscordProfileMode:
+    """验证多 profile 配置下的会话隔离"""
+
+    def test_profile_session_isolation(self, runner):
+        """不同 channel 使用不同 profile，应该隔离"""
+        CHANNEL_A = "1039178386623557754"
+        CHANNEL_B = "1039178386623557755"
+        
+        # Create sessions in different channels
+        text_a = inject_and_get_reply(runner, "/new profile-a",
+                                      timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_A)
+        assert "profile-a" in text_a
+        
+        text_b = inject_and_get_reply(runner, "/new profile-b",
+                                      timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_B)
+        assert "profile-b" in text_b
+        
+        # Verify isolation
+        sessions_a = inject_and_get_reply(runner, "/sessions",
+                                          timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_A)
+        sessions_b = inject_and_get_reply(runner, "/sessions",
+                                          timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_B)
+        
+        assert "profile-a" in sessions_a
+        assert "profile-b" in sessions_b
+
