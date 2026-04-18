@@ -575,12 +575,13 @@ class TestFileLimits:
         assert session_name in init_text
         
         # 计算需要发送的消息数量以达到 ~10MB
-        # 每条消息约 500KB（包含 JSON 序列化开销）
-        message_size = 500 * 1024  # 500KB per message
-        target_messages = 22  # 22 * 500KB ≈ 11MB（超过 10MB 限制）
+        # 每条消息约 100KB（避免触发会话压缩问题）
+        message_size = 100 * 1024  # 100KB per message
+        target_messages = 110  # 110 * 100KB ≈ 11MB（超过 10MB 限制）
         
         print(f"\n  Testing 10MB file size limit...")
         print(f"  Sending {target_messages} messages × {message_size / 1024:.0f}KB")
+        print(f"  Target: ~{target_messages * message_size / (1024 * 1024):.1f}MB total")
         
         session_file_path = None
         
@@ -594,8 +595,8 @@ class TestFileLimits:
                 msg = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
                 assert msg is not None, f"No reply for message {i+1}"
                 
-                # 每 5 条消息检查一次文件大小
-                if (i + 1) % 5 == 0:
+                # 每 10 条消息检查一次文件大小和压缩状态
+                if (i + 1) % 10 == 0:
                     current_mb = (i + 1) * message_size / (1024 * 1024)
                     
                     # 尝试找到会话文件并检查大小
@@ -617,8 +618,8 @@ class TestFileLimits:
                         if file_size_mb > 10:
                             print(f"    ⚠️  Exceeded 10MB limit")
                 else:
-                    # 简化进度输出
-                    if (i + 1) % 2 == 0:
+                    # 简化进度输出（每 5 条显示一次）
+                    if (i + 1) % 5 == 0:
                         print(f"    [{i+1}/{target_messages}] ...", end="\r", flush=True)
                 
                 # 短暂等待，避免过快

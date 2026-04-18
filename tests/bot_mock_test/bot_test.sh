@@ -391,10 +391,8 @@ except Exception as e:
     echo "" >> "$BOT_LOG"
 
     # Run tests with output synced to log (both stdout and stderr)
-    # Use a subshell to ensure clean pipe closure
-    (
-        "$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes
-    ) > >(tee -a "$BOT_LOG") 2> >(tee -a "$BOT_LOG" >&2)
+    # Merge stderr into stdout, then pipe to tee
+    "$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes 2>&1 | tee -a "$BOT_LOG"
     local test_exit=${PIPESTATUS[0]}
 
     # Print test results summary to log

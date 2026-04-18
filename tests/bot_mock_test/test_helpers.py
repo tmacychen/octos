@@ -15,5 +15,8 @@ def inject_and_get_reply(runner, text: str, timeout: int = 15, **inject_kwargs) 
     count_before = len(runner.get_sent_messages())
     runner.inject(text, **inject_kwargs)
     msg = runner.wait_for_reply(count_before=count_before, timeout=timeout)
-    assert msg is not None, f"Bot 未在 {timeout}s 内回复 '{text}'"
+    
+    # Truncate long messages in error output to avoid cluttering logs
+    text_preview = text[:100] + "..." if len(text) > 100 else text
+    assert msg is not None, f"Bot 未在 {timeout}s 内回复 '{text_preview}'"
     return msg["text"]
