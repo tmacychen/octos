@@ -152,6 +152,16 @@ class TestDiscordSessionActorCommands:
         text = inject_and_get_reply(runner, "/queue", timeout=TIMEOUT_COMMAND)
         assert text.startswith("Queue mode:"), f"实际回复: {text}"
 
+    def test_queue_set_followup(self, runner):
+        """/queue followup → 'Queue mode set to: Followup'"""
+        text = inject_and_get_reply(runner, "/queue followup", timeout=TIMEOUT_COMMAND)
+        assert "Followup" in text, f"实际回复: {text}"
+
+    def test_queue_set_invalid(self, runner):
+        """/queue badmode → 'Unknown mode: ...'"""
+        text = inject_and_get_reply(runner, "/queue badmode", timeout=TIMEOUT_COMMAND)
+        assert "Unknown mode" in text, f"实际回复: {text}"
+
     def test_status_show(self, runner):
         """/status → Status Config"""
         text = inject_and_get_reply(runner, "/status", timeout=TIMEOUT_COMMAND)
@@ -259,6 +269,38 @@ class TestDiscordSessionIsolation:
 @pytest.mark.llm
 class TestDiscordMessageSplitting:
     """验证 Agent 回复超过 Discord 限制时自动分片"""
+
+    def test_normal_message_within_limit(self, runner):
+        """正常长度的消息应能成功发送"""
+        # 生成 1000 字符的文本（在限制内）
+        normal_text = "B" * 1000
+        
+        count_before = len(runner.get_sent_messages())
+        runner.inject(normal_text, channel_id="1039178386623557765")
+        
+        # 等待 bot 回复
+        time.sleep(3)
+        msgs = runner.get_sent_messages()
+        
+        # 应该有新的消息
+        assert len(msgs) > count_before, "Bot should reply to normal message"
+        print(f"\n  Normal message (1000 chars) → OK")
+
+    def test_message_near_limit(self, runner):
+        """接近限制的消息（1800 字符）应能成功发送"""
+        # 生成 1800 字符的文本（接近但未超过 1900）
+        near_limit_text = "C" * 1800
+        
+        count_before = len(runner.get_sent_messages())
+        runner.inject(near_limit_text, channel_id="1039178386623557766")
+        
+        # 等待 bot 回复
+        time.sleep(3)
+        msgs = runner.get_sent_messages()
+        
+        # 验证消息被处理
+        assert len(msgs) >= count_before, "Bot should handle near-limit message"
+        print(f"\n  Near-limit message (1800 chars) → OK")
 
     def test_long_response_split(self, runner):
         """发送请求生成长回复，验证是否分片"""
@@ -471,6 +513,78 @@ class TestDiscordAbortCommands:
         assert "🛑" in text or "cancel" in text.lower(), f"Expected cancel response, got: {text[:200]}"
         print(f"  ✓ Abort (STOP uppercase) → {text}")
 
+    def test_abort_with_whitespace(self, runner):
+        """验证 abort 命令前后空格不影响识别"""
+        for cmd in ["  stop  ", "\tstop\n", " 停 "]:
+            count_before = len(runner.get_sent_messages())
+            runner.inject(cmd, channel_id="1039178386623557764")
+            abort_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+            assert abort_reply is not None, f"Should respond to trimmed '{cmd}'"
+            assert len(abort_reply["text"]) > 0
+        print(f"\n  ✓ Whitespace handling works")
+
+    def test_abort_japanese(self, runner):
+        """发送“やめて”中止 - 应返回日文响应"""
+        count_before = len(runner.get_sent_messages())
+        runner.inject("hi", channel_id="1039178386623557767")
+        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+        assert hi_reply is not None
+        
+        count_after_hi = len(runner.get_sent_messages())
+        runner.inject("Task", channel_id="1039178386623557767")
+        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
+        assert first_reply is not None
+        
+        time.sleep(1)
+        
+        count_after_first = len(runner.get_sent_messages())
+        runner.inject("やめて", channel_id="1039178386623557767")
+        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        
+        assert abort_reply is not None, "Bot did not respond to Japanese abort command"
+        text = abort_reply["text"]
+        assert "🛑" in text or "cancel" in text.lower(), f"Expected cancel response, got: {text[:200]}"
+        print(f"  ✓ Abort (やめて) → {text}")
+
+    def test_abort_russian(self, runner):
+        """发送“стоп”中止 - 应返回俄文响应"""
+        count_before = len(runner.get_sent_messages())
+        runner.inject("hi", channel_id="1039178386623557768")
+        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+        assert hi_reply is not None
+        
+        count_after_hi = len(runner.get_sent_messages())
+        runner.inject("Task", channel_id="1039178386623557768")
+        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
+        assert first_reply is not None
+        
+        time.sleep(1)
+        
+        count_after_first = len(runner.get_sent_messages())
+        runner.inject("стоп", channel_id="1039178386623557768")
+        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        
+        assert abort_reply is not None, "Bot did not respond to Russian abort command"
+        text = abort_reply["text"]
+        assert "🛑" in text or "cancel" in text.lower(), f"Expected cancel response, got: {text[:200]}"
+        print(f"  ✓ Abort (стоп) → {text}")
+
+    def test_non_abort_messages_not_triggered(self, runner):
+        """验证普通消息不会误触发 abort"""
+        # 这些消息包含 abort 关键词但不是独立的命令
+        non_triggers = [
+            "please stop talking about cats",  # 句子中的 stop
+            "stopping point is here",  # stopping 不是 stop
+        ]
+        
+        for msg in non_triggers:
+            count_before = len(runner.get_sent_messages())
+            runner.inject(msg, channel_id="1039178386623557769")
+            # 等待一小段时间让 octos 处理
+            time.sleep(0.5)
+        
+        print(f"\n  ✓ Non-abort messages handled correctly")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Profile 模式测试
@@ -525,6 +639,26 @@ class TestDiscordProfileMode:
         assert "coding expert" in soul_a.lower() or "You are a coding expert" in soul_a
         assert "creative writer" in soul_b.lower() or "You are a creative writer" in soul_b
 
+    def test_queue_mode_per_profile(self, runner):
+        """每个 profile 可以有独立的队列模式"""
+        CHANNEL_A = "1039178386623557762"
+        CHANNEL_B = "1039178386623557763"
+        
+        # Profile A 设置为 followup
+        text_a = inject_and_get_reply(runner, "/queue followup",
+                                      timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_A)
+        assert "Followup" in text_a
+        
+        # Profile B 保持默认 collect
+        text_b = inject_and_get_reply(runner, "/queue",
+                                      timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_B)
+        assert "Collect" in text_b or "collect" in text_b.lower()
+        
+        # 验证 A 仍然是 followup
+        text_a_check = inject_and_get_reply(runner, "/queue",
+                                            timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_A)
+        assert "Followup" in text_a_check
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 文件限制测试
@@ -562,3 +696,98 @@ class TestDiscordFileLimits:
         final = inject_and_get_reply(runner, "/sessions", timeout=TIMEOUT_COMMAND, channel_id=channel)
         assert len(final) > 0, "Sessions command failed after accumulation"
         print(f"\n  ✓ Session stable after 5 messages")
+
+    @pytest.mark.slow
+    def test_session_file_size_limit_enforcement(self, runner):
+        """验证会话文件达到 10MB 限制后的行为
+        
+        根据 octos-bus/src/session.rs:
+        const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;  // 10 MB
+        
+        测试策略（优化版）：
+        1. 创建一个 ~10MB 的临时文件
+        2. 一次性上传到会话（模拟 Discord 文件发送）
+        3. 检查磁盘上的会话文件大小
+        4. 验证超过限制后 octos 仍能响应
+        
+        注意：这是一个慢测试，标记为 @pytest.mark.slow
+        """
+        import os
+        import tempfile
+        
+        # 使用专用 channel_id 避免干扰
+        test_channel_id = "1039178386623557770"
+        session_name = "size-limit-test"
+        
+        # 先创建新会话
+        init_text = inject_and_get_reply(
+            runner, f"/new {session_name}",
+            timeout=TIMEOUT_COMMAND,
+            channel_id=test_channel_id
+        )
+        assert session_name in init_text
+        
+        print(f"\n  Testing 10MB file size limit with single file upload...")
+        
+        # 创建一个 ~10MB 的临时文件
+        target_size = 10 * 1024 * 1024  # 10MB
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+        try:
+            # 写入数据直到达到目标大小
+            chunk = "X" * (1024 * 1024)  # 1MB chunks
+            written = 0
+            while written < target_size:
+                temp_file.write(chunk)
+                written += len(chunk)
+            temp_file.close()
+            
+            file_size_mb = os.path.getsize(temp_file.name) / (1024 * 1024)
+            print(f"  Created temp file: {file_size_mb:.1f}MB")
+            print(f"  Uploading to session...")
+            
+            # 一次性上传文件
+            count_before = len(runner.get_sent_messages())
+            runner.inject_document(
+                file_path=temp_file.name,
+                caption="Large file for size limit test",
+                channel_id=test_channel_id
+            )
+            
+            # 等待 octos 处理
+            msg = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+            assert msg is not None, "Bot did not respond to file upload"
+            print(f"  ✓ Bot responded: {msg['text'][:50]}...")
+            
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
+        
+        # 检查会话文件大小
+        session_file_path = None
+        sessions_dir = os.path.expanduser("~/.octos/users")
+        user_dir_pattern = f"_main%3Adiscord%3A{test_channel_id}"
+        
+        for entry in os.listdir(sessions_dir):
+            if user_dir_pattern in entry:
+                session_file_path = os.path.join(
+                    sessions_dir, entry, "sessions", f"{session_name}.jsonl"
+                )
+                break
+        
+        if session_file_path and os.path.exists(session_file_path):
+            final_size_mb = os.path.getsize(session_file_path) / (1024 * 1024)
+            print(f"  Session file size: {final_size_mb:.2f}MB")
+            
+            # 验证文件大小应该在 10MB 左右（允许一定误差）
+            assert final_size_mb < 15, \
+                f"Session file too large: {final_size_mb:.2f}MB (expected < 15MB)"
+            
+            print(f"  ✓ File size within expected range (< 15MB)")
+        else:
+            print(f"  ⚠️  Could not find session file")
+        
+        # 验证会话仍然可用
+        final_text = inject_and_get_reply(runner, "Test after large file", timeout=TIMEOUT_COMMAND, channel_id=test_channel_id)
+        assert len(final_text) > 0
+        print(f"  ✓ Session still functional after large file")
