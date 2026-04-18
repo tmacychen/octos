@@ -390,7 +390,11 @@ except Exception as e:
     echo "╚══════════════════════════════════════════════════════════════╝" >> "$BOT_LOG"
     echo "" >> "$BOT_LOG"
 
-    "$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes | tee -a "$BOT_LOG"
+    # Run tests with output synced to log
+    # Use a subshell to ensure clean pipe closure
+    (
+        "$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes
+    ) | tee -a "$BOT_LOG"
     local test_exit=${PIPESTATUS[0]}
 
     # Print test results summary to log
