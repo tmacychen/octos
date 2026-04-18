@@ -20,12 +20,20 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 from threading import Thread
 import logging
+import sys
 
-logging.basicConfig(level=logging.INFO)
+# Simple logging to stderr
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s:%(name)s:%(message)s',
+    stream=sys.stderr,
+    force=True
+)
 logger = logging.getLogger(__name__)
 
 
@@ -80,6 +88,10 @@ class MockTelegramServer:
         }
         self._commands_registered = []
         self._edit_history: list[dict] = []  # Record all edit operations for testing
+        
+        # Media directory for file uploads
+        import tempfile
+        self.media_dir = Path(tempfile.mkdtemp(prefix="mock_tg_media_"))
         
     def _setup_routes(self):
         """Set up FastAPI routes"""
@@ -411,6 +423,27 @@ class MockTelegramServer:
             )
             return {"ok": True, "update_id": update_id}
 
+        @app.post("/_inject_document")
+        async def inject_document(request: Request):
+            """Inject a document upload (for testing file handling)"""
+            data = await request.json()
+            file_path = data.get("file_path")
+            caption = data.get("caption", "")
+            
+            if not file_path:
+                raise HTTPException(status_code=400, detail="file_path is required")
+            
+            if not Path(file_path).exists():
+                raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+            
+            update_id = self.inject_document(
+                file_path=file_path,
+                caption=caption,
+                chat_id=data.get("chat_id", 123),
+                from_username=data.get("username", "testuser"),
+            )
+            return {"ok": True, "update_id": update_id}
+
         @app.post("/_inject_callback")
         async def inject_callback(request: Request):
             """Inject a callback query (button press) for test scripts"""
@@ -500,6 +533,52 @@ class MockTelegramServer:
         # Truncate long messages in logs to avoid output explosion
         text_preview = text[:100] + "..." if len(text) > 100 else text
         logger.info(f"📥 Injected message ({len(text)} bytes): {text_preview}")
+        return update_id
+    
+    def inject_document(self, file_path: str, caption: str, chat_id: int = 123,
+                       from_username: str = "testuser") -> int:
+        """Inject a document upload as if sent by a user
+        
+        This simulates Telegram's file upload mechanism.
+        The file will be copied to media_dir and the path passed to octos.
+        """
+        import shutil
+        
+        update_id = self._next_update_id
+        self._next_update_id += 1
+        
+        # Copy file to media directory (simulating Telegram download)
+        filename = Path(file_path).name
+        dest_path = self.media_dir / f"injected_{update_id}_{filename}"
+        shutil.copy2(file_path, dest_path)
+        
+        update = Update(
+            update_id=update_id,
+            message={
+                "message_id": update_id + 100,
+                "from": {
+                    "id": chat_id,
+                    "is_bot": False,
+                    "first_name": from_username,
+                    "username": from_username,
+                },
+                "chat": {
+                    "id": chat_id,
+                    "type": "private",
+                },
+                "date": 1234567890,
+                "caption": caption,
+                "document": {
+                    "file_id": f"doc_{update_id}",
+                    "file_name": filename,
+                    "mime_type": "application/octet-stream",
+                    "file_size": dest_path.stat().st_size,
+                },
+            }
+        )
+        self._updates.append(update)
+        file_size_mb = dest_path.stat().st_size / (1024 * 1024)
+        logger.info(f"📎 Injected document: {filename} ({file_size_mb:.1f}MB) → {dest_path}")
         return update_id
     
     def inject_callback_query(self, data: str, chat_id: int = 123,

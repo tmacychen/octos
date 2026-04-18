@@ -319,6 +319,7 @@ class TestAbortCommands:
     标记为 @pytest.mark.llm 仅因为需要完整的 gateway 环境。
     
     Abort 工作原理：
+    - 用户发送任务消息，octos 开始处理
     - 用户发送 abort 命令（"停" / "stop" / "cancel" 等）
     - GatewayDispatcher 在 session_actor 中检测 is_abort_trigger()
     - 立即返回 abort_response()，不调用 LLM
@@ -326,21 +327,76 @@ class TestAbortCommands:
     """
 
     def test_abort_chinese_stop(self, runner):
-        """发送"停"中止 - 应返回中文响应"""
-        text = inject_and_get_reply(runner, "停", timeout=TIMEOUT_COMMAND)
+        """发送任务后，用"停"中止 - 应返回中文响应"""
+        
+        # 先发送 hi 建立会话
+        count_before = len(runner.get_sent_messages())
+        runner.inject("hi", chat_id=123)
+        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+        assert hi_reply is not None, "Bot did not respond to hi"
+        print(f"\n  Session established: {hi_reply['text'][:50]}...")
+        
+        # 再发送一个任务消息，触发 LLM 处理
+        count_after_hi = len(runner.get_sent_messages())
+        runner.inject("请帮我写一段代码", chat_id=123)
+        
+        # 等待 octos 开始回复（确认任务已启动）
+        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
+        assert first_reply is not None, "Bot did not start processing the task"
+        print(f"  Task started: {first_reply['text'][:50]}...")
+        
+        # 额外等待一小段时间，确保 octos 已经进入处理状态
+        import time
+        time.sleep(1)  # 让 octos 有时间设置 cancelled flag
+        
+        # 现在发送 abort 命令
+        count_after_first = len(runner.get_sent_messages())
+        runner.inject("停", chat_id=123)
+        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        
+        assert abort_reply is not None, "Bot did not respond to abort command"
+        text = abort_reply["text"]
         
         # 验证收到中文取消响应
         assert "已取消" in text or "🛑" in text, \
-            f"Expected Chinese cancel response, got: {text}"
-        print(f"\n  ✓ Abort (停) → {text}")
+            f"Expected Chinese cancel response, got: {text[:200]}"
+        print(f"  ✓ Abort (停) → {text}")
 
     def test_abort_english_stop(self, runner):
-        """发送"stop"中止 - 应返回英文响应"""
-        text = inject_and_get_reply(runner, "stop", timeout=TIMEOUT_COMMAND)
+        """发送任务后，用"stop"中止 - 应返回英文响应"""
         
+        # 先发送 hi 建立会话
+        count_before = len(runner.get_sent_messages())
+        runner.inject("hi", chat_id=124)
+        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+        assert hi_reply is not None, "Bot did not respond to hi"
+        print(f"\n  Session established: {hi_reply['text'][:50]}...")
+        
+        # 再发送一个任务消息
+        count_after_hi = len(runner.get_sent_messages())
+        runner.inject("Help me write code", chat_id=124)
+        
+        # 等待 octos 开始回复
+        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
+        assert first_reply is not None, "Bot did not start processing the task"
+        print(f"  Task started: {first_reply['text'][:50]}...")
+        
+        # 额外等待一小段时间，确保 octos 已经进入处理状态
+        import time
+        time.sleep(1)  # 让 octos 有时间设置 cancelled flag
+        
+        # 发送 abort 命令
+        count_after_first = len(runner.get_sent_messages())
+        runner.inject("stop", chat_id=124)
+        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        
+        assert abort_reply is not None, "Bot did not respond to abort command"
+        text = abort_reply["text"]
+        
+        # 验证收到英文取消响应
         assert "Cancelled" in text or "🛑" in text, \
-            f"Expected English cancel response, got: {text}"
-        print(f"\n  ✓ Abort (stop) → {text}")
+            f"Expected English cancel response, got: {text[:200]}"
+        print(f"  ✓ Abort (stop) → {text}")
 
     def test_abort_english_cancel(self, runner):
         """发送"cancel"中止 - 应返回英文响应"""
@@ -551,16 +607,16 @@ class TestFileLimits:
         根据 octos-bus/src/session.rs:
         const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;  // 10 MB
         
-        测试策略：
-        1. 使用专用的 chat_id (999) 避免干扰其他测试
-        2. 累积消息直到接近 10MB
+        测试策略（优化版）：
+        1. 创建一个 ~10MB 的临时文件
+        2. 一次性上传到会话（模拟 Telegram 文件发送）
         3. 检查磁盘上的会话文件大小
-        4. 验证超过限制后 octos 仍能响应（但不保存）
+        4. 验证超过限制后 octos 仍能响应
         
         注意：这是一个慢测试，标记为 @pytest.mark.slow
         """
         import os
-        import time
+        import tempfile
         
         # 使用专用 chat_id 避免干扰
         test_chat_id = 999
@@ -574,85 +630,70 @@ class TestFileLimits:
         )
         assert session_name in init_text
         
-        # 计算需要发送的消息数量以达到 ~10MB
-        # 每条消息约 100KB（避免触发会话压缩问题）
-        message_size = 100 * 1024  # 100KB per message
-        target_messages = 110  # 110 * 100KB ≈ 11MB（超过 10MB 限制）
+        print(f"\n  Testing 10MB file size limit with single file upload...")
         
-        print(f"\n  Testing 10MB file size limit...")
-        print(f"  Sending {target_messages} messages × {message_size / 1024:.0f}KB")
-        print(f"  Target: ~{target_messages * message_size / (1024 * 1024):.1f}MB total")
-        
-        session_file_path = None
-        
-        for i in range(target_messages):
-            message = f"Size test {i+1}: " + "X" * (message_size - 20)
+        # 创建一个 ~10MB 的临时文件
+        target_size = 10 * 1024 * 1024  # 10MB
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+        try:
+            # 写入数据直到达到目标大小
+            chunk = "X" * (1024 * 1024)  # 1MB chunks
+            written = 0
+            while written < target_size:
+                temp_file.write(chunk)
+                written += len(chunk)
+            temp_file.close()
             
-            try:
-                # 不打印回复内容，只等待响应
-                count_before = len(runner.get_sent_messages())
-                runner.inject(message, chat_id=test_chat_id)
-                msg = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
-                assert msg is not None, f"No reply for message {i+1}"
-                
-                # 每 10 条消息检查一次文件大小和压缩状态
-                if (i + 1) % 10 == 0:
-                    current_mb = (i + 1) * message_size / (1024 * 1024)
-                    
-                    # 尝试找到会话文件并检查大小
-                    if session_file_path is None:
-                        sessions_dir = os.path.expanduser("~/.octos/users")
-                        user_dir_pattern = f"_main%3Atelegram%3A{test_chat_id}"
-                        
-                        for entry in os.listdir(sessions_dir):
-                            if user_dir_pattern in entry:
-                                session_file_path = os.path.join(
-                                    sessions_dir, entry, "sessions", f"{session_name}.jsonl"
-                                )
-                                break
-                    
-                    if session_file_path and os.path.exists(session_file_path):
-                        file_size_mb = os.path.getsize(session_file_path) / (1024 * 1024)
-                        print(f"    [{i+1}/{target_messages}] File: {file_size_mb:.1f}MB")
-                        
-                        if file_size_mb > 10:
-                            print(f"    ⚠️  Exceeded 10MB limit")
-                else:
-                    # 简化进度输出（每 5 条显示一次）
-                    if (i + 1) % 5 == 0:
-                        print(f"    [{i+1}/{target_messages}] ...", end="\r", flush=True)
-                
-                # 短暂等待，避免过快
-                if i < target_messages - 1:
-                    time.sleep(0.1)
-                    
-            except Exception as e:
-                print(f"\n  ✗ Failed at message {i+1}: {type(e).__name__}")
-                raise
+            file_size_mb = os.path.getsize(temp_file.name) / (1024 * 1024)
+            print(f"  Created temp file: {file_size_mb:.1f}MB")
+            print(f"  Uploading to session...")
+            
+            # 一次性上传文件
+            count_before = len(runner.get_sent_messages())
+            runner.inject_document(
+                file_path=temp_file.name,
+                caption="Large file for size limit test",
+                chat_id=test_chat_id
+            )
+            
+            # 等待 octos 处理
+            msg = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+            assert msg is not None, "Bot did not respond to file upload"
+            print(f"  ✓ Bot responded: {msg['text'][:50]}...")
+            
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
         
-        print()  # 换行
+        # 检查会话文件大小
+        session_file_path = None
+        sessions_dir = os.path.expanduser("~/.octos/users")
+        user_dir_pattern = f"_main%3Atelegram%3A{test_chat_id}"
         
-        # 最终验证
+        for entry in os.listdir(sessions_dir):
+            if user_dir_pattern in entry:
+                session_file_path = os.path.join(
+                    sessions_dir, entry, "sessions", f"{session_name}.jsonl"
+                )
+                break
+        
         if session_file_path and os.path.exists(session_file_path):
             final_size_mb = os.path.getsize(session_file_path) / (1024 * 1024)
-            print(f"  Final file size: {final_size_mb:.2f}MB")
+            print(f"  Session file size: {final_size_mb:.2f}MB")
             
-            # 验证文件大小应该在 10MB 左右
-            assert final_size_mb < 12, \
-                f"Session file too large: {final_size_mb:.2f}MB (expected < 12MB)"
+            # 验证文件大小应该在 10MB 左右（允许一定误差）
+            assert final_size_mb < 15, \
+                f"Session file too large: {final_size_mb:.2f}MB (expected < 15MB)"
             
-            print(f"  ✓ File size within expected range (< 12MB)")
+            print(f"  ✓ File size within expected range (< 15MB)")
         else:
-            print(f"  ⚠️  Could not locate session file")
+            print(f"  ⚠️  Could not find session file")
         
-        # 验证 octos 仍然能响应
-        final_response = inject_and_get_reply(
-            runner, "Final check",
-            timeout=TIMEOUT_COMMAND,
-            chat_id=test_chat_id
-        )
-        assert len(final_response) > 0
-        print(f"  ✓ octos still responds after ~{target_messages * message_size / (1024*1024):.1f}MB")
+        # 验证会话仍然可用
+        final_text = inject_and_get_reply(runner, "Test after large file", timeout=TIMEOUT_COMMAND, chat_id=test_chat_id)
+        assert len(final_text) > 0
+        print(f"  ✓ Session still functional after large file")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -40,6 +40,28 @@ class BotTestRunner(BaseMockRunner):
         resp.raise_for_status()
         return resp.json()
 
+    def inject_document(self, file_path: str, caption: str = "",
+                       chat_id: int = 123, username: str = "testuser") -> dict:
+        """注入一个文档上传（模拟文件发送）
+        
+        Args:
+            file_path: 本地文件路径
+            caption: 文件说明文字
+            chat_id: 聊天ID
+            username: 用户名
+        
+        Returns:
+            Mock Server响应
+        """
+        resp = httpx.post(f"{self.base_url}/_inject_document", json={
+            "file_path": file_path,
+            "caption": caption,
+            "chat_id": chat_id,
+            "username": username,
+        }, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
     def get_edit_history(self) -> list[dict]:
         """获取消息编辑历史（测试用）"""
         # Mock Server 不直接暴露编辑历史，通过 clear() 间接验证

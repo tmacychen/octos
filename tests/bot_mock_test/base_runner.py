@@ -27,12 +27,14 @@ class BaseMockRunner:
         return resp.json()
 
     def wait_for_reply(self, count_before: int = 0,
-                       timeout: int = 10, poll_interval: float = 1.0) -> Optional[dict]:
+                       timeout: int = 10, poll_interval: float = 1.0,
+                       chat_id: Optional[int] = None) -> Optional[dict]:
         """
         等待 bot 发送新消息，返回最新一条。
         count_before: 调用前已有的消息数量
         timeout: 最长等待秒数
         poll_interval: 轮询间隔秒数
+        chat_id: 可选，只等待特定 chat_id 的消息（并发测试必需）
         """
         elapsed = 0.0
         while elapsed < timeout:
@@ -40,7 +42,13 @@ class BaseMockRunner:
             elapsed += poll_interval
             msgs = self.get_sent_messages()
             if len(msgs) > count_before:
-                return msgs[-1]
+                # If chat_id specified, filter messages for this chat
+                if chat_id is not None:
+                    for msg in reversed(msgs[count_before:]):
+                        if msg.get("chat_id") == chat_id:
+                            return msg
+                else:
+                    return msgs[-1]
         return None
 
     def health(self) -> bool:

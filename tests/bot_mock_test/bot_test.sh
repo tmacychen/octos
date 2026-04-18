@@ -149,6 +149,7 @@ MOD_TEST_FILE=""
 MOD_FEATURE=""
 MOD_MOCK_MODULE=""
 MOD_MOCK_CLASS=""
+TEST_CASE=""  # Optional: specific test case to run
 
 parse_module() {
     local mod="$1"
@@ -230,7 +231,14 @@ run_module() {
     local mod="$1"
     parse_module "$mod"
 
+    # Setup cleanup trap to kill processes on exit/interrupt
+    # Use ${VAR:-} to avoid unbound variable errors with set -u
+    trap 'kill ${BOT_PID:-} ${MOCK_PID:-} 2>/dev/null; wait ${BOT_PID:-} ${MOCK_PID:-} 2>/dev/null || true' EXIT INT TERM
+
     section "Running $MOD_NAME tests (port $MOD_PORT)"
+
+    # ── 0. Ensure log directory exists ───────────────────────────────────────
+    mkdir -p "$LOG_DIR"
 
     # ── 1. Check ANTHROPIC_API_KEY ───────────────────────────────────────────
     if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
@@ -267,11 +275,22 @@ run_module() {
 
     # ── 5. Kill anything on the mock port ────────────────────────────────────
     section "Preparing mock server"
+    
+    # Kill all Mock Server processes (not just those on the port)
+    local mock_pids
+    mock_pids=$(ps aux | grep -E "mock_tg|mock_discord|MockTelegramServer|MockDiscordServer" | grep -v grep | awk '{print $2}' || true)
+    if [[ -n "$mock_pids" ]]; then
+        warn "Killing existing Mock Server processes: $mock_pids"
+        echo "$mock_pids" | xargs kill 2>/dev/null || true
+        sleep 1
+    fi
+    
+    # Also kill anything on the mock port (fallback)
     local existing_pid
     existing_pid=$(lsof -ti tcp:"$MOD_PORT" 2>/dev/null || true)
     if [[ -n "$existing_pid" ]]; then
-        warn "Port $MOD_PORT in use by PID $existing_pid, killing..."
-        kill "$existing_pid" 2>/dev/null || true
+        warn "Port $MOD_PORT still in use by PID $existing_pid, force killing..."
+        kill -9 "$existing_pid" 2>/dev/null || true
         for _ in $(seq 1 10); do
             sleep 0.5
             if ! lsof -ti tcp:"$MOD_PORT" >/dev/null 2>&1; then
@@ -281,12 +300,13 @@ run_module() {
     fi
 
     # ── 6. Start mock server ─────────────────────────────────────────────────
+    # Start mock server
     local health_timeout=3
     if [[ "$MOD_NAME" == "discord" ]]; then
         health_timeout=5
     fi
 
-    PYTHONPATH="$SCRIPT_DIR" "$VENV_PYTHON" -c "
+    PYTHONPATH="$SCRIPT_DIR" PYTHONUNBUFFERED=1 "$VENV_PYTHON" -c "
 import time, signal, sys
 from ${MOD_MOCK_MODULE} import ${MOD_MOCK_CLASS}
 server = ${MOD_MOCK_CLASS}(port=${MOD_PORT})
@@ -328,9 +348,10 @@ except Exception as e:
     rm -f "$BOT_LOG"
 
     export "$EXTRA_ENV_VAR"="$EXTRA_ENV_VAL"
-    "$BOT_BIN" gateway --config "$CONFIG_FILE" > "$BOT_LOG" 2>&1 &
+    # octos gateway output to log file only (not stdout)
+    "$BOT_BIN" gateway --config "$CONFIG_FILE" >> "$BOT_LOG" 2>&1 &
     BOT_PID=$!
-    info "Bot PID: $BOT_PID  |  Log: $BOT_LOG"
+    info "Bot PID: $BOT_PID"
 
     # Poll for ready
     echo ""
@@ -383,28 +404,18 @@ except Exception as e:
     export PYTHONPATH="$SCRIPT_DIR"
     export MOCK_BASE_URL="http://127.0.0.1:$MOD_PORT"
 
-    # Print visual separators to log file
-    echo "" >> "$BOT_LOG"
-    echo "╔══════════════════════════════════════════════════════════════╗" >> "$BOT_LOG"
-    echo "║           TEST EXECUTION START: $MOD_NAME" >> "$BOT_LOG"
-    echo "╚══════════════════════════════════════════════════════════════╝" >> "$BOT_LOG"
-    echo "" >> "$BOT_LOG"
-
-    # Run tests with output synced to log (both stdout and stderr)
-    # Merge stderr into stdout, then pipe to tee
-    "$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes 2>&1 | tee -a "$BOT_LOG"
-    local test_exit=${PIPESTATUS[0]}
-
-    # Print test results summary to log
-    echo "" >> "$BOT_LOG"
-    echo "╔══════════════════════════════════════════════════════════════╗" >> "$BOT_LOG"
-    if [ $test_exit -eq 0 ]; then
-        echo "║                  ✅ ALL TESTS PASSED                        ║" >> "$BOT_LOG"
-    else
-        echo "║                  ❌ SOME TESTS FAILED                       ║" >> "$BOT_LOG"
+    # Build pytest command
+    local pytest_cmd=("$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes)
+    
+    # If specific test case provided, add it to the command
+    if [[ -n "$TEST_CASE" ]]; then
+        pytest_cmd+=("-k" "$TEST_CASE")
+        info "Running specific test: $TEST_CASE"
     fi
-    echo "╚══════════════════════════════════════════════════════════════╝" >> "$BOT_LOG"
-    echo "" >> "$BOT_LOG"
+
+    # Run tests - output goes to stdout (captured by outer tee if used)
+    "${pytest_cmd[@]}"
+    local test_exit=$?
 
     # ── 9. Cleanup ───────────────────────────────────────────────────────────
     section "Cleanup"
@@ -457,6 +468,11 @@ case "$ACTION" in
         echo "    discord, dc      Run Discord tests"
         echo "    list             List available modules"
         echo "    cases <mod>      List test cases in a module"
+        echo "    <mod> [case]     Run module or specific test case"
+        echo ""
+        echo "  Examples:"
+        echo "    tests/run_tests.sh --test bot telegram"
+        echo "    tests/run_tests.sh --test bot telegram test_concurrent_session_creation"
         echo ""
         exit 0
         ;;
@@ -496,13 +512,41 @@ case "$ACTION" in
         exit $FAILED
         ;;
     *)
-        resolved=$(resolve_module "$ACTION" || true)
-        if [[ -z "$resolved" ]]; then
-            err "Unknown module: $ACTION"
+        # Smart detection: check if first arg is a module or test case
+        target="${1:-}"
+        TEST_CASE="${2:-}"
+        
+        if [[ -z "$target" ]]; then
+            err "No module specified"
             list_modules
             exit 1
         fi
-        run_module "$resolved"
-        exit $?
+        
+        # Try to resolve as module name
+        resolved=$(resolve_module "$target" || true)
+        
+        if [[ -n "$resolved" ]]; then
+            # It's a valid module, run it (with optional test case filter)
+            if [[ -n "$TEST_CASE" ]]; then
+                info "Running specific test case: $TEST_CASE in $target"
+            fi
+            run_module "$resolved"
+            exit $?
+        else
+            # Not a module name, check if it looks like a test case name
+            if [[ "$target" == test_* ]]; then
+                err "Test case '$target' specified without module name"
+                echo ""
+                echo "  Usage: tests/run_tests.sh --test bot <module> <test_case>"
+                echo "  Example: tests/run_tests.sh --test bot telegram $target"
+                echo ""
+                list_modules
+                exit 1
+            else
+                err "Unknown module: $target"
+                list_modules
+                exit 1
+            fi
+        fi
         ;;
 esac

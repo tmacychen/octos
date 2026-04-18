@@ -14,7 +14,10 @@ def inject_and_get_reply(runner, text: str, timeout: int = 15, **inject_kwargs) 
     """
     count_before = len(runner.get_sent_messages())
     runner.inject(text, **inject_kwargs)
-    msg = runner.wait_for_reply(count_before=count_before, timeout=timeout)
+    
+    # Extract chat_id for filtering (Telegram only)
+    chat_id = inject_kwargs.get("chat_id")
+    msg = runner.wait_for_reply(count_before=count_before, timeout=timeout, chat_id=chat_id)
     
     # Truncate long messages in error output to avoid cluttering logs
     text_preview = text[:100] + "..." if len(text) > 100 else text

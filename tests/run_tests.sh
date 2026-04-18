@@ -29,6 +29,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# ── State ────────────────────────────────────────────────────────────────────
+TEST_DIR="/tmp/octos_test"
+LOG_DIR="$TEST_DIR/logs"
+OCTOS_BIN="$TEST_DIR/octos"
+CHECKSUM_FILE="$TEST_DIR/.octos_checksum"
+SOURCE_BIN="$PROJECT_ROOT/target/debug/octos"
+FAILED=0
+MODULE_RESULTS=()   # tracks "module_name:PASS" or "module_name:FAIL"
+
+# ── Session log (must be defined before any logging functions) ───────────────
+SESSION_LOG_DIR="$LOG_DIR/sessions"
+mkdir -p "$SESSION_LOG_DIR"
+SESSION_LOG="$SESSION_LOG_DIR/$(date +%Y%m%d_%H%M%S).log"
+
+# ── Redirect all stdout/stderr to log file AND terminal (via tee) ────────────
+# This ensures ALL output from this script is captured in the session log
+exec > >(tee -a "$SESSION_LOG") 2>&1
+
 # ── Colors ───────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
@@ -42,29 +60,12 @@ else
     RED='' GREEN='' YELLOW='' CYAN='' GRAY='' BOLD='' RESET=''
 fi
 
-info()  { echo -e "${CYAN}  ℹ ${RESET} $*" | tee -a "$SESSION_LOG"; }
-ok()    { echo -e "${GREEN}  ✅ ${RESET} $*" | tee -a "$SESSION_LOG"; }
-warn()  { echo -e "${YELLOW}  ⚠️  ${RESET} $*" | tee -a "$SESSION_LOG"; }
-err()   { echo -e "${RED}  ❌ ${RESET} $*" | tee -a "$SESSION_LOG"; }
-section() { echo "" | tee -a "$SESSION_LOG"; echo -e "${BOLD}${CYAN}── $* ${RESET}" | tee -a "$SESSION_LOG"; }
-log_line() { echo -e "${GRAY}    $*${RESET}" | tee -a "$SESSION_LOG"; }
-
-# Write a line to session log only (no stdout)
-log_only() { echo "$*" >> "$SESSION_LOG"; }
-
-# ── State ────────────────────────────────────────────────────────────────────
-TEST_DIR="/tmp/octos_test"
-LOG_DIR="$TEST_DIR/logs"
-OCTOS_BIN="$TEST_DIR/octos"
-CHECKSUM_FILE="$TEST_DIR/.octos_checksum"
-SOURCE_BIN="$PROJECT_ROOT/target/debug/octos"
-FAILED=0
-MODULE_RESULTS=()   # tracks "module_name:PASS" or "module_name:FAIL"
-
-# ── Session log ─────────────────────────────────────────────────────────────
-SESSION_LOG_DIR="$LOG_DIR/sessions"
-mkdir -p "$SESSION_LOG_DIR"
-SESSION_LOG="$SESSION_LOG_DIR/$(date +%Y%m%d_%H%M%S).log"
+info()  { echo -e "${CYAN}  ℹ ${RESET} $*"; }
+ok()    { echo -e "${GREEN}  ✅ ${RESET} $*"; }
+warn()  { echo -e "${YELLOW}  ⚠️  ${RESET} $*"; }
+err()   { echo -e "${RED}  ❌ ${RESET} $*"; }
+section() { echo ""; echo -e "${BOLD}${CYAN}── $* ${RESET}"; }
+log_line() { echo -e "${GRAY}    $*${RESET}"; }
 
 # ── Binary sync with checksum ───────────────────────────────────────────────
 sync_binary() {
@@ -111,7 +112,7 @@ build_octos() {
         --manifest-path "$PROJECT_ROOT/Cargo.toml" \
         --bin octos \
         --all-features \
-        2>&1 | tee "$build_log" | tee -a "$SESSION_LOG"; then
+        2>&1 | tee "$build_log"; then
         err "Build failed (see log: $build_log)"
         exit 1
     fi
@@ -141,7 +142,27 @@ run_bot_tests() {
         bot_args=("all")
     fi
 
-    bash "$bot_script" "${bot_args[@]}" 2>&1 | tee -a "$SESSION_LOG"
+    # Determine which module(s) to test and set log file accordingly
+    local first_arg="${bot_args[0]:-all}"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local bot_log
+    
+    case "$first_arg" in
+        telegram|tg)
+            bot_log="$LOG_DIR/octos_telegram_bot_test_${timestamp}.log"
+            ;;
+        discord|dc)
+            bot_log="$LOG_DIR/octos_discord_bot_test_${timestamp}.log"
+            ;;
+        all|*)
+            bot_log="$LOG_DIR/octos_bot_test_${timestamp}.log"
+            ;;
+    esac
+
+    info "Bot test log: $bot_log"
+    
+    # Redirect output to module-specific log file AND terminal
+    bash "$bot_script" "${bot_args[@]}" 2>&1 | tee -a "$bot_log"
     local bot_exit=${PIPESTATUS[0]}
     if [[ $bot_exit -ne 0 ]]; then
         err "Bot tests failed"
@@ -168,8 +189,9 @@ run_cli_tests() {
     export OCTOS_LOG_DIR="$LOG_DIR"
 
     # Always pass -b with binary path, forward remaining sub-args
-    bash "$cli_script" -b "$OCTOS_BIN" "$@" 2>&1 | tee -a "$SESSION_LOG"
-    local cli_exit=${PIPESTATUS[0]}
+    # Output already redirected by exec, just capture exit code
+    bash "$cli_script" -b "$OCTOS_BIN" "$@"
+    local cli_exit=$?
     if [[ $cli_exit -ne 0 ]]; then
         err "CLI tests failed"
         MODULE_RESULTS+=("cli:FAIL")
@@ -200,6 +222,7 @@ show_help() {
     echo "    discord, dc      Run Discord tests only"
     echo "    list             List available bot modules"
     echo "    cases <mod>      List test cases in a module"
+    echo "    <mod> [case]     Run module or specific test case"
     echo ""
     echo "  CLI test arguments (after --test cli):"
     echo "    -v, --verbose    Verbose output"
@@ -211,6 +234,8 @@ show_help() {
     echo "    tests/run_tests.sh --test bot              # all bot tests"
     echo "    tests/run_tests.sh --test bot telegram     # Telegram only"
     echo "    tests/run_tests.sh --test bot cases tg     # list Telegram cases"
+    echo "    tests/run_tests.sh --test bot tg           # run Telegram tests"
+    echo "    tests/run_tests.sh --test bot tg test_concurrent_session_creation  # run single test"
     echo "    tests/run_tests.sh --test cli              # CLI tests"
     echo "    tests/run_tests.sh --test cli -v           # CLI tests, verbose"
     echo ""
@@ -307,26 +332,26 @@ esac
 # ── Final summary ────────────────────────────────────────────────────────────
 echo ""
 if [[ $FAILED -eq 0 ]]; then
-    echo -e "${BOLD}${GREEN}  🎉 All tests passed!${RESET}" | tee -a "$SESSION_LOG"
+    echo -e "${BOLD}${GREEN}  🎉 All tests passed!${RESET}"
 else
-    echo -e "${BOLD}${RED}  💥 Some tests failed${RESET}" | tee -a "$SESSION_LOG"
+    echo -e "${BOLD}${RED}  💥 Some tests failed${RESET}"
 fi
 
 # ── Test summary ────────────────────────────────────────────────────────────
 section "Test Summary"
-echo -e "  Date:    $(date '+%Y-%m-%d %H:%M:%S')" | tee -a "$SESSION_LOG"
-echo -e "  Result:  $([ $FAILED -eq 0 ] && echo 'PASSED' || echo 'FAILED')" | tee -a "$SESSION_LOG"
-echo -e "  Modules:" | tee -a "$SESSION_LOG"
+echo -e "  Date:    $(date '+%Y-%m-%d %H:%M:%S')"
+echo -e "  Result:  $([ $FAILED -eq 0 ] && echo 'PASSED' || echo 'FAILED')"
+echo -e "  Modules:"
 for result in "${MODULE_RESULTS[@]}"; do
     mod_name="${result%%:*}"
     mod_status="${result##*:}"
     if [[ "$mod_status" == "PASS" ]]; then
-        echo -e "    ${GREEN}✅ ${mod_name}${RESET}" | tee -a "$SESSION_LOG"
+        echo -e "    ${GREEN}✅ ${mod_name}${RESET}"
     else
-        echo -e "    ${RED}❌ ${mod_name}${RESET}" | tee -a "$SESSION_LOG"
+        echo -e "    ${RED}❌ ${mod_name}${RESET}"
     fi
 done
-echo -e "  Log:     $SESSION_LOG" | tee -a "$SESSION_LOG"
+echo -e "  Log:     $SESSION_LOG"
 echo ""
 
 exit $FAILED
