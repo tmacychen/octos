@@ -77,11 +77,13 @@ class TestDiscordSessionCommands:
         """/sessions → non-empty reply"""
         text = inject_and_get_reply(runner, "/sessions", timeout=TIMEOUT_COMMAND)
         assert len(text) > 0, "Empty reply"
+        print(f"\n  /sessions → {text[:100]}")
 
     def test_back_returns_session(self, runner):
         """/back → session-related reply"""
         text = inject_and_get_reply(runner, "/back", timeout=TIMEOUT_COMMAND)
         assert "session" in text.lower(), f"Unexpected reply: {text}"
+        print(f"\n  /back → {text}")
 
     def test_back_with_history(self, runner):
         """/back 在有历史会话时返回之前的会话"""
@@ -108,6 +110,7 @@ class TestDiscordSessionCommands:
         """/soul → non-empty reply"""
         text = inject_and_get_reply(runner, "/soul", timeout=TIMEOUT_COMMAND)
         assert len(text) > 0, "Empty reply"
+        print(f"\n  /soul → {text[:80]}")
 
     def test_soul_set(self, runner):
         """/soul <text> → confirmation"""
@@ -178,7 +181,8 @@ class TestDiscordSessionActorCommands:
         """未知命令 → 帮助文本"""
         text = inject_and_get_reply(runner, "/unknowncmd", timeout=TIMEOUT_COMMAND)
         assert text.startswith("Unknown command."), f"实际回复: {text}"
-        for cmd in ["/new", "/s", "/sessions"]:
+        for cmd in ["/new", "/s", "/sessions", "/back", "/delete", "/soul",
+                    "/status", "/adaptive", "/reset"]:
             assert cmd in text, f"帮助文本缺少 {cmd}: {text}"
 
 
