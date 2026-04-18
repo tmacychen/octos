@@ -30,6 +30,15 @@ def runner():
     return r
 
 
+@pytest.fixture(autouse=True)
+def cleanup_state(runner):
+    """每个测试前清理 Mock Server 状态"""
+    # Wait for any pending LLM responses to complete
+    time.sleep(1.0)
+    runner.clear()
+    yield
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 第一层：GatewayDispatcher 命令（会话管理）
 # ══════════════════════════════════════════════════════════════════════════════
