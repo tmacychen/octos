@@ -542,7 +542,7 @@ class MockDiscordServer:
         data = await request.json()
         msg = InjectedMessage(
             content=data.get("text", ""),
-            channel_id=str(data.get("chat_id", DEFAULT_CHANNEL_ID)),
+            channel_id=str(data.get("channel_id", data.get("chat_id", DEFAULT_CHANNEL_ID))),
             guild_id=str(data.get("guild_id")) if data.get("guild_id") else None,
             sender_id=str(data.get("sender_id", DEFAULT_USER_ID)),
             sender_name=str(data.get("username", "TestUser")),
@@ -561,7 +561,7 @@ class MockDiscordServer:
         data = await request.json()
         inter = InjectedInteraction(
             data=data.get("data", {}),
-            channel_id=str(data.get("chat_id", DEFAULT_CHANNEL_ID)),
+            channel_id=str(data.get("channel_id", data.get("chat_id", DEFAULT_CHANNEL_ID))),
             guild_id=str(data.get("guild_id")) if data.get("guild_id") else None,
             sender_id=str(data.get("sender_id", DEFAULT_USER_ID)),
             token=data.get("token", ""),
