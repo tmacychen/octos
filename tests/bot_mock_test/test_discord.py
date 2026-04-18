@@ -83,11 +83,25 @@ class TestDiscordSessionCommands:
         text = inject_and_get_reply(runner, "/back", timeout=TIMEOUT_COMMAND)
         assert "session" in text.lower(), f"Unexpected reply: {text}"
 
+    def test_back_with_history(self, runner):
+        """/back 在有历史会话时返回之前的会话"""
+        # Create a named session first
+        inject_and_get_reply(runner, "/new history-test", timeout=TIMEOUT_COMMAND)
+        # Go back should return to previous or default
+        text = inject_and_get_reply(runner, "/back", timeout=TIMEOUT_COMMAND)
+        assert "session" in text.lower(), f"Expected session info, got: {text}"
+
     def test_delete_session(self, runner):
         """/delete <name> → success"""
         inject_and_get_reply(runner, "/new to-delete", timeout=TIMEOUT_COMMAND)
         text = inject_and_get_reply(runner, "/delete to-delete", timeout=TIMEOUT_COMMAND)
         assert text == "Deleted session: to-delete", f"实际回复: {text}"
+
+    def test_delete_no_name(self, runner):
+        """/delete 无名称时显示错误"""
+        text = inject_and_get_reply(runner, "/delete", timeout=TIMEOUT_COMMAND)
+        assert "usage" in text.lower() or "error" in text.lower() or "name" in text.lower(), \
+            f"Expected error for /delete without name, got: {text}"
 
     def test_soul_show(self, runner):
         """/soul → non-empty reply"""
@@ -98,6 +112,27 @@ class TestDiscordSessionCommands:
         """/soul <text> → confirmation"""
         text = inject_and_get_reply(runner, "/soul You are helpful.", timeout=TIMEOUT_COMMAND)
         assert text == "Soul updated. Takes effect in new sessions.", f"实际回复: {text}"
+
+    def test_back_alias_b(self, runner):
+        """/b 作为 /back 的别名"""
+        text = inject_and_get_reply(runner, "/b", timeout=TIMEOUT_COMMAND)
+        assert "session" in text.lower(), f"Unexpected reply for /b: {text}"
+
+    def test_delete_alias_d(self, runner):
+        """/d 作为 /delete 的别名"""
+        inject_and_get_reply(runner, "/new temp-session", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/d temp-session", timeout=TIMEOUT_COMMAND)
+        assert "Deleted session: temp-session" in text or "deleted" in text.lower(), \
+            f"Unexpected reply for /d: {text}"
+
+    def test_soul_reset(self, runner):
+        """/soul reset → 重置 soul"""
+        # First set a soul
+        inject_and_get_reply(runner, "/soul Custom soul", timeout=TIMEOUT_COMMAND)
+        # Then reset it
+        text = inject_and_get_reply(runner, "/soul reset", timeout=TIMEOUT_COMMAND)
+        assert "reset" in text.lower() or "cleared" in text.lower() or "default" in text.lower(), \
+            f"Expected reset confirmation, got: {text}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -390,6 +425,52 @@ class TestDiscordAbortCommands:
             f"Expected cancel response, got: {text[:200]}"
         print(f"  ✓ Abort (cancel) → {text}")
 
+    def test_abort_chinese_stop(self, runner):
+        """发送任务后，用中文“停”中止"""
+        count_before = len(runner.get_sent_messages())
+        runner.inject("hi", channel_id="1039178386623557756")
+        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+        assert hi_reply is not None
+        
+        count_after_hi = len(runner.get_sent_messages())
+        runner.inject("Help me", channel_id="1039178386623557756")
+        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
+        assert first_reply is not None
+        
+        time.sleep(1)
+        
+        count_after_first = len(runner.get_sent_messages())
+        runner.inject("停", channel_id="1039178386623557756")
+        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        
+        assert abort_reply is not None, "Bot did not respond to abort command"
+        text = abort_reply["text"]
+        assert "🛑" in text or "取消" in text, f"Expected Chinese cancel response, got: {text[:200]}"
+        print(f"  ✓ Abort (停) → {text}")
+
+    def test_abort_case_insensitive(self, runner):
+        """验证大小写不敏感 - STOP vs stop"""
+        count_before = len(runner.get_sent_messages())
+        runner.inject("hi", channel_id="1039178386623557757")
+        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+        assert hi_reply is not None
+        
+        count_after_hi = len(runner.get_sent_messages())
+        runner.inject("Task", channel_id="1039178386623557757")
+        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
+        assert first_reply is not None
+        
+        time.sleep(1)
+        
+        count_after_first = len(runner.get_sent_messages())
+        runner.inject("STOP", channel_id="1039178386623557757")  # Uppercase
+        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        
+        assert abort_reply is not None, "Bot did not respond to STOP command"
+        text = abort_reply["text"]
+        assert "🛑" in text or "cancel" in text.lower(), f"Expected cancel response, got: {text[:200]}"
+        print(f"  ✓ Abort (STOP uppercase) → {text}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Profile 模式测试
@@ -421,3 +502,63 @@ class TestDiscordProfileMode:
         assert "profile-a" in sessions_a
         assert "profile-b" in sessions_b
 
+    def test_soul_per_profile(self, runner):
+        """验证每个 profile 有独立的 soul 配置"""
+        CHANNEL_A = "1039178386623557758"
+        CHANNEL_B = "1039178386623557759"
+        
+        # Set different souls for different channels
+        text_a = inject_and_get_reply(runner, "/soul You are a coding expert",
+                                      timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_A)
+        assert "Soul updated" in text_a
+        
+        text_b = inject_and_get_reply(runner, "/soul You are a creative writer",
+                                      timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_B)
+        assert "Soul updated" in text_b
+        
+        # Verify souls are independent
+        soul_a = inject_and_get_reply(runner, "/soul",
+                                      timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_A)
+        soul_b = inject_and_get_reply(runner, "/soul",
+                                      timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_B)
+        
+        assert "coding expert" in soul_a.lower() or "You are a coding expert" in soul_a
+        assert "creative writer" in soul_b.lower() or "You are a creative writer" in soul_b
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 文件限制测试
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDiscordFileLimits:
+    """验证 Discord 文件大小和消息长度限制"""
+
+    def test_large_message_handling(self, runner):
+        """测试大消息处理 - Discord 限制 1900 字符"""
+        # Create a message near the limit
+        long_text = "A" * 1800
+        count_before = len(runner.get_sent_messages())
+        runner.inject(long_text, channel_id="1039178386623557760")
+        
+        # Wait for response
+        msg = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_LLM)
+        # Should handle gracefully (either split or process)
+        assert msg is not None, "Bot did not respond to large message"
+        print(f"\n  ✓ Large message handled: {len(msg['text'])} chars response")
+
+    def test_session_accumulation_stability(self, runner):
+        """测试会话累积稳定性 - 多条消息后仍正常工作"""
+        channel = "1039178386623557761"
+        
+        # Send multiple messages to accumulate history
+        for i in range(5):
+            text = inject_and_get_reply(
+                runner, f"Message {i+1}",
+                timeout=TIMEOUT_COMMAND, channel_id=channel
+            )
+            assert len(text) > 0, f"Empty response for message {i+1}"
+        
+        # Final command should still work
+        final = inject_and_get_reply(runner, "/sessions", timeout=TIMEOUT_COMMAND, channel_id=channel)
+        assert len(final) > 0, "Sessions command failed after accumulation"
+        print(f"\n  ✓ Session stable after 5 messages")
