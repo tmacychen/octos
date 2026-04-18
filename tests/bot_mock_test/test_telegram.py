@@ -315,8 +315,14 @@ class TestMessageSplitting:
 class TestAbortCommands:
     """验证 Agent 能正确中止任务 — 多语言 abort 触发词识别
     
-    注意：abort 是本地命令识别，不依赖 LLM。
-    但标记为 @pytest.mark.llm 是因为它需要在会话上下文中测试。
+    注意：abort 是本地命令识别（octos-core/src/abort.rs），不依赖 LLM。
+    标记为 @pytest.mark.llm 仅因为需要完整的 gateway 环境。
+    
+    Abort 工作原理：
+    - 用户发送 abort 命令（"停" / "stop" / "cancel" 等）
+    - GatewayDispatcher 在 session_actor 中检测 is_abort_trigger()
+    - 立即返回 abort_response()，不调用 LLM
+    - 响应语言与触发词匹配（中文→中文，英文→英文等）
     """
 
     def test_abort_chinese_stop(self, runner):
@@ -324,38 +330,40 @@ class TestAbortCommands:
         text = inject_and_get_reply(runner, "停", timeout=TIMEOUT_COMMAND)
         
         # 验证收到中文取消响应
-        assert "已取消" in text or "取消" in text, f"Expected Chinese cancel response, got: {text}"
+        assert "已取消" in text or "🛑" in text, \
+            f"Expected Chinese cancel response, got: {text}"
         print(f"\n  ✓ Abort (停) → {text}")
 
     def test_abort_english_stop(self, runner):
         """发送"stop"中止 - 应返回英文响应"""
         text = inject_and_get_reply(runner, "stop", timeout=TIMEOUT_COMMAND)
         
-        # 验证收到英文取消响应
-        assert "Cancelled" in text or "cancelled" in text, f"Expected English cancel response, got: {text}"
+        assert "Cancelled" in text or "🛑" in text, \
+            f"Expected English cancel response, got: {text}"
         print(f"\n  ✓ Abort (stop) → {text}")
 
     def test_abort_english_cancel(self, runner):
         """发送"cancel"中止 - 应返回英文响应"""
         text = inject_and_get_reply(runner, "cancel", timeout=TIMEOUT_COMMAND)
         
-        assert "Cancelled" in text or "cancelled" in text, f"Expected English cancel response, got: {text}"
+        assert "Cancelled" in text or "🛑" in text, \
+            f"Expected English cancel response, got: {text}"
         print(f"\n  ✓ Abort (cancel) → {text}")
 
     def test_abort_japanese(self, runner):
         """发送"やめて"中止 - 应返回日文响应"""
         text = inject_and_get_reply(runner, "やめて", timeout=TIMEOUT_COMMAND)
         
-        # 验证收到日文取消响应
-        assert "キャンセル" in text or "🛑" in text, f"Expected Japanese cancel response, got: {text}"
+        assert "キャンセル" in text or "🛑" in text, \
+            f"Expected Japanese cancel response, got: {text}"
         print(f"\n  ✓ Abort (やめて) → {text}")
 
     def test_abort_russian(self, runner):
         """发送"стоп"中止 - 应返回俄文响应"""
         text = inject_and_get_reply(runner, "стоп", timeout=TIMEOUT_COMMAND)
         
-        # 验证收到俄文取消响应
-        assert "Отменено" in text or "🛑" in text, f"Expected Russian cancel response, got: {text}"
+        assert "Отменено" in text or "🛑" in text, \
+            f"Expected Russian cancel response, got: {text}"
         print(f"\n  ✓ Abort (стоп) → {text}")
 
     def test_abort_case_insensitive(self, runner):
@@ -565,36 +573,33 @@ class TestFileLimits:
             chat_id=test_chat_id
         )
         assert session_name in init_text
-        print(f"\n  Created session: {session_name}")
         
         # 计算需要发送的消息数量以达到 ~10MB
         # 每条消息约 500KB（包含 JSON 序列化开销）
         message_size = 500 * 1024  # 500KB per message
         target_messages = 22  # 22 * 500KB ≈ 11MB（超过 10MB 限制）
         
-        print(f"  Sending {target_messages} messages of {message_size / 1024:.0f}KB each...")
-        print(f"  Target: ~{target_messages * message_size / (1024*1024):.1f}MB total")
+        print(f"\n  Testing 10MB file size limit...")
+        print(f"  Sending {target_messages} messages × {message_size / 1024:.0f}KB")
         
         session_file_path = None
         
         for i in range(target_messages):
-            message = f"Size test message {i+1}: " + "X" * (message_size - 30)
+            message = f"Size test {i+1}: " + "X" * (message_size - 20)
             
             try:
-                text = inject_and_get_reply(
-                    runner, message,
-                    timeout=TIMEOUT_COMMAND,
-                    chat_id=test_chat_id
-                )
+                # 不打印回复内容，只等待响应
+                count_before = len(runner.get_sent_messages())
+                runner.inject(message, chat_id=test_chat_id)
+                msg = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
+                assert msg is not None, f"No reply for message {i+1}"
                 
                 # 每 5 条消息检查一次文件大小
                 if (i + 1) % 5 == 0:
                     current_mb = (i + 1) * message_size / (1024 * 1024)
-                    print(f"    Progress: {i+1}/{target_messages} messages (~{current_mb:.1f}MB)")
                     
                     # 尝试找到会话文件并检查大小
                     if session_file_path is None:
-                        # 查找会话文件
                         sessions_dir = os.path.expanduser("~/.octos/users")
                         user_dir_pattern = f"_main%3Atelegram%3A{test_chat_id}"
                         
@@ -607,43 +612,46 @@ class TestFileLimits:
                     
                     if session_file_path and os.path.exists(session_file_path):
                         file_size_mb = os.path.getsize(session_file_path) / (1024 * 1024)
-                        print(f"    Session file size: {file_size_mb:.2f}MB")
+                        print(f"    [{i+1}/{target_messages}] File: {file_size_mb:.1f}MB")
                         
-                        # 如果已经超过 10MB，记录但继续
                         if file_size_mb > 10:
-                            print(f"    ⚠️  File exceeded 10MB limit!")
+                            print(f"    ⚠️  Exceeded 10MB limit")
+                else:
+                    # 简化进度输出
+                    if (i + 1) % 2 == 0:
+                        print(f"    [{i+1}/{target_messages}] ...", end="\r", flush=True)
                 
                 # 短暂等待，避免过快
                 if i < target_messages - 1:
                     time.sleep(0.1)
                     
             except Exception as e:
-                print(f"  ✗ Failed at message {i+1}: {type(e).__name__}: {str(e)[:100]}")
-                # 不立即失败，继续观察后续行为
+                print(f"\n  ✗ Failed at message {i+1}: {type(e).__name__}")
+                raise
+        
+        print()  # 换行
         
         # 最终验证
         if session_file_path and os.path.exists(session_file_path):
             final_size_mb = os.path.getsize(session_file_path) / (1024 * 1024)
-            print(f"\n  Final session file size: {final_size_mb:.2f}MB")
-            print(f"  Session file path: {session_file_path}")
+            print(f"  Final file size: {final_size_mb:.2f}MB")
             
-            # 验证文件大小应该在 10MB 左右（可能略超或略低，取决于实现）
-            # octos 应该阻止文件显著超过 10MB
+            # 验证文件大小应该在 10MB 左右
             assert final_size_mb < 12, \
                 f"Session file too large: {final_size_mb:.2f}MB (expected < 12MB)"
             
-            print(f"  ✓ Session file size within expected range (< 12MB)")
+            print(f"  ✓ File size within expected range (< 12MB)")
         else:
-            print(f"\n  ⚠️  Could not locate session file for verification")
+            print(f"  ⚠️  Could not locate session file")
         
-        # 验证 octos 仍然能响应（即使文件可能达到限制）
+        # 验证 octos 仍然能响应
         final_response = inject_and_get_reply(
             runner, "Final check",
             timeout=TIMEOUT_COMMAND,
             chat_id=test_chat_id
         )
         assert len(final_response) > 0
-        print(f"  ✓ octos still responds after accumulating ~{target_messages * message_size / (1024*1024):.1f}MB")
+        print(f"  ✓ octos still responds after ~{target_messages * message_size / (1024*1024):.1f}MB")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

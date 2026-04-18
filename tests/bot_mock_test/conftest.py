@@ -8,6 +8,7 @@ conftest.py 中的 fixture 对同目录下所有测试文件自动生效。
 import time
 import pytest
 import asyncio
+import sys
 
 
 def pytest_configure(config):
@@ -18,6 +19,21 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: marks tests that are slow (large data transfer, etc.)"
     )
+
+
+def pytest_runtest_logstart(nodeid, location):
+    """在每个测试用例开始时打印视觉分隔符到日志文件。"""
+    # 提取测试名称（去掉路径和参数）
+    test_name = nodeid.split("::")[-1]
+    
+    # 构建分隔符
+    separator = "\n" + "=" * 70 + "\n"
+    banner = f"▶ START TEST: {test_name}\n"
+    
+    # 同时输出到 stdout 和 stderr（会被 tee 捕获）
+    print(separator, file=sys.stdout, flush=True)
+    print(banner, file=sys.stdout, flush=True)
+    print(separator, file=sys.stderr, flush=True)
 
 
 @pytest.fixture

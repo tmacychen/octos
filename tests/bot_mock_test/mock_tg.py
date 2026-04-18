@@ -497,7 +497,9 @@ class MockTelegramServer:
             }
         )
         self._updates.append(update)
-        logger.info(f"📥 Injected message: {text}")
+        # Truncate long messages in logs to avoid output explosion
+        text_preview = text[:100] + "..." if len(text) > 100 else text
+        logger.info(f"📥 Injected message ({len(text)} bytes): {text_preview}")
         return update_id
     
     def inject_callback_query(self, data: str, chat_id: int = 123,

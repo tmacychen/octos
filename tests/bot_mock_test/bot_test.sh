@@ -169,7 +169,7 @@ setup_telegram_env() {
         err "TELEGRAM_BOT_TOKEN is not set"
         return 1
     fi
-    BOT_LOG="$LOG_DIR/octos_bot_test.log"
+    BOT_LOG="$LOG_DIR/octos_telegram_bot_test.log"
     CONFIG_FILE="$TEST_DIR/.octos/test_config.json"
     EXTRA_ENV_VAR="TELOXIDE_API_URL"
     EXTRA_ENV_VAL="http://127.0.0.1:$MOD_PORT"
@@ -383,13 +383,46 @@ except Exception as e:
     export PYTHONPATH="$SCRIPT_DIR"
     export MOCK_BASE_URL="http://127.0.0.1:$MOD_PORT"
 
-    "$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes
-    local test_exit=$?
+    # Print visual separators to log file
+    echo "" >> "$BOT_LOG"
+    echo "╔══════════════════════════════════════════════════════════════╗" >> "$BOT_LOG"
+    echo "║           TEST EXECUTION START: $MOD_NAME" >> "$BOT_LOG"
+    echo "╚══════════════════════════════════════════════════════════════╝" >> "$BOT_LOG"
+    echo "" >> "$BOT_LOG"
+
+    "$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes | tee -a "$BOT_LOG"
+    local test_exit=${PIPESTATUS[0]}
+
+    # Print test results summary to log
+    echo "" >> "$BOT_LOG"
+    echo "╔══════════════════════════════════════════════════════════════╗" >> "$BOT_LOG"
+    if [ $test_exit -eq 0 ]; then
+        echo "║                  ✅ ALL TESTS PASSED                        ║" >> "$BOT_LOG"
+    else
+        echo "║                  ❌ SOME TESTS FAILED                       ║" >> "$BOT_LOG"
+    fi
+    echo "╚══════════════════════════════════════════════════════════════╝" >> "$BOT_LOG"
+    echo "" >> "$BOT_LOG"
 
     # ── 9. Cleanup ───────────────────────────────────────────────────────────
     section "Cleanup"
+    
+    # Kill processes and wait for them to exit
     kill "$BOT_PID" 2>/dev/null || true
     kill "$MOCK_PID" 2>/dev/null || true
+    
+    # Wait for processes to terminate (with timeout)
+    for i in {1..10}; do
+        if ! kill -0 "$BOT_PID" 2>/dev/null && ! kill -0 "$MOCK_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.5
+    done
+    
+    # Force kill if still running
+    kill -9 "$BOT_PID" 2>/dev/null || true
+    kill -9 "$MOCK_PID" 2>/dev/null || true
+    
     ok "Processes stopped"
 
     echo ""

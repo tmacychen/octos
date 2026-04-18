@@ -298,7 +298,7 @@ def test_multi_turn(self, runner: DiscordTestRunner):
 
 ```fish
 # ====== Telegram 调试 ======
-cat /tmp/octos_bot_test.log
+cat /tmp/octos_telegram_bot_test.log
 
 # 手动启动 Telegram Mock Server
 PYTHONPATH=tests/bot_mock \
