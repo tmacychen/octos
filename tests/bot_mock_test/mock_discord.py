@@ -210,7 +210,7 @@ class MockDiscordServer:
             )
             self._sent_messages.append(sent)
 
-            logger.info(f"Bot sent message to {channel_id}: {content[:80]}")
+            logger.info(f"📤 Bot sent message to {channel_id}: {content[:80]}")
 
             resp: Dict[str, Any] = {
                 "id": msg_id,
@@ -242,7 +242,7 @@ class MockDiscordServer:
             """Edit an existing message."""
             body = await request.json()
             content = body.get("content", "")
-            logger.info(f"Bot edited message {message_id} in {channel_id}: {content[:80]}")
+            logger.info(f"✏️ Bot edited message {message_id} in {channel_id}: {content[:80]}")
 
             # Track as sent message with [edited] prefix
             self._sent_messages.append(SentMessage(
@@ -261,19 +261,19 @@ class MockDiscordServer:
         @app.delete("/api/v10/channels/{channel_id}/messages/{message_id}")
         async def delete_message(channel_id: str, message_id: str):
             """Delete a message."""
-            logger.info(f"Bot deleted message {message_id} in {channel_id}")
+            logger.info(f"🗑️ Bot deleted message {message_id} in {channel_id}")
             return JSONResponse({})
 
         @app.put("/api/v10/channels/{channel_id}/messages/{message_id}/reactions/{emoji:path}/@me")
         async def create_reaction(channel_id: str, message_id: str, emoji: str):
             """Add reaction to a message."""
-            logger.info(f"Bot reacted {emoji} to msg {message_id}")
+            logger.info(f"👍 Bot reacted {emoji} to msg {message_id}")
             return JSONResponse({})
 
         @app.delete("/api/v10/channels/{channel_id}/messages/{message_id}/reactions/{emoji:path}/@me")
         async def delete_reaction(channel_id: str, message_id: str, emoji: str):
             """Remove bot's reaction from a message."""
-            logger.info(f"Bot removed reaction {emoji} from msg {message_id}")
+            logger.info(f"👎 Bot removed reaction {emoji} from msg {message_id}")
             return JSONResponse({})
 
         @app.post("/api/v10/interactions/{interaction_id}/{token}/callback")
@@ -427,7 +427,7 @@ class MockDiscordServer:
                 "d": event,
             }
             await websocket.send_json(payload)
-            logger.info(f"Dispatched MESSAGE_CREATE: {msg.content[:50]}")
+            logger.info(f"📥 Dispatched MESSAGE_CREATE ({len(msg.content)} bytes): {msg.content[:50]}")
             seq += 1
             self._injected_messages.remove(msg)
         return seq
@@ -621,7 +621,7 @@ class MockDiscordServer:
         self._injected_messages.append(msg)
         update_id = self._next_update_id
         self._next_update_id += 1
-        logger.info(f"Injected message (programmatic): {text[:50]}")
+        logger.info(f"📥 Injected message ({len(text)} bytes): {text[:50]}")
         return update_id
 
     def inject_interaction_data(
@@ -641,7 +641,7 @@ class MockDiscordServer:
         self._injected_interactions.append(inter)
         update_id = self._next_update_id
         self._next_update_id += 1
-        logger.info(f"Injected interaction (programmatic): {data}")
+        logger.info(f"🎯 Injected interaction: {data.get('name', 'unknown')}")
         return update_id
 
     def get_sent_messages(self) -> List[SentMessage]:
@@ -667,7 +667,7 @@ class MockDiscordServer:
 
         thread = Thread(target=run, daemon=True)
         thread.start()
-        logger.info(f"Mock Discord server started at http://{self.host}:{self.port} (WS at same address)")
+        logger.info(f"🚀 Mock Discord server started at http://{self.host}:{self.port} (WS at same address)")
         return thread
 
 
