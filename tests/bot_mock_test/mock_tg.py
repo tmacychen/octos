@@ -156,7 +156,7 @@ class MockTelegramServer:
                 reply_to_message_id=reply_to_message_id,
             ))
             
-            logger.info(f"📤 Bot sent message to {chat_id}: {text[:50]}...")
+            logger.info(f"🤖 Bot sent message to {chat_id}: {text[:50]}...")
             
             return {
                 "ok": True,
@@ -532,7 +532,7 @@ class MockTelegramServer:
         self._updates.append(update)
         # Truncate long messages in logs to avoid output explosion
         text_preview = text[:100] + "..." if len(text) > 100 else text
-        logger.info(f"📥 Injected message ({len(text)} bytes): {text_preview}")
+        logger.info(f"💬 Injected message ({len(text)} bytes): {text_preview}")
         return update_id
     
     def inject_document(self, file_path: str, caption: str, chat_id: int = 123,
@@ -607,7 +607,7 @@ class MockTelegramServer:
             }
         )
         self._updates.append(update)
-        logger.info(f"📥 Injected callback query: {data}")
+        logger.info(f"🎯 Injected callback query: {data}")
         return update_id
     
     def get_sent_messages(self) -> list[SentMessage]:

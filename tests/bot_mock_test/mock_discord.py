@@ -210,7 +210,7 @@ class MockDiscordServer:
             )
             self._sent_messages.append(sent)
 
-            logger.info(f"📤 Bot sent message to {channel_id}: {content[:80]}")
+            logger.info(f"🤖 Bot sent message to {channel_id}: {content[:80]}")
 
             resp: Dict[str, Any] = {
                 "id": msg_id,
@@ -427,7 +427,7 @@ class MockDiscordServer:
                 "d": event,
             }
             await websocket.send_json(payload)
-            logger.info(f"📥 Dispatched MESSAGE_CREATE ({len(msg.content)} bytes): {msg.content[:50]}")
+            logger.info(f"🔄 Dispatched MESSAGE_CREATE ({len(msg.content)} bytes): {msg.content[:50]}")
             seq += 1
             self._injected_messages.remove(msg)
         return seq
@@ -622,7 +622,7 @@ class MockDiscordServer:
         self._injected_messages.append(msg)
         update_id = self._next_update_id
         self._next_update_id += 1
-        logger.info(f"📥 Injected message ({len(text)} bytes): {text[:50]}")
+        logger.info(f"💬 Injected message ({len(text)} bytes): {text[:50]}")
         return update_id
 
     def inject_interaction_data(
