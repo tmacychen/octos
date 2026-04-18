@@ -326,7 +326,6 @@ class TestDiscordConcurrencyLimit:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.llm
-@pytest.mark.skip(reason="Discord abort handling needs investigation - Octos may not recognize plain text abort commands in Discord")
 class TestDiscordAbortCommands:
     """验证 Agent 能正确中止任务 — 多语言 abort 触发词识别"""
 
@@ -361,7 +360,7 @@ class TestDiscordAbortCommands:
         text = abort_reply["text"]
         
         # 验证收到英文取消响应
-        assert "cancel" in text.lower() or "abort" in text.lower() or "🛑" in text, \
+        assert "cancel" in text.lower() or "abort" in text.lower() or "🛑" in text or "cancelled" in text.lower(), \
             f"Expected English cancel response, got: {text[:200]}"
         print(f"  ✓ Abort (stop) → {text}")
 
