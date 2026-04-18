@@ -94,6 +94,17 @@ class InjectedInteraction:
     message_id: Optional[str] = None
 
 
+@dataclass
+class InjectedDocument:
+    """A document/file upload injected by test scripts."""
+    file_path: str
+    caption: str = ""
+    channel_id: str = DEFAULT_CHANNEL_ID
+    guild_id: Optional[str] = DEFAULT_GUILD_ID
+    sender_id: str = DEFAULT_USER_ID
+    sender_name: str = "TestUser"
+
+
 # ---------------------------------------------------------------------------
 # Mock server
 # ---------------------------------------------------------------------------
@@ -117,6 +128,7 @@ class MockDiscordServer:
         self._sent_messages: List[SentMessage] = []
         self._injected_messages: List[InjectedMessage] = []
         self._injected_interactions: List[InjectedInteraction] = []
+        self._injected_documents: List[InjectedDocument] = []
         self._message_counter: int = int(time.time() * 1000)  # snowflake-like
         self._next_update_id: int = 1
 
@@ -407,6 +419,7 @@ class MockDiscordServer:
         # ====== Test control endpoints ======
         app.add_api_route("/_inject", self._handle_inject, methods=["POST"])
         app.add_api_route("/_inject_interaction", self._handle_inject_interaction, methods=["POST"])
+        app.add_api_route("/_inject_document", self._handle_inject_document, methods=["POST"])
         app.add_api_route("/_sent_messages", self._handle_sent_messages, methods=["GET"])
         app.add_api_route("/_clear", self._handle_clear, methods=["POST"])
         app.add_api_route("/health", self._handle_health, methods=["GET"])
@@ -577,6 +590,39 @@ class MockDiscordServer:
                 logger.warning(f"Failed to dispatch interaction: {e}")
         return {"ok": True}
 
+    async def _handle_inject_document(self, request: Request):
+        """Inject a document/file upload (for testing file handling)"""
+        from pathlib import Path
+        
+        data = await request.json()
+        file_path = data.get("file_path")
+        caption = data.get("caption", "")
+        
+        if not file_path:
+            raise HTTPException(status_code=400, detail="file_path is required")
+        
+        if not Path(file_path).exists():
+            raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+        
+        doc = InjectedDocument(
+            file_path=file_path,
+            caption=caption,
+            channel_id=str(data.get("channel_id", DEFAULT_CHANNEL_ID)),
+            guild_id=str(data.get("guild_id")) if data.get("guild_id") else None,
+            sender_id=str(data.get("sender_id", DEFAULT_USER_ID)),
+            sender_name=str(data.get("username", "TestUser")),
+        )
+        self._injected_documents.append(doc)
+        
+        # Dispatch as MESSAGE_CREATE with attachment
+        for ws in list(self._ws_clients):
+            try:
+                await self._dispatch_injected_messages(ws, 0)
+            except Exception as e:
+                logger.warning(f"Failed to dispatch document to WS client: {e}")
+        
+        return {"ok": True}
+
     async def _handle_sent_messages(self):
         """Return all messages sent by the bot."""
         return [
@@ -595,6 +641,7 @@ class MockDiscordServer:
         self._sent_messages.clear()
         self._injected_messages.clear()
         self._injected_interactions.clear()
+        self._injected_documents.clear()
         return {"ok": True}
 
     async def _handle_health(self):

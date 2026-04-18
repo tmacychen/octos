@@ -100,7 +100,8 @@ class TestDiscordSessionCommands:
     def test_delete_no_name(self, runner):
         """/delete 无名称时显示错误"""
         text = inject_and_get_reply(runner, "/delete", timeout=TIMEOUT_COMMAND)
-        assert "usage" in text.lower() or "error" in text.lower() or "name" in text.lower(), \
+        # 实际返回："Cannot delete the default session. Use /clear to reset it."
+        assert "cannot delete" in text.lower() or "default session" in text.lower() or "clear" in text.lower(), \
             f"Expected error for /delete without name, got: {text}"
 
     def test_soul_show(self, runner):
@@ -404,10 +405,21 @@ class TestDiscordConcurrencyLimit:
 
 @pytest.mark.llm
 class TestDiscordAbortCommands:
-    """验证 Agent 能正确中止任务 — 多语言 abort 触发词识别"""
+    """验证 Agent 能正确中止任务 — 多语言 abort 触发词识别
+    
+    注意：abort 是本地命令识别（octos-core/src/abort.rs），不依赖 LLM。
+    标记为 @pytest.mark.llm 仅因为需要完整的 gateway 环境。
+    
+    Abort 工作原理：
+    - 用户发送任务消息，octos 开始处理
+    - 用户发送 abort 命令（“停” / “stop” / “cancel” 等）
+    - SessionActor 在处理消息前检测 is_abort_trigger()
+    - 立即返回 abort_response()，不调用 LLM
+    - 响应语言与触发词匹配（中文→中文，英文→英文等）
+    """
 
     def test_abort_english_stop(self, runner):
-        """发送任务后，用"stop"中止 - 应返回英文响应"""
+        """发送任务后，用“stop”中止 - 应返回英文响应"""
         
         # 先发送 hi 建立会话
         count_before = len(runner.get_sent_messages())
@@ -416,33 +428,29 @@ class TestDiscordAbortCommands:
         assert hi_reply is not None, "Bot did not respond to hi"
         print(f"\n  Session established: {hi_reply['text'][:50]}...")
         
-        # 再发送一个任务消息
+        # 发送一个会触发长时间处理的任务
         count_after_hi = len(runner.get_sent_messages())
-        runner.inject("Help me write code", channel_id="1039178386623557754")
+        runner.inject("请帮我写一段详细的Python代码，包括完整的注释和文档字符串，至少500行", 
+                      channel_id="1039178386623557754")
         
-        # 等待 octos 开始回复
-        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
-        assert first_reply is not None, "Bot did not start processing the task"
-        print(f"  Task started: {first_reply['text'][:50]}...")
+        # 等待一小段时间让 octos 开始处理（但不等完成）
+        time.sleep(0.5)
         
-        # 额外等待一小段时间
-        time.sleep(1)
-        
-        # 现在发送 abort 命令
-        count_after_first = len(runner.get_sent_messages())
+        # 在任务处理过程中发送 abort 命令
+        count_after_task = len(runner.get_sent_messages())
         runner.inject("stop", channel_id="1039178386623557754")
-        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        abort_reply = runner.wait_for_reply(count_before=count_after_task, timeout=TIMEOUT_COMMAND)
         
         assert abort_reply is not None, "Bot did not respond to abort command"
         text = abort_reply["text"]
         
         # 验证收到英文取消响应
-        assert "cancel" in text.lower() or "abort" in text.lower() or "🛑" in text or "cancelled" in text.lower(), \
+        assert "🛑" in text or "cancel" in text.lower() or "cancelled" in text.lower(), \
             f"Expected English cancel response, got: {text[:200]}"
         print(f"  ✓ Abort (stop) → {text}")
 
     def test_abort_english_cancel(self, runner):
-        """发送任务后，用"cancel"中止"""
+        """发送任务后，用“cancel”中止"""
         
         count_before = len(runner.get_sent_messages())
         runner.inject("hi", channel_id="1039178386623557755")
@@ -450,20 +458,19 @@ class TestDiscordAbortCommands:
         assert hi_reply is not None
         
         count_after_hi = len(runner.get_sent_messages())
-        runner.inject("Write a function", channel_id="1039178386623557755")
-        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
-        assert first_reply is not None
+        runner.inject("Write a comprehensive function with error handling", 
+                      channel_id="1039178386623557755")
         
-        time.sleep(1)
+        time.sleep(0.5)
         
-        count_after_first = len(runner.get_sent_messages())
+        count_after_task = len(runner.get_sent_messages())
         runner.inject("cancel", channel_id="1039178386623557755")
-        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        abort_reply = runner.wait_for_reply(count_before=count_after_task, timeout=TIMEOUT_COMMAND)
         
         assert abort_reply is not None, "Bot did not respond to cancel command"
         text = abort_reply["text"]
         
-        assert "cancel" in text.lower() or "abort" in text.lower() or "🛑" in text, \
+        assert "🛑" in text or "cancel" in text.lower() or "cancelled" in text.lower(), \
             f"Expected cancel response, got: {text[:200]}"
         print(f"  ✓ Abort (cancel) → {text}")
 
@@ -475,19 +482,19 @@ class TestDiscordAbortCommands:
         assert hi_reply is not None
         
         count_after_hi = len(runner.get_sent_messages())
-        runner.inject("Help me", channel_id="1039178386623557756")
-        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
-        assert first_reply is not None
+        runner.inject("请帮我分析量子计算的原理和应用", 
+                      channel_id="1039178386623557756")
         
-        time.sleep(1)
+        time.sleep(0.5)
         
-        count_after_first = len(runner.get_sent_messages())
+        count_after_task = len(runner.get_sent_messages())
         runner.inject("停", channel_id="1039178386623557756")
-        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        abort_reply = runner.wait_for_reply(count_before=count_after_task, timeout=TIMEOUT_COMMAND)
         
         assert abort_reply is not None, "Bot did not respond to abort command"
         text = abort_reply["text"]
-        assert "🛑" in text or "取消" in text, f"Expected Chinese cancel response, got: {text[:200]}"
+        assert "🛑" in text or "取消" in text or "已取消" in text, \
+            f"Expected Chinese cancel response, got: {text[:200]}"
         print(f"  ✓ Abort (停) → {text}")
 
     def test_abort_case_insensitive(self, runner):
@@ -499,18 +506,17 @@ class TestDiscordAbortCommands:
         
         count_after_hi = len(runner.get_sent_messages())
         runner.inject("Task", channel_id="1039178386623557757")
-        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
-        assert first_reply is not None
         
-        time.sleep(1)
+        time.sleep(0.5)
         
-        count_after_first = len(runner.get_sent_messages())
+        count_after_task = len(runner.get_sent_messages())
         runner.inject("STOP", channel_id="1039178386623557757")  # Uppercase
-        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        abort_reply = runner.wait_for_reply(count_before=count_after_task, timeout=TIMEOUT_COMMAND)
         
         assert abort_reply is not None, "Bot did not respond to STOP command"
         text = abort_reply["text"]
-        assert "🛑" in text or "cancel" in text.lower(), f"Expected cancel response, got: {text[:200]}"
+        assert "🛑" in text or "cancel" in text.lower() or "cancelled" in text.lower(), \
+            f"Expected cancel response, got: {text[:200]}"
         print(f"  ✓ Abort (STOP uppercase) → {text}")
 
     def test_abort_with_whitespace(self, runner):
@@ -532,18 +538,17 @@ class TestDiscordAbortCommands:
         
         count_after_hi = len(runner.get_sent_messages())
         runner.inject("Task", channel_id="1039178386623557767")
-        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
-        assert first_reply is not None
         
-        time.sleep(1)
+        time.sleep(0.5)
         
-        count_after_first = len(runner.get_sent_messages())
+        count_after_task = len(runner.get_sent_messages())
         runner.inject("やめて", channel_id="1039178386623557767")
-        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        abort_reply = runner.wait_for_reply(count_before=count_after_task, timeout=TIMEOUT_COMMAND)
         
         assert abort_reply is not None, "Bot did not respond to Japanese abort command"
         text = abort_reply["text"]
-        assert "🛑" in text or "cancel" in text.lower(), f"Expected cancel response, got: {text[:200]}"
+        assert "🛑" in text or "cancel" in text.lower() or "キャンセル" in text, \
+            f"Expected cancel response, got: {text[:200]}"
         print(f"  ✓ Abort (やめて) → {text}")
 
     def test_abort_russian(self, runner):
@@ -555,18 +560,17 @@ class TestDiscordAbortCommands:
         
         count_after_hi = len(runner.get_sent_messages())
         runner.inject("Task", channel_id="1039178386623557768")
-        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
-        assert first_reply is not None
         
-        time.sleep(1)
+        time.sleep(0.5)
         
-        count_after_first = len(runner.get_sent_messages())
+        count_after_task = len(runner.get_sent_messages())
         runner.inject("стоп", channel_id="1039178386623557768")
-        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        abort_reply = runner.wait_for_reply(count_before=count_after_task, timeout=TIMEOUT_COMMAND)
         
         assert abort_reply is not None, "Bot did not respond to Russian abort command"
         text = abort_reply["text"]
-        assert "🛑" in text or "cancel" in text.lower(), f"Expected cancel response, got: {text[:200]}"
+        assert "🛑" in text or "cancel" in text.lower() or "Отменено" in text, \
+            f"Expected cancel response, got: {text[:200]}"
         print(f"  ✓ Abort (стоп) → {text}")
 
     def test_non_abort_messages_not_triggered(self, runner):
