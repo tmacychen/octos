@@ -33,8 +33,9 @@ def runner():
 @pytest.fixture(autouse=True)
 def cleanup_state(runner):
     """每个测试前清理 Mock Server 状态"""
-    # Small delay to ensure previous LLM responses are complete
-    time.sleep(0.5)
+    # Wait for any pending LLM responses to complete
+    # This prevents cross-test contamination from slow LLM calls
+    time.sleep(1.0)
     runner.clear()
     yield
 
