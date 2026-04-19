@@ -33,6 +33,7 @@ OCTOS_BINARY="octos"
 OUTPUT_DIR="test-results"
 VERBOSE=false
 CANCELLED=false
+TEST_SCOPE="all"  # all or specific category
 
 # Unified test runner presets
 TEST_DIR="${OCTOS_TEST_DIR:-/tmp/octos_test}"
@@ -59,6 +60,7 @@ if [[ -t 1 ]]; then
     YELLOW='\033[0;33m'
     CYAN='\033[0;36m'
     GRAY='\033[0;90m'
+    BOLD='\033[1m'
     NC='\033[0m'
 else
     RED=''
@@ -66,6 +68,7 @@ else
     YELLOW=''
     CYAN=''
     GRAY=''
+    BOLD=''
     NC=''
 fi
 
@@ -77,7 +80,8 @@ Do NOT run directly. Use:
 Arguments:
     -v, --verbose           Verbose output
     -o, --output-dir DIR    Output directory (default: test-results)
-    -c, --config FILE       Test config file (default: test_cases.json)
+    -s, --scope SCOPE       Test scope: all|CLI|Init|Clean|Status|Completions|Skills|Auth|Channels|Cron|Chat|Gateway|Serve|Docs
+    list                    List available test categories and exit
 EOF
 }
 
@@ -280,6 +284,33 @@ check_jq() {
     fi
 }
 
+list_categories() {
+    check_jq
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}[ERROR] Config file not found: $CONFIG_FILE${NC}"
+        exit 1
+    fi
+
+    echo -e "${CYAN}Available Test Categories:${NC}"
+    echo -e "${GRAY}========================================${NC}"
+    
+    # Extract unique categories and count tests per category
+    jq -r '.tests[].category' "$CONFIG_FILE" | sort | uniq -c | sort -rn | while read count category; do
+        printf "  ${GREEN}%-20s${NC} %d tests\n" "$category" "$count"
+    done
+    
+    echo -e "${GRAY}========================================${NC}"
+    local total
+    total=$(jq '.tests | length' "$CONFIG_FILE")
+    echo -e "Total: ${BOLD}$total${NC} test cases"
+    echo ""
+    echo -e "${YELLOW}Usage examples:${NC}"
+    echo -e "  tests/run_tests.sh --test cli -s Init          # Run only Init tests"
+    echo -e "  tests/run_tests.sh --test cli -s Completions   # Run only Completions tests"
+    echo -e "  tests/run_tests.sh --test cli                  # Run all tests"
+}
+
 load_tests_from_json() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}[ERROR] Config file not found: $CONFIG_FILE${NC}"
@@ -300,6 +331,7 @@ run_tests_from_json() {
     check_jq
 
     TEST_COUNT=$(jq '.tests | length' "$CONFIG_FILE")
+    local skipped=0
 
     for i in $(seq 0 $((TEST_COUNT - 1))); do
         if [[ "$CANCELLED" == true ]]; then
@@ -317,6 +349,12 @@ run_tests_from_json() {
         FILE_PATH=$(jq -r ".tests[$i].path // \"\"" "$CONFIG_FILE")
         SHOULD_EXIST=$(jq -r ".tests[$i].should_exist // true" "$CONFIG_FILE")
 
+        # Filter by test scope
+        if [[ "$TEST_SCOPE" != "all" ]] && [[ "$CATEGORY" != "$TEST_SCOPE" ]]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
         COMMAND=$(echo "$COMMAND" | sed "s|{testDir}|$TEST_DIR|g" | sed "s|{tempDir}|$TEMP_DIR|g")
 
         if [[ "$CATEGORY" != "$CURRENT_CATEGORY" ]]; then
@@ -332,6 +370,11 @@ run_tests_from_json() {
             run_cli_test "$TEST_ID" "$CATEGORY" "$NAME" "$COMMAND" "$EXPECTED" "$VALIDATION" "$TIMEOUT"
         fi
     done
+
+    if [[ $skipped -gt 0 ]]; then
+        echo -e "\n${GRAY}Skipped $skipped tests (scope: $TEST_SCOPE)${NC}"
+        log "Skipped $skipped tests (scope: $TEST_SCOPE)"
+    fi
 }
 
 main() {
@@ -343,16 +386,30 @@ main() {
                 shift 2
                 ;;
             -o|--output-dir)
+                if [[ -z "${2:-}" ]]; then
+                    echo -e "${RED}[ERROR] Option $1 requires a value${NC}"
+                    usage
+                    exit 1
+                fi
                 OUTPUT_DIR="$2"
-                shift 2
-                ;;
-            -c|--config)
-                CONFIG_FILE="$2"
                 shift 2
                 ;;
             -v|--verbose)
                 VERBOSE=true
                 shift
+                ;;
+            -s|--scope)
+                if [[ -z "${2:-}" ]]; then
+                    echo -e "${RED}[ERROR] Option $1 requires a value${NC}"
+                    usage
+                    exit 1
+                fi
+                TEST_SCOPE="$2"
+                shift 2
+                ;;
+            list)
+                list_categories
+                exit 0
                 ;;
             -h|--help)
                 usage
@@ -408,12 +465,12 @@ main() {
     run_tests_from_json
 
     # ========================================
-    # Generate Report
+    # Generate Brief Report
     # ========================================
     echo -e "\n${CYAN}========================================${NC}"
-    echo -e "${CYAN}Generating Report...${NC}"
+    echo -e "${CYAN}Generating Brief Report...${NC}"
     log "========================================"
-    log "Generating Report..."
+    log "Generating Brief Report..."
 
     local report_path="${OUTPUT_DIR}/CLI_TEST_REPORT_${REPORT_DATE}.md"
     local pass_rate=0
@@ -421,53 +478,54 @@ main() {
         pass_rate=$(( PASSED * 100 / TOTAL ))
     fi
 
+    # Write brief report to file
     {
-        echo "# Octos CLI Automated Test Report"
+        echo "# Octos CLI Test Report"
         echo ""
-        echo "## Test Information"
+        echo "## Summary"
         echo ""
-        echo "| Item | Content |"
-        echo "|------|---------|"
-        echo "| Test Date | $TEST_DATE |"
-        echo "| Binary | $OCTOS_BINARY |"
-        echo "| Total Tests | $TOTAL |"
-        echo "| Passed | $PASSED |"
-        echo "| Failed | $FAILED |"
-        echo "| Pass Rate | ${pass_rate}% |"
-        echo "| Log File | $LOG_FILE |"
+        echo "- **Test Date**: $TEST_DATE"
+        echo "- **Scope**: $TEST_SCOPE"
+        echo "- **Total**: $TOTAL"
+        echo "- **Passed**: $PASSED"
+        echo "- **Failed**: $FAILED"
+        echo "- **Pass Rate**: ${pass_rate}%"
         echo ""
-        echo "## Detailed Test Results"
+        echo "## Failed Tests"
         echo ""
-        echo "| ID | Category | Test Name | Status |"
-        echo "|----|----------|-----------|--------|"
-        for r in "${RESULTS[@]}"; do
-            echo "$r"
-        done
-        echo ""
-        echo "## Environment"
-        echo ""
-        echo "- OS: $(uname -s)"
-        echo "- Test Date: $TEST_DATE"
+        if [[ $FAILED -eq 0 ]]; then
+            echo "✅ All tests passed!"
+        else
+            echo "| ID | Category | Test Name |"
+            echo "|----|----------|-----------|"
+            for r in "${RESULTS[@]}"; do
+                if echo "$r" | grep -q "FAIL"; then
+                    # Extract test info from result line
+                    echo "$r" | sed 's/| \([^ ]*\) | \([^ ]*\) | \(.*\) | FAIL |/| \1 | \2 | \3 |/'
+                fi
+            done
+        fi
         echo ""
         echo "---"
-        echo "*Generated by Bash test script*"
-    } >> "$report_path"
+        echo "*Generated at $TEST_DATE*"
+    } > "$report_path"
 
-    echo -e "${GREEN}Report: $report_path${NC}"
-    echo -e "${GREEN}Log: $LOG_FILE${NC}"
-    log "Report saved to: $report_path"
-    log "Log saved to: $LOG_FILE"
-    echo ""
+    # Print summary to stdout
+    echo -e "\n${CYAN}========================================${NC}"
+    echo -e "${BOLD}Test Summary${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "  Scope:     $TEST_SCOPE"
+    echo -e "  Total:     $TOTAL"
+    echo -e "  Passed:    ${GREEN}$PASSED${NC}"
+    echo -e "  Failed:    ${RED}$FAILED${NC}"
+    echo -e "  Pass Rate: ${pass_rate}%"
+    echo -e ""
+    echo -e "  Report:    ${GREEN}$report_path${NC}"
+    echo -e "  Log:       ${GRAY}$LOG_FILE${NC}"
     echo -e "${CYAN}========================================${NC}"
 
-    if [[ $pass_rate -ge 80 ]]; then
-        echo -e "${GREEN}SUMMARY: Total=$TOTAL Passed=$PASSED Failed=$FAILED PassRate=${pass_rate}%${NC}"
-    elif [[ $pass_rate -ge 60 ]]; then
-        echo -e "${YELLOW}SUMMARY: Total=$TOTAL Passed=$PASSED Failed=$FAILED PassRate=${pass_rate}%${NC}"
-    else
-        echo -e "${RED}SUMMARY: Total=$TOTAL Passed=$PASSED Failed=$FAILED PassRate=${pass_rate}%${NC}"
-    fi
-
+    log "Report saved to: $report_path"
+    log "Log saved to: $LOG_FILE"
     log "========================================"
     log "SUMMARY: Total=$TOTAL Passed=$PASSED Failed=$FAILED PassRate=${pass_rate}%"
 

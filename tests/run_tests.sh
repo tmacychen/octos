@@ -221,23 +221,28 @@ show_help() {
     echo "    telegram, tg     Run Telegram tests only"
     echo "    discord, dc      Run Discord tests only"
     echo "    list             List available bot modules"
-    echo "    cases <mod>      List test cases in a module"
+    echo "    list <mod>       List test cases in a module"
     echo "    <mod> [case]     Run module or specific test case"
     echo ""
     echo "  CLI test arguments (after --test cli):"
-    echo "    -v, --verbose    Verbose output"
-    echo "    -o, --output-dir Output directory (default: test-results)"
-    echo "    -c, --config     Test config file"
+    echo "    -v, --verbose              Verbose output"
+    echo "    -o, --output-dir DIR       Output directory (default: test-results)"
+    echo "    -s, --scope SCOPE          Test scope: all|CLI|Init|Clean|Status|Completions|Skills|Auth|Channels|Cron|Chat|Gateway|Serve|Docs"
+    echo "    list                       List available test categories and exit"
     echo ""
     echo "  Examples:"
     echo "    tests/run_tests.sh all                     # run everything"
     echo "    tests/run_tests.sh --test bot              # all bot tests"
     echo "    tests/run_tests.sh --test bot telegram     # Telegram only"
-    echo "    tests/run_tests.sh --test bot cases tg     # list Telegram cases"
+    echo "    tests/run_tests.sh --test bot list         # list bot modules"
+    echo "    tests/run_tests.sh --test bot list tg      # list Telegram test cases"
     echo "    tests/run_tests.sh --test bot tg           # run Telegram tests"
     echo "    tests/run_tests.sh --test bot tg test_concurrent_session_creation  # run single test"
     echo "    tests/run_tests.sh --test cli              # CLI tests"
     echo "    tests/run_tests.sh --test cli -v           # CLI tests, verbose"
+    echo "    tests/run_tests.sh --test cli list         # List test categories"
+    echo "    tests/run_tests.sh --test cli -s Init      # Run only Init tests"
+    echo "    tests/run_tests.sh --test cli -s Completions # Run only Completions tests"
     echo ""
     echo "  Environment:"
     echo "    ANTHROPIC_API_KEY    Required for bot LLM tests"
@@ -261,7 +266,7 @@ fi
 # ── Validate command early (before building) ─────────────────────────────────
 case "$ACTION" in
     all|--test)
-        # Valid commands, continue to env check and build
+        # Valid commands, continue to validation
         ;;
     *)
         err "Unknown command: $ACTION"
@@ -269,6 +274,73 @@ case "$ACTION" in
         exit 1
         ;;
 esac
+
+# ── Validate --test arguments before building ────────────────────────────────
+if [[ "$ACTION" == "--test" ]]; then
+    TEST_TARGET="${2:-}"
+    if [[ -z "$TEST_TARGET" ]]; then
+        err "--test requires an argument: bot | cli"
+        show_help
+        exit 1
+    fi
+    
+    # Pre-validate CLI test arguments (before building)
+    # Only check for obviously invalid option flags, detailed validation is done by cli_test.sh
+    if [[ "$TEST_TARGET" == "cli" ]] && [[ $# -ge 3 ]]; then
+        valid_opts="-v --verbose -o --output-dir -s --scope list"
+        prev_arg=""
+        for i in $(seq 3 $#); do
+            arg="${!i}"
+            # Check if it's an option flag (starts with -) and not a value for previous option
+            if [[ "$arg" == -* ]] && [[ "$prev_arg" != "-o" ]] && [[ "$prev_arg" != "--output-dir" ]] && \
+               [[ "$prev_arg" != "-s" ]] && [[ "$prev_arg" != "--scope" ]]; then
+                # It's an option flag, check if it's in the whitelist
+                if ! echo "$valid_opts" | grep -q -- "$arg"; then
+                    err "Invalid argument for CLI tests: $arg"
+                    echo ""
+                    echo "This check runs before compilation to catch typos early."
+                    echo ""
+                    echo "Valid CLI test options:"
+                    echo "  -v, --verbose          Verbose output"
+                    echo "  -o, --output-dir DIR   Output directory"
+                    echo "  -s, --scope SCOPE      Test scope (all|CLI|Init|Clean|...)"
+                    echo "  list                   List available test categories"
+                    echo ""
+                    echo "For general help, use: tests/run_tests.sh --help"
+                    echo ""
+                    echo "Examples:"
+                    echo "  tests/run_tests.sh --test cli              # Run all CLI tests"
+                    echo "  tests/run_tests.sh --test cli -s Init      # Run Init tests only"
+                    echo "  tests/run_tests.sh --test cli list         # List test categories"
+                    exit 1
+                fi
+                
+                # Check if this option requires a value and if there's a next argument
+                case "$arg" in
+                    -o|--output-dir|-s|--scope)
+                        next_i=$((i + 1))
+                        if [[ $next_i -le $# ]]; then
+                            next_arg="${!next_i}"
+                            # If next arg starts with -, it's likely another option, not a value
+                            if [[ "$next_arg" == -* ]]; then
+                                err "Option $arg requires a value"
+                                echo ""
+                                echo "Example: tests/run_tests.sh --test cli -s Init"
+                                exit 1
+                            fi
+                        else
+                            err "Option $arg requires a value"
+                            echo ""
+                            echo "Example: tests/run_tests.sh --test cli -s Init"
+                            exit 1
+                        fi
+                        ;;
+                esac
+            fi
+            prev_arg="$arg"
+        done
+    fi
+fi
 
 # ── Pre-flight env check ──────────────────────────────────────────────────────
 check_bot_env() {
@@ -300,8 +372,23 @@ case "$ACTION" in
         ;;
 esac
 
-# Build octos once (all features)
-build_octos
+# Check if we need to build (skip for list/cases operations)
+NEED_BUILD=true
+case "$ACTION" in
+    --test)
+        TEST_TARGET="${2:-}"
+        FIRST_SUB_ARG="${3:-}"  # First argument after --test <target>
+        # Check if first sub-arg is a list operation
+        if [[ "$FIRST_SUB_ARG" == "list" ]] || [[ "$FIRST_SUB_ARG" == "cases" ]]; then
+            NEED_BUILD=false
+        fi
+        ;;
+esac
+
+# Build octos once (all features) - only if needed
+if [[ "$NEED_BUILD" == true ]]; then
+    build_octos
+fi
 
 case "$ACTION" in
     all)
