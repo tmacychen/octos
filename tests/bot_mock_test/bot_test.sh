@@ -171,7 +171,7 @@ setup_telegram_env() {
         return 1
     fi
     BOT_LOG="$LOG_DIR/octos_telegram_bot_test.log"
-    CONFIG_FILE="$TEST_DIR/.octos/test_config.json"
+    CONFIG_FILE="$TEST_DIR/.octos/test_telegram_config.json"
     EXTRA_ENV_VAR="TELOXIDE_API_URL"
     EXTRA_ENV_VAL="http://127.0.0.1:$MOD_PORT"
     CONFIG_JSON='{
