@@ -237,7 +237,12 @@ run_module() {
 
     section "Running $MOD_NAME tests (port $MOD_PORT)"
 
-    # ── 0. Ensure log directory exists ───────────────────────────────────────
+    # ── 0. Print octos version ──────────────────────────────────────────────
+    local octos_version
+    octos_version=$("$BOT_BIN" --version 2>/dev/null || echo "unknown")
+    info "octos version: $octos_version"
+
+    # ── 1. Ensure log directory exists ───────────────────────────────────────
     mkdir -p "$LOG_DIR"
 
     # ── 1. Check ANTHROPIC_API_KEY ───────────────────────────────────────────
