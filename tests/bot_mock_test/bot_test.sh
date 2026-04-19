@@ -170,7 +170,7 @@ setup_telegram_env() {
         err "TELEGRAM_BOT_TOKEN is not set"
         return 1
     fi
-    BOT_LOG="$LOG_DIR/octos_telegram_bot_test.log"
+    BOT_LOG="$LOG_DIR/octos_telegram_bot_test_$(date +%Y%m%d_%H%M%S).log"
     CONFIG_FILE="$TEST_DIR/.octos/test_telegram_config.json"
     EXTRA_ENV_VAR="TELOXIDE_API_URL"
     EXTRA_ENV_VAL="http://127.0.0.1:$MOD_PORT"
@@ -200,7 +200,7 @@ setup_discord_env() {
         export DISCORD_BOT_TOKEN="mock-bot-token-for-testing"
         info "DISCORD_BOT_TOKEN not set, using dummy value (mock mode)"
     fi
-    BOT_LOG="$LOG_DIR/octos_discord_bot_test.log"
+    BOT_LOG="$LOG_DIR/octos_discord_bot_test_$(date +%Y%m%d_%H%M%S).log"
     CONFIG_FILE="$TEST_DIR/.octos/test_discord_config.json"
     EXTRA_ENV_VAR="DISCORD_API_BASE_URL"
     EXTRA_ENV_VAL="http://127.0.0.1:$MOD_PORT"
