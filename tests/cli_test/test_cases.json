@@ -59,7 +59,7 @@
       "id": "4.2",
       "category": "Init",
       "name": "default init",
-      "command": "init --defaults --cwd \"{testDir}\"",
+      "command": "init --defaults --cwd {testDir}",
       "expected": "Created",
       "timeout": 30
     },
@@ -76,7 +76,7 @@
       "id": "4.4",
       "category": "Init",
       "name": "reinit prompt",
-      "command": "init --cwd \"{testDir}\" --defaults",
+      "command": "init --cwd {testDir} --defaults",
       "expected": "already exists",
       "timeout": 30
     },
@@ -92,7 +92,7 @@
       "id": "5.2",
       "category": "Clean",
       "name": "no .octos dir",
-      "command": "clean --cwd \"{tempDir}/no-octos-dir\"",
+      "command": "clean --cwd {tempDir}/no-octos-dir",
       "expected": "No .octos",
       "timeout": 30
     },
@@ -100,7 +100,7 @@
       "id": "5.3",
       "category": "Clean",
       "name": "empty dir",
-      "command": "clean --cwd \"{testDir}\"",
+      "command": "clean --cwd {testDir}",
       "expected": "Nothing to clean",
       "timeout": 30
     },
@@ -116,7 +116,7 @@
       "id": "6.2",
       "category": "Status",
       "name": "show status",
-      "command": "status --cwd \"{testDir}\"",
+      "command": "status --cwd {testDir}",
       "expected": "provider",
       "timeout": 30
     },
@@ -292,7 +292,7 @@
   "platform_overrides": {
     "windows": {
       "4.2": {
-        "command": "init --defaults --cwd \"{testDir}\"",
+        "command": "init --defaults --cwd {testDir}",
         "note": "Same command on Windows"
       }
     }
