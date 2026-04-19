@@ -256,12 +256,21 @@ class MockDiscordServer:
             content = body.get("content", "")
             logger.info(f"✏️ Bot edited message {message_id} in {channel_id}: {content[:80]}")
 
-            # Track as sent message with [edited] prefix
-            self._sent_messages.append(SentMessage(
-                channel_id=channel_id,
-                content=f"[edited] {content}",
-                message_id=message_id,
-            ))
+            # Update existing message instead of appending (matches real Discord behavior)
+            updated = False
+            for msg in reversed(self._sent_messages):
+                if msg.message_id == message_id:
+                    msg.content = content
+                    updated = True
+                    break
+            
+            # If not found, append as new (fallback for edge cases)
+            if not updated:
+                self._sent_messages.append(SentMessage(
+                    channel_id=channel_id,
+                    content=content,
+                    message_id=message_id,
+                ))
 
             return JSONResponse({
                 "id": message_id,

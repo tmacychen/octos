@@ -34,7 +34,8 @@ def runner():
 def cleanup_state(runner):
     """每个测试前清理 Mock Server 状态"""
     # Wait for any pending LLM responses to complete
-    time.sleep(1.0)
+    # Increased to 5s to ensure LLM responses from previous test have time to arrive
+    time.sleep(5.0)
     runner.clear()
     yield
 
