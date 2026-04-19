@@ -314,7 +314,7 @@ run_tests_from_json() {
         VALIDATION=$(jq -r ".tests[$i].validation // \"contains\"" "$CONFIG_FILE")
         TIMEOUT=$(jq -r ".tests[$i].timeout // 60" "$CONFIG_FILE")
         TEST_TYPE=$(jq -r ".tests[$i].type // \"cli\"" "$CONFIG_FILE")
-        PATH=$(jq -r ".tests[$i].path // \"\"" "$CONFIG_FILE")
+        FILE_PATH=$(jq -r ".tests[$i].path // \"\"" "$CONFIG_FILE")
         SHOULD_EXIST=$(jq -r ".tests[$i].should_exist // true" "$CONFIG_FILE")
 
         COMMAND=$(echo "$COMMAND" | sed "s|{testDir}|$TEST_DIR|g" | sed "s|{tempDir}|$TEMP_DIR|g")
@@ -326,7 +326,7 @@ run_tests_from_json() {
         fi
 
         if [[ "$TEST_TYPE" == "file_check" ]]; then
-            CHECK_PATH=$(echo "$PATH" | sed "s|{testDir}|$TEST_DIR|g" | sed "s|{tempDir}|$TEMP_DIR|g")
+            CHECK_PATH=$(echo "$FILE_PATH" | sed "s|{testDir}|$TEST_DIR|g" | sed "s|{tempDir}|$TEMP_DIR|g")
             run_file_check "$TEST_ID" "$CATEGORY" "$NAME" "$CHECK_PATH" "$SHOULD_EXIST"
         else
             run_cli_test "$TEST_ID" "$CATEGORY" "$NAME" "$COMMAND" "$EXPECTED" "$VALIDATION" "$TIMEOUT"
