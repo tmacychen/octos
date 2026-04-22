@@ -19,6 +19,12 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: marks tests that are slow (large data transfer, etc.)"
     )
+    config.addinivalue_line(
+        "markers", "abort_test: marks abort/cancel tests that need extra cleanup delay"
+    )
+    config.addinivalue_line(
+        "markers", "llm_intensive: marks LLM-intensive tests that need extra delay between runs"
+    )
 
 
 def pytest_runtest_logstart(nodeid, location):
@@ -50,10 +56,22 @@ def message_baseline(runner):
 
     使用全局单调递增的消息计数，避免 clear() 导致的竞态条件。
     每个 test_*.py 只需定义自己的 runner fixture 即可。
+    
+    🔥 OPTIMIZATION: Quick check first, only wait if messages are still arriving.
     """
     prev = len(runner.get_sent_messages())
-    for _ in range(10):
-        time.sleep(0.3)
+    
+    # Quick check: if no new messages in 0.1s, assume stable
+    time.sleep(0.1)
+    cur = len(runner.get_sent_messages())
+    
+    if cur == prev:
+        yield  # No delayed messages, continue immediately
+        return
+    
+    # Only enter stabilization loop if messages are still arriving
+    for _ in range(5):  # Reduced from 10 to 5 iterations
+        time.sleep(0.2)  # Reduced from 0.3s to 0.2s
         cur = len(runner.get_sent_messages())
         if cur == prev:
             break
