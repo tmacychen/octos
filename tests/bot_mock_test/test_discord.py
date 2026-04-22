@@ -675,6 +675,11 @@ class TestDiscordProfileMode:
         CHANNEL_A = "1039178386623557762"
         CHANNEL_B = "1039178386623557763"
         
+        # 🔥 CRITICAL FIX: Create fresh sessions to ensure clean state
+        # Previous tests may have modified queue_mode on these channels
+        inject_and_get_reply(runner, "/new", timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_A)
+        inject_and_get_reply(runner, "/new", timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_B)
+        
         # Profile A 设置为 followup
         text_a = inject_and_get_reply(runner, "/queue followup",
                                       timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_A)
