@@ -534,28 +534,15 @@ pub(crate) fn resolve_preferred_workspace_contract_artifact_path(
     project_root: &Path,
     artifact_name: &str,
 ) -> Result<Option<PathBuf>> {
-    let mut candidates = resolve_workspace_contract_artifact_paths(project_root, artifact_name)?;
-    if let Some(preferred) = preferred_contract_basename(artifact_name) {
-        let exact = candidates
-            .iter()
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .map(|value| value.eq_ignore_ascii_case(preferred))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !exact.is_empty() {
-            candidates = exact;
-        }
-    }
-
-    Ok(candidates.into_iter().max_by_key(|path| {
-        std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .ok()
-    }))
+    Ok(
+        resolve_workspace_contract_artifact_paths(project_root, artifact_name)?
+            .into_iter()
+            .max_by_key(|path| {
+                std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+            }),
+    )
 }
 
 pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStatus {
