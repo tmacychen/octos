@@ -221,7 +221,7 @@ setup_discord_env() {
         "allowed_senders": []
       }
     ],
-    "queue_mode": "interrupt"
+    "queue_mode": "collect"
   }
 }'
     return 0
@@ -287,8 +287,8 @@ run_module() {
     local mock_pids
     mock_pids=$(ps aux | grep -E "mock_tg|mock_discord|MockTelegramServer|MockDiscordServer" | grep -v grep | awk '{print $2}' || true)
     if [[ -n "$mock_pids" ]]; then
-        warn "Killing existing Mock Server processes: $mock_pids"
-        echo "$mock_pids" | xargs kill 2>/dev/null || true
+        warn "Force killing existing Mock Server processes: $mock_pids"
+        echo "$mock_pids" | xargs kill -9 2>/dev/null || true
         sleep 1
     fi
     
@@ -334,18 +334,19 @@ run_module() {
         info "  Removed .pytest_cache directory"
     fi
     
-    # Clear venv cache
+    # 🔥 CRITICAL FIX: Clear uv/virtualenv import cache
+    # uv caches compiled bytecode in site-packages/__pycache__
     if [[ -d "$SCRIPT_DIR/.venv" ]]; then
-        local venv_pycache_count=$(find "$SCRIPT_DIR/.venv" -type d -name "__pycache__" -path "*/bot_mock_test/*" 2>/dev/null | wc -l | tr -d ' ')
-        local venv_pyc_count=$(find "$SCRIPT_DIR/.venv" -name "*.pyc" -path "*/bot_mock_test/*" 2>/dev/null | wc -l | tr -d ' ')
+        local venv_pycache_count=$(find "$SCRIPT_DIR/.venv/lib" -type d -name "__pycache__" 2>/dev/null | wc -l | tr -d ' ')
+        local venv_pyc_count=$(find "$SCRIPT_DIR/.venv/lib" -name "*.pyc" 2>/dev/null | wc -l | tr -d ' ')
         
         if [[ $venv_pycache_count -gt 0 ]]; then
-            find "$SCRIPT_DIR/.venv" -type d -name "__pycache__" -path "*/bot_mock_test/*" -exec rm -rf {} + 2>/dev/null || true
+            find "$SCRIPT_DIR/.venv/lib" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
             info "  Removed $venv_pycache_count venv __pycache__ directories"
         fi
         
         if [[ $venv_pyc_count -gt 0 ]]; then
-            find "$SCRIPT_DIR/.venv" -name "*.pyc" -path "*/bot_mock_test/*" -delete 2>/dev/null || true
+            find "$SCRIPT_DIR/.venv/lib" -name "*.pyc" -delete 2>/dev/null || true
             info "  Deleted $venv_pyc_count venv .pyc files"
         fi
     fi
@@ -353,22 +354,30 @@ run_module() {
     ok "Cache cleared (total: $((pycache_count + pyc_count + pytest_cache_exists)) items)"
 
     # ── 6. Start mock server ─────────────────────────────────────────────────
+    # 🔥 CRITICAL FIX: Force delete all Python cache before starting Mock Server
+    # This ensures the latest code changes are loaded
+    info "Force clearing all Python cache before Mock Server startup..."
+    find "$SCRIPT_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+    find "$SCRIPT_DIR" -name "*.pyc" -delete 2>/dev/null || true
+    ok "Cache cleared"
+    
     # Start mock server
     local health_timeout=3
     if [[ "$MOD_NAME" == "discord" ]]; then
         health_timeout=5
     fi
 
-    PYTHONPATH="$SCRIPT_DIR" PYTHONUNBUFFERED=1 "$VENV_PYTHON" -c "
+    PYTHONPATH="$SCRIPT_DIR" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 "$VENV_PYTHON" -c "
 import time, signal, sys
 from ${MOD_MOCK_MODULE} import ${MOD_MOCK_CLASS}
 server = ${MOD_MOCK_CLASS}(port=${MOD_PORT})
-server.start_background()
+# Pass log file to redirect all uvicorn output
+server.start_background(log_file='$BOT_LOG')
 print('ready', flush=True)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 while True:
     time.sleep(1)
-" &
+" >> "$BOT_LOG" 2>&1 &
     MOCK_PID=$!
 
     local wait_sec=1
@@ -466,6 +475,7 @@ except Exception as e:
     ok "Cache cleared before tests"
 
     # Build pytest command (no separate log file, output captured by tee)
+    export PYTHONDONTWRITEBYTECODE=1
     local pytest_cmd=("$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" \
         -v --tb=short --no-header --color=yes \
         --capture=no \
