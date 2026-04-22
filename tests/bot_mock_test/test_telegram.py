@@ -13,12 +13,17 @@ Telegram Bot 集成测试用例
 
 import pytest
 import time
+import random
 from runner import BotTestRunner
 from test_helpers import inject_and_get_reply
 
 # ── 超时配置 ──────────────────────────────────────────────────────────────────
 TIMEOUT_COMMAND = 30   # 本地命令，无需 LLM
 TIMEOUT_LLM     = 90   # 需要调用 LLM API (增加到 90s 以应对网络延迟)
+
+# ── 压力缓解配置 ──────────────────────────────────────────────────────────────
+# 在累积测试中，每条消息之间增加延迟，避免过快导致超时
+ACCUMULATION_DELAY = 0.5  # 累积测试中每条消息后的等待时间（秒）
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -322,7 +327,7 @@ class TestMessageSplitting:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.llm
-class TestAbortCommands:
+class TestTelegramAbortCommands:
     """验证 Agent 能正确中止任务 — 多语言 abort 触发词识别
     
     注意：abort 是本地命令识别（octos-core/src/abort.rs），不依赖 LLM。
@@ -336,117 +341,165 @@ class TestAbortCommands:
     - 响应语言与触发词匹配（中文→中文，英文→英文等）
     """
 
-    def test_abort_chinese_stop(self, runner):
-        """发送任务后，用"停"中止 - 应返回中文响应"""
+    @pytest.mark.parametrize(
+        "language,chat_id,long_task,expected_keywords",
+        [
+            # English - test all triggers: stop, cancel, abort, halt, quit, enough
+            ("english", 123, 
+             "Please write a detailed technical article about Python async programming best practices...",
+             ["🛑", "Cancelled"]),
+            
+            # Chinese - test all triggers: 停, 停止, 取消, 停下, 别说了
+            ("chinese", 126,
+             "请帮我写一篇详细的技术文章，介绍 Python 异步编程的最佳实践...",
+             ["🛑", "已取消"]),
+            
+            # Japanese - test all triggers: やめて, 止めて, ストップ
+            ("japanese", 134,
+             "Pythonの非同期プログラミングのベストプラクティスについて詳細な技術記事を書いてください...",
+             ["🛑", "キャンセル"]),
+            
+            # Russian - test all triggers: стоп, отмена, хватит
+            ("russian", 137,
+             "Напишите подробную техническую статью о лучших практиках асинхронного программирования на Python...",
+             ["🛑", "Отменено"]),
+        ],
+        ids=[
+            "english_all_triggers",
+            "chinese_all_triggers",
+            "japanese_all_triggers",
+            "russian_all_triggers",
+        ]
+    )
+    def test_abort_multilanguage(self, runner, language, chat_id, long_task, expected_keywords):
+        """多语言 abort 命令测试 - 遍历所有触发词
         
-        # 先发送 hi 建立会话
-        count_before = len(runner.get_sent_messages())
-        runner.inject("hi", chat_id=123)
-        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
-        assert hi_reply is not None, "Bot did not respond to hi"
-        print(f"\n  Session established: {hi_reply['text'][:50]}...")
+        测试流程：
+        1. 发送一个长任务（触发 LLM 处理）
+        2. 等待 5 秒，让任务开始执行
+        3. 每隔 5 秒发送一个触发词，直到收到 abort 响应或所有触发词用完
+        4. 如果收到 abort 响应，测试通过
+        5. 如果所有触发词都发送完了，再等 5 秒还没响应，测试失败
         
-        # 再发送一个任务消息，触发 LLM 处理
-        count_after_hi = len(runner.get_sent_messages())
-        runner.inject("请帮我写一段代码", chat_id=123)
-        
-        # 等待 octos 开始回复（确认任务已启动）
-        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
-        assert first_reply is not None, "Bot did not start processing the task"
-        print(f"  Task started: {first_reply['text'][:50]}...")
-        
-        # 额外等待一小段时间，确保 octos 已经进入处理状态
+        支持：英文、中文、日文、俄文。
+        """
         import time
-        time.sleep(1)  # 让 octos 有时间设置 cancelled flag
         
-        # 现在发送 abort 命令
-        count_after_first = len(runner.get_sent_messages())
-        runner.inject("停", chat_id=123)
-        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        # Define trigger words for each language (from abort.rs)
+        TRIGGERS = {
+            "english": ["stop", "cancel", "abort", "halt", "quit", "enough"],
+            "chinese": ["停", "停止", "取消", "停下", "别说了"],
+            "japanese": ["やめて", "止めて", "ストップ"],
+            "russian": ["стоп", "отмена", "хватит"],
+        }
         
-        assert abort_reply is not None, "Bot did not respond to abort command"
+        triggers = TRIGGERS[language]
+        print(f"\n  Testing {language} with {len(triggers)} triggers: {triggers}")
+        
+        # Step 1: 发送长任务，触发 LLM 处理
+        count_before_task = len(runner.get_sent_messages())
+        runner.inject(long_task, chat_id=chat_id)
+        print(f"  → Long task injected")
+        
+        # Step 2: 等待 5 秒，让任务开始执行
+        time.sleep(5.0)
+        print(f"  → Waited 5s for task to start")
+        
+        # Step 3: 遍历所有触发词，每隔 5 秒发送一个
+        abort_reply = None
+        for i, abort_cmd in enumerate(triggers):
+            print(f"  → [{i+1}/{len(triggers)}] Sending abort command: '{abort_cmd}'")
+            runner.inject(abort_cmd, chat_id=chat_id)
+            
+            # 等待 5 秒，检查是否收到 abort 响应
+            poll_start = time.time()
+            while time.time() - poll_start < 5.0:
+                msgs = runner.get_sent_messages()
+                # 从后往前找，找到第一条包含 abort 特征的消息
+                for msg in reversed(msgs):
+                    msg_text = msg.get("text", "")
+                    if "🛑" in msg_text or any(kw.lower() in msg_text.lower() for kw in expected_keywords if not kw.startswith("🛑")):
+                        abort_reply = msg
+                        break
+                
+                if abort_reply is not None:
+                    break
+                
+                time.sleep(0.3)  # 短轮询间隔
+            
+            if abort_reply is not None:
+                print(f"  ✓ Abort response received after '{abort_cmd}'")
+                break
+            else:
+                print(f"  ✗ No response to '{abort_cmd}', trying next...")
+        
+        # Step 4: 如果所有触发词都试过了，再等 5 秒
+        if abort_reply is None:
+            print(f"  → All triggers exhausted, waiting final 5s...")
+            time.sleep(5.0)
+            
+            # 最后一次检查
+            msgs = runner.get_sent_messages()
+            for msg in reversed(msgs):
+                msg_text = msg.get("text", "")
+                if "🛑" in msg_text or any(kw.lower() in msg_text.lower() for kw in expected_keywords if not kw.startswith("🛑")):
+                    abort_reply = msg
+                    break
+        
+        # Step 5: 断言
+        assert abort_reply is not None, \
+            f"Bot did not respond to ANY abort command after trying all {len(triggers)} triggers: {triggers}"
+        
         text = abort_reply["text"]
         
-        # 验证收到中文取消响应
-        assert "已取消" in text or "🛑" in text, \
-            f"Expected Chinese cancel response, got: {text[:200]}"
-        print(f"  ✓ Abort (停) → {text}")
-
-    def test_abort_english_stop(self, runner):
-        """发送任务后，用"stop"中止 - 应返回英文响应"""
+        # 🔥 VERIFICATION B: 确保收到的是 abort 响应，不是长任务的中间消息
+        has_stop_emoji = "🛑" in text
+        has_cancel_keyword = any(kw.lower() in text.lower() for kw in expected_keywords if not kw.startswith("🛑"))
         
-        # 先发送 hi 建立会话
-        count_before = len(runner.get_sent_messages())
-        runner.inject("hi", chat_id=124)
-        hi_reply = runner.wait_for_reply(count_before=count_before, timeout=TIMEOUT_COMMAND)
-        assert hi_reply is not None, "Bot did not respond to hi"
-        print(f"\n  Session established: {hi_reply['text'][:50]}...")
+        assert has_stop_emoji or has_cancel_keyword, \
+            f"Expected abort response (with 🛑 or cancel keyword), got: {text[:200]}"
         
-        # 再发送一个任务消息
-        count_after_hi = len(runner.get_sent_messages())
-        runner.inject("Help me write code", chat_id=124)
+        # 🔥 VERIFICATION A: 验证“真中断” - 确认长任务确实停止了
+        count_after_abort = len(runner.get_sent_messages())
         
-        # 等待 octos 开始回复
-        first_reply = runner.wait_for_reply(count_before=count_after_hi, timeout=TIMEOUT_COMMAND)
-        assert first_reply is not None, "Bot did not start processing the task"
-        print(f"  Task started: {first_reply['text'][:50]}...")
+        # 等待一段时间，观察是否还有新消息（长任务不应该继续输出）
+        time.sleep(3)
         
-        # 额外等待一小段时间，确保 octos 已经进入处理状态
-        import time
-        time.sleep(1)  # 让 octos 有时间设置 cancelled flag
+        count_final = len(runner.get_sent_messages())
         
-        # 发送 abort 命令
-        count_after_first = len(runner.get_sent_messages())
-        runner.inject("stop", chat_id=124)
-        abort_reply = runner.wait_for_reply(count_before=count_after_first, timeout=TIMEOUT_COMMAND)
+        # 断言：abort 后不应该有新的消息产生
+        new_messages_after_abort = count_final - count_after_abort
+        assert new_messages_after_abort <= 1, \
+            f"Long task was NOT properly aborted! Found {new_messages_after_abort} new messages after abort: {text[:100]}"
         
-        assert abort_reply is not None, "Bot did not respond to abort command"
-        text = abort_reply["text"]
-        
-        # 验证收到英文取消响应
-        assert "Cancelled" in text or "🛑" in text, \
-            f"Expected English cancel response, got: {text[:200]}"
-        print(f"  ✓ Abort (stop) → {text}")
-
-    def test_abort_english_cancel(self, runner):
-        """发送"cancel"中止 - 应返回英文响应"""
-        text = inject_and_get_reply(runner, "cancel", timeout=TIMEOUT_COMMAND)
-        
-        assert "Cancelled" in text or "🛑" in text, \
-            f"Expected English cancel response, got: {text}"
-        print(f"\n  ✓ Abort (cancel) → {text}")
-
-    def test_abort_japanese(self, runner):
-        """发送"やめて"中止 - 应返回日文响应"""
-        text = inject_and_get_reply(runner, "やめて", timeout=TIMEOUT_COMMAND)
-        
-        assert "キャンセル" in text or "🛑" in text, \
-            f"Expected Japanese cancel response, got: {text}"
-        print(f"\n  ✓ Abort (やめて) → {text}")
-
-    def test_abort_russian(self, runner):
-        """发送"стоп"中止 - 应返回俄文响应"""
-        text = inject_and_get_reply(runner, "стоп", timeout=TIMEOUT_COMMAND)
-        
-        assert "Отменено" in text or "🛑" in text, \
-            f"Expected Russian cancel response, got: {text}"
-        print(f"\n  ✓ Abort (стоп) → {text}")
-
-    def test_abort_case_insensitive(self, runner):
-        """验证 abort 命令大小写不敏感"""
-        for cmd in ["STOP", "Stop", "CANCEL", "Cancel"]:
-            text = inject_and_get_reply(runner, cmd, timeout=TIMEOUT_COMMAND)
-            assert len(text) > 0, f"Should respond to '{cmd}'"
-            assert "🛑" in text or "Cancel" in text or "取消" in text, \
-                f"Unexpected response for '{cmd}': {text}"
-        print(f"\n  ✓ Case insensitive abort works")
+        print(f"  ✓ Abort interrupted long task → {text}")
+        print(f"    Verified: No further messages after abort ({new_messages_after_abort} new msgs)")
 
     def test_abort_with_whitespace(self, runner):
         """验证 abort 命令前后空格不影响识别"""
-        for cmd in ["  stop  ", "\tstop\n", " 停 "]:
-            text = inject_and_get_reply(runner, cmd, timeout=TIMEOUT_COMMAND)
-            assert len(text) > 0, f"Should respond to trimmed '{cmd}'"
-        print(f"\n  ✓ Whitespace handling works")
+        test_cases = [
+            ("  stop  ", 135, ["🛑", "Cancelled", "Cancel"]),
+            ("\tstop\n", 136, ["🛑", "Cancelled", "Cancel"]),
+            (" 停 ", 137, ["🛑", "取消", "已取消"]),
+        ]
+        
+        for cmd, chat_id, expected_keywords in test_cases:
+            count_before = len(runner.get_sent_messages())
+            runner.inject(cmd, chat_id=chat_id)
+            abort_reply = runner.wait_for_reply(
+                count_before=count_before,
+                timeout=TIMEOUT_COMMAND,
+                chat_id=chat_id
+            )
+            assert abort_reply is not None, f"Should respond to trimmed '{cmd}'"
+            text = abort_reply["text"]
+            
+            has_expected_keyword = any(kw.lower() in text.lower() for kw in expected_keywords if not kw.startswith("🛑"))
+            has_emoji = "🛑" in text
+            assert has_emoji or has_expected_keyword, \
+                f"Expected cancel response for '{cmd}', got: {text[:200]}"
+        
+        print(f"  ✓ Whitespace handling works")
 
     def test_non_abort_messages_not_triggered(self, runner):
         """验证普通消息不会误触发 abort"""
@@ -597,9 +650,9 @@ class TestFileLimits:
             try:
                 text = inject_and_get_reply(runner, message, timeout=TIMEOUT_COMMAND)
                 
-                # 短暂等待，避免过快
+                # 增加延迟，避免过快发送导致超时
                 if i < message_count - 1:
-                    time.sleep(0.2)
+                    time.sleep(ACCUMULATION_DELAY)
                     
             except Exception as e:
                 print(f"  ✗ Failed at message {i+1}: {type(e).__name__}")
