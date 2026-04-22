@@ -131,6 +131,7 @@ class MockDiscordServer:
         self._injected_documents: List[InjectedDocument] = []
         self._message_counter: int = int(time.time() * 1000)  # snowflake-like
         self._next_update_id: int = 1
+        self._gateway_seq: int = 0  # Gateway sequence number for events
 
         # Bot info returned by GET /users/@me
         self._bot_info = {
@@ -159,6 +160,11 @@ class MockDiscordServer:
     def _next_id(self) -> int:
         self._message_counter += 1
         return self._message_counter
+
+    def _next_seq(self) -> int:
+        """Get next Gateway sequence number."""
+        self._gateway_seq += 1
+        return self._gateway_seq
 
     def _setup_routes(self):
         app = self.app
@@ -223,6 +229,12 @@ class MockDiscordServer:
             self._sent_messages.append(sent)
 
             logger.info(f"🤖 Bot sent message to {channel_id}: {content[:80]}")
+
+            # 🔥 CRITICAL FIX: Dispatch MESSAGE_CREATE event via Gateway
+            # This is what real Discord does - after REST API accepts the message,
+            # it dispatches a MESSAGE_CREATE event through the Gateway WebSocket
+            # so all connected clients (including the sender) receive the event.
+            asyncio.create_task(self._dispatch_bot_message_via_gateway(sent))
 
             resp: Dict[str, Any] = {
                 "id": msg_id,
@@ -366,6 +378,9 @@ class MockDiscordServer:
 
                     if opcode == 2:  # IDENTIFY
                         logger.info("WS: Received IDENTIFY, sending READY")
+                        
+                        # Use shared sequence counter
+                        seq = self._next_seq()
 
                         ready_payload = {
                             "op": 0,  # DISPATCH
@@ -395,7 +410,6 @@ class MockDiscordServer:
                             },
                         }
                         await websocket.send_json(ready_payload)
-                        seq += 1
 
                         # Dispatch any pending injected interactions now that we're ready
                         for inter in list(self._injected_interactions):
@@ -445,12 +459,11 @@ class MockDiscordServer:
             payload = {
                 "op": 0,  # DISPATCH
                 "t": "MESSAGE_CREATE",
-                "s": seq,
+                "s": self._next_seq(),  # Use shared sequence counter
                 "d": event,
             }
             await websocket.send_json(payload)
             logger.info(f"🔄 Dispatched MESSAGE_CREATE ({len(msg.content)} bytes): {msg.content[:50]}")
-            seq += 1
             self._injected_messages.remove(msg)
         return seq
 
@@ -504,7 +517,7 @@ class MockDiscordServer:
         payload = {
             "op": 0,  # DISPATCH
             "t": "INTERACTION_CREATE",
-            "s": seq,
+            "s": self._next_seq(),  # Use shared sequence counter
             "d": interaction_data,
         }
         await websocket.send_json(payload)
@@ -554,6 +567,77 @@ class MockDiscordServer:
             }
 
         return base
+
+    async def _dispatch_bot_message_via_gateway(self, sent: SentMessage):
+        """
+        Dispatch a MESSAGE_CREATE event for bot-sent messages via Gateway.
+        
+        This is critical for serenity SDK - after the REST API accepts a message,
+        Discord dispatches a MESSAGE_CREATE event through the Gateway so all
+        connected clients (including the sender) receive confirmation.
+        
+        Without this, serenity's say() method may timeout or fail because it
+        expects to receive the MESSAGE_CREATE event to confirm successful delivery.
+        """
+        # Wait a tiny bit to simulate real Discord timing
+        await asyncio.sleep(0.05)
+        
+        # Build MESSAGE_CREATE event payload matching Discord's format
+        event = {
+            "id": sent.message_id,
+            "channel_id": sent.channel_id,
+            "guild_id": DEFAULT_GUILD_ID,
+            "author": {
+                "id": self._bot_info["id"],
+                "username": self._bot_info["username"],
+                "discriminator": self._bot_info["discriminator"],
+                "global_name": self._bot_info["global_name"],
+                "avatar": None,
+                "bot": True,
+            },
+            "content": sent.content,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00"),
+            "edited_timestamp": None,
+            "tts": False,
+            "mention_everyone": False,
+            "mentions": [],
+            "mention_roles": [],
+            "attachments": [],
+            "embeds": sent.embeds if hasattr(sent, 'embeds') else [],
+            "pinned": False,
+            "type": 0,
+            "flags": 0,
+            "referenced_message": None,
+            "member": {
+                "roles": [],
+                "joined_at": "2024-01-01T00:00:00+00:00",
+                "deaf": False,
+                "mute": False,
+                "pending": False,
+            },
+        }
+        
+        payload = {
+            "op": 0,  # DISPATCH
+            "t": "MESSAGE_CREATE",
+            "s": self._next_seq(),  # Use shared sequence counter
+            "d": event,
+        }
+        
+        # Send to all connected WebSocket clients
+        disconnected = []
+        for ws in list(self._ws_clients):
+            try:
+                await ws.send_json(payload)
+                logger.debug(f"📨 Dispatched MESSAGE_CREATE to WS client: {sent.content[:50]}")
+            except Exception as e:
+                logger.warning(f"Failed to dispatch MESSAGE_CREATE to WS client: {e}")
+                disconnected.append(ws)
+        
+        # Clean up disconnected clients
+        for ws in disconnected:
+            if ws in self._ws_clients:
+                self._ws_clients.remove(ws)
 
     # ------------------------------------------------------------------
     # Test control endpoint handlers
