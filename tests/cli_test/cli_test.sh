@@ -8,7 +8,6 @@
 #   -v, --verbose       Verbose output
 #   -o, --output-dir    Output directory (default: test-results)
 #   -c, --config        Test config file (default: cli_test/test_cases.json)
-#   -s, --scope SCOPE   Run only a specific category
 
 set -euo pipefail
 
@@ -24,7 +23,7 @@ if [[ -z "${OCTOS_TEST_DIR:-}" ]]; then
     echo ""
     echo "    tests/run_tests.sh --test cli [args...]"
     echo ""
-    echo "  Available args: -v | -o <dir> | -c <file> | -s <scope>"
+    echo "  Available args: -v | -o <dir> | -c <file>"
     echo ""
     exit 1
 fi
@@ -34,14 +33,11 @@ OCTOS_BINARY="octos"
 OUTPUT_DIR="test-results"
 VERBOSE=false
 CANCELLED=false
-TEST_SCOPE="all"
+TEST_SCOPE="all"  # all or specific category
 
 # Unified test runner presets
 TEST_DIR="${OCTOS_TEST_DIR:-/tmp/octos_test}"
 LOG_DIR="${OCTOS_LOG_DIR:-$TEST_DIR/logs}"
-
-# CLI-specific workspace: TEST_DIR/cli/
-CLI_WORKSPACE="$TEST_DIR/cli"
 
 # Counters
 TOTAL=0
@@ -57,7 +53,7 @@ REPORT_DATE=$(date '+%Y-%m-%d_%H%M')
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 LOG_FILE=""
 CURRENT_CATEGORY=""
-CATEGORY_TEST_DIR=""  # Current category test directory (isolated)
+CATEGORY_TEST_DIR=""  # Current category test directory
 
 # Colors (if terminal supports)
 if [[ -t 1 ]]; then
@@ -91,22 +87,17 @@ Arguments:
 EOF
 }
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-# All log output goes to BOTH stdout (captured by run_tests.sh session log)
-# AND the CLI-specific log file.
 log() {
     local msg="$1"
-    local ts
-    ts=$(date '+%Y-%m-%d %H:%M:%S')
-    local line="[${ts}] $msg"
-    echo "$line"                     # stdout (captured by exec tee in run_tests.sh)
-    [[ -n "${LOG_FILE:-}" ]] && echo "$line" >> "$LOG_FILE"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] $msg" >> "$LOG_FILE"
 }
 
 verbose_log() {
-    log "$1"
+    local msg="$1"
+    log "$msg"
     if [[ "$VERBOSE" == true ]]; then
-        echo -e "${GRAY}[$1]${NC}"
+        echo -e "${GRAY}[$msg]${NC}"
     fi
 }
 
@@ -115,8 +106,10 @@ cancel_handler() {
     echo -e "\n${YELLOW}[CANCELLED] Test run cancelled by user${NC}"
     log "[CANCELLED] Test run cancelled by user"
 
+    # Kill any running processes
     pkill -f "octos" 2>/dev/null || true
 
+    # Generate partial report
     if [[ ${#RESULTS[@]} -gt 0 ]]; then
         local partial_report="${OUTPUT_DIR}/CLI_TEST_REPORT_CANCELLED_$(date '+%Y%m%d_%H%M%S').md"
         {
@@ -138,14 +131,12 @@ cancel_handler() {
 
 trap cancel_handler SIGINT SIGTERM
 
-# ── JSON parsing helper ───────────────────────────────────────────────────────
 parse_json() {
     local json="$1"
     local key="$2"
     echo "$json" | grep -o "\"${key}\":[^,}]*" | sed 's/.*: *"\?\([^"]*\)"\?.*/\1/' | tr -d '"'
 }
 
-# ── Run a CLI command test ───────────────────────────────────────────────────
 run_cli_test() {
     local test_id="$1"
     local category="$2"
@@ -161,18 +152,15 @@ run_cli_test() {
     log "[TEST_DIR] $CATEGORY_TEST_DIR"
 
     local stdout stderr exit_code
-    local tmp_stdout="${TEMP_DIR}/octos_stdout_$$.txt"
-    local tmp_stderr="${TEMP_DIR}/octos_stderr_$$.txt"
-
-    if "$OCTOS_BINARY" $cmd_args > "$tmp_stdout" 2> "$tmp_stderr"; then
+    if "$OCTOS_BINARY" $cmd_args > "$TEMP_DIR/octos_stdout_$$.txt" 2> "$TEMP_DIR/octos_stderr_$$.txt"; then
         exit_code=0
     else
         exit_code=$?
     fi
 
-    stdout=$(cat "$tmp_stdout" 2>/dev/null || echo "")
-    stderr=$(cat "$tmp_stderr" 2>/dev/null || echo "")
-    rm -f "$tmp_stdout" "$tmp_stderr"
+    stdout=$(cat "$TEMP_DIR/octos_stdout_$$.txt" 2>/dev/null || echo "")
+    stderr=$(cat "$TEMP_DIR/octos_stderr_$$.txt" 2>/dev/null || echo "")
+    rm -f "$TEMP_DIR/octos_stdout_$$.txt" "$TEMP_DIR/octos_stderr_$$.txt"
 
     local actual="$stdout$stderr"
     local passed=false
@@ -193,11 +181,6 @@ run_cli_test() {
                 passed=true
             fi
             ;;
-        regex)
-            if echo "$actual" | grep -qE -- "$expected"; then
-                passed=true
-            fi
-            ;;
     esac
 
     if [[ "$passed" == true ]]; then
@@ -210,9 +193,14 @@ run_cli_test() {
         color="$RED"
     fi
 
+    # Truncate actual for summary
+    local actual_truncated="${actual:0:200}"
+    actual_truncated="${actual_truncated//$'\n'/ }"
+    actual_truncated="${actual_truncated//$'\r'/ }"
+
     RESULTS+=("| $test_id | $category | $test_name | $status |")
 
-    # Always log to file AND stdout
+    # Always log to file
     log "[EXEC] octos $cmd_args"
     log "[EXITCODE] $exit_code"
     log "[STDOUT] $stdout"
@@ -238,8 +226,6 @@ run_cli_test() {
     echo -e "$color[$status]${NC} $test_id $test_name"
 }
 
-# ── Run a file check test ────────────────────────────────────────────────────
-# Checks if a file/directory exists, and if it does, records its contents.
 run_file_check() {
     local test_id="$1"
     local category="$2"
@@ -258,7 +244,8 @@ run_file_check() {
     local exists=false
     local retry_count=0
     local max_retries=5
-
+    
+    # Retry logic for file existence check
     while [[ $retry_count -lt $max_retries ]]; do
         if [[ -e "$path" ]]; then
             exists=true
@@ -272,7 +259,7 @@ run_file_check() {
             fi
         fi
     done
-
+    
     if [[ "$exists" == false ]]; then
         log "[FILE CHECK] File exists: NO (after $max_retries attempts)"
         # Debug: list directory contents if parent exists
@@ -282,38 +269,8 @@ run_file_check() {
             log "[FILE CHECK] Parent directory exists: $parent_dir"
             log "[FILE CHECK] Parent directory contents:"
             ls -la "$parent_dir" >> "$LOG_FILE" 2>&1
-            # Also output to stdout for session log capture
-            ls -la "$parent_dir" 2>/dev/null
         else
             log "[FILE CHECK] Parent directory does NOT exist: $parent_dir"
-        fi
-    else
-        # Record file contents for diagnostic purposes
-        if [[ -f "$path" ]]; then
-            log "[FILE CHECK] File content of $path:"
-            {
-                echo "--- BEGIN: $path ---"
-                cat "$path" 2>/dev/null || echo "(binary or unreadable)"
-                echo "--- END: $path ---"
-            } >> "$LOG_FILE"
-            # Also to stdout (for session log)
-            {
-                echo "--- BEGIN: $path ---"
-                cat "$path" 2>/dev/null || echo "(binary or unreadable)"
-                echo "--- END: $path ---"
-            }
-        elif [[ -d "$path" ]]; then
-            log "[FILE CHECK] Directory listing of $path:"
-            {
-                echo "--- DIR: $path ---"
-                ls -la "$path" 2>/dev/null
-                echo "--- END DIR ---"
-            } >> "$LOG_FILE"
-            {
-                echo "--- DIR: $path ---"
-                ls -la "$path" 2>/dev/null
-                echo "--- END DIR ---"
-            }
         fi
     fi
 
@@ -341,20 +298,19 @@ run_file_check() {
 
     RESULTS+=("| $test_id | $category | $test_name | $status |")
 
-    log "[FILE CHECK] $path — $actual_msg"
+    log "[FILE CHECK] $path"
     log "[STATUS] $status"
     log ""
 
     if [[ "$VERBOSE" == true ]]; then
-        echo -e "${CYAN}[FILE CHECK] $path${NC} — $actual_msg"
+        echo -e "${CYAN}[FILE CHECK] $path${NC}"
         echo -e "${GRAY}[STATUS] $status${NC}"
         echo ""
     fi
 
-    echo -e "$color[$status]${NC} $test_id $test_name — $actual_msg"
+    echo -e "$color[$status]${NC} $test_id $test_name"
 }
 
-# ── List test categories ─────────────────────────────────────────────────────
 check_jq() {
     if ! command -v jq &> /dev/null; then
         echo -e "${RED}[ERROR] jq is required for JSON parsing${NC}"
@@ -367,7 +323,7 @@ check_jq() {
 
 list_categories() {
     check_jq
-
+    
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}[ERROR] Config file not found: $CONFIG_FILE${NC}"
         exit 1
@@ -375,11 +331,12 @@ list_categories() {
 
     echo -e "${CYAN}Available Test Categories:${NC}"
     echo -e "${GRAY}========================================${NC}"
-
+    
+    # Extract unique categories and count tests per category
     jq -r '.tests[].category' "$CONFIG_FILE" | sort | uniq -c | sort -rn | while read count category; do
         printf "  ${GREEN}%-20s${NC} %d tests\n" "$category" "$count"
     done
-
+    
     echo -e "${GRAY}========================================${NC}"
     local total
     total=$(jq '.tests | length' "$CONFIG_FILE")
@@ -391,7 +348,6 @@ list_categories() {
     echo -e "  tests/run_tests.sh --test cli                  # Run all tests"
 }
 
-# ── Load tests from JSON config ──────────────────────────────────────────────
 load_tests_from_json() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}[ERROR] Config file not found: $CONFIG_FILE${NC}"
@@ -408,9 +364,6 @@ load_tests_from_json() {
     log "Found $TEST_COUNT test cases"
 }
 
-# ── Run all tests from JSON config ───────────────────────────────────────────
-# Each category gets its own isolated directory under CLI_WORKSPACE/<Category>_<timestamp>
-# This prevents Init tests from polluting the shared TEST_DIR.
 run_tests_from_json() {
     check_jq
 
@@ -439,30 +392,26 @@ run_tests_from_json() {
             continue
         fi
 
-        # ── Create isolated test directory per category ───────────────────────
-        # Each category gets: CLI_WORKSPACE/<Category>_<timestamp>
-        # e.g. /tmp/octos_test/cli/Init_20260419_1602
+        # Create isolated test directory per category with timestamp
         if [[ "$CATEGORY" != "$CURRENT_CATEGORY" ]]; then
             # Cleanup previous category test directory
             if [[ -n "$CATEGORY_TEST_DIR" ]] && [[ -d "$CATEGORY_TEST_DIR" ]]; then
                 log "[CLEANUP] Removing previous test directory: $CATEGORY_TEST_DIR"
-                echo -e "${GRAY}  Cleaning up: $CATEGORY_TEST_DIR${NC}"
                 rm -rf "$CATEGORY_TEST_DIR"
+                verbose_log "[CLEANUP] Removed: $CATEGORY_TEST_DIR"
             fi
 
             CURRENT_CATEGORY="$CATEGORY"
-            CATEGORY_TEST_DIR="${CLI_WORKSPACE}/${CATEGORY}_${TIMESTAMP}"
+            CATEGORY_TEST_DIR="${TEST_DIR}/${CATEGORY}_${TIMESTAMP}"
             mkdir -p "$CATEGORY_TEST_DIR"
             log "[SETUP] Created isolated test directory for $CATEGORY: $CATEGORY_TEST_DIR"
-            echo -e "${GRAY}  Test directory: $CATEGORY_TEST_DIR${NC}"
+            verbose_log "[SETUP] Test directory: $CATEGORY_TEST_DIR"
 
             echo -e "\n${YELLOW}[$CATEGORY]${NC}"
             log "[SECTION] $CATEGORY"
         fi
 
-        # Replace variables:
-        #   {testDir}  → isolated category directory (e.g. /tmp/octos_test/cli/Init_20260419_1602)
-        #   {tempDir}  → shared temp directory
+        # Replace variables with category-specific test directory
         COMMAND=$(echo "$COMMAND" | sed "s|{testDir}|$CATEGORY_TEST_DIR|g" | sed "s|{tempDir}|$TEMP_DIR|g")
 
         if [[ "$TEST_TYPE" == "file_check" ]]; then
@@ -476,7 +425,7 @@ run_tests_from_json() {
     # Final cleanup for last category
     if [[ -n "$CATEGORY_TEST_DIR" ]] && [[ -d "$CATEGORY_TEST_DIR" ]]; then
         log "[CLEANUP] Removing final test directory: $CATEGORY_TEST_DIR"
-        echo -e "${GRAY}  Cleaning up: $CATEGORY_TEST_DIR${NC}"
+        verbose_log "[CLEANUP] Removed: $CATEGORY_TEST_DIR"
         rm -rf "$CATEGORY_TEST_DIR"
     fi
 
@@ -486,7 +435,6 @@ run_tests_from_json() {
     fi
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 main() {
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -533,13 +481,10 @@ main() {
         esac
     done
 
-    # Setup directories
+    # Setup directories — use unified test directory
     mkdir -p "$OUTPUT_DIR"
-    mkdir -p "$CLI_WORKSPACE"
-    TEMP_DIR="${CLI_WORKSPACE}/temp"
+    TEMP_DIR="${TEST_DIR}/temp"
     mkdir -p "$TEMP_DIR"
-    # Ensure sub-directories used by test cases exist
-    mkdir -p "$TEMP_DIR/no-octos-dir"
 
     LOG_FILE="$LOG_DIR/cli_test.log"
 
@@ -548,9 +493,8 @@ main() {
     echo -e "${CYAN}========================================${NC}"
     echo -e "${GRAY}Test Time: $TEST_DATE${NC}"
     echo -e "${GRAY}Binary: $OCTOS_BINARY${NC}"
-    echo -e "${GRAY}Version: $($OCTOS_BINARY --version 2>/dev/null || echo 'unknown')${NC}"
     echo -e "${GRAY}Log File: $LOG_FILE${NC}"
-    echo -e "${GRAY}CLI Workspace: $CLI_WORKSPACE${NC}"
+    echo -e "${GRAY}Base Test Directory: $TEST_DIR${NC}"
     echo ""
 
     log "========================================"
@@ -558,10 +502,9 @@ main() {
     log "========================================"
     log "Test Time: $TEST_DATE"
     log "Binary: $OCTOS_BINARY"
-    log "Version: $($OCTOS_BINARY --version 2>/dev/null || echo 'unknown')"
     log "Verbose Mode: $VERBOSE"
-    log "CLI Workspace: $CLI_WORKSPACE"
-    log "Isolation Mode: Per-category under cli/"
+    log "Base Test Directory: $TEST_DIR"
+    log "Isolation Mode: Per-category with timestamp"
     log ""
 
     # Check if binary exists
@@ -574,8 +517,8 @@ main() {
         fi
     fi
 
-    echo -e "${GRAY}Test workspace: $CLI_WORKSPACE${NC}"
-    log "Test workspace: $CLI_WORKSPACE"
+    echo -e "${GRAY}Test workspace: $TEST_DIR${NC}"
+    log "Test workspace: $TEST_DIR"
     echo ""
 
     CURRENT_CATEGORY=""
@@ -618,6 +561,7 @@ main() {
             echo "|----|----------|-----------|"
             for r in "${RESULTS[@]}"; do
                 if echo "$r" | grep -q "FAIL"; then
+                    # Extract test info from result line
                     echo "$r" | sed 's/| \([^ ]*\) | \([^ ]*\) | \(.*\) | FAIL |/| \1 | \2 | \3 |/'
                 fi
             done

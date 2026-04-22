@@ -284,6 +284,50 @@ if [[ "$ACTION" == "--test" ]]; then
         exit 1
     fi
     
+    # Validate test target
+    if [[ "$TEST_TARGET" != "bot" ]] && [[ "$TEST_TARGET" != "cli" ]]; then
+        err "Unknown test target: $TEST_TARGET"
+        echo ""
+        echo "Available test targets:"
+        echo "  bot    Run bot mock tests (Telegram, Discord)"
+        echo "  cli    Run CLI tests"
+        echo ""
+        echo "Examples:"
+        echo "  tests/run_tests.sh --test bot              # All bot tests"
+        echo "  tests/run_tests.sh --test cli              # All CLI tests"
+        exit 1
+    fi
+    
+    # Pre-validate Bot test arguments (before building)
+    if [[ "$TEST_TARGET" == "bot" ]] && [[ $# -ge 3 ]]; then
+        valid_bot_args="all telegram tg discord dc list cases"
+        first_bot_arg="${3:-}"
+        
+        # Check if first bot argument is valid
+        if ! echo "$valid_bot_args" | grep -qw "$first_bot_arg"; then
+            err "Invalid argument for Bot tests: $first_bot_arg"
+            echo ""
+            echo "This check runs before compilation to catch typos early."
+            echo ""
+            echo "Valid Bot test arguments:"
+            echo "  all                  Run all bot modules (default)"
+            echo "  telegram, tg         Run Telegram tests only"
+            echo "  discord, dc          Run Discord tests only"
+            echo "  list                 List available bot modules"
+            echo "  list <mod>           List test cases in a module"
+            echo "  cases <mod>          Alias for 'list <mod>'"
+            echo ""
+            echo "For general help, use: tests/run_tests.sh --help"
+            echo ""
+            echo "Examples:"
+            echo "  tests/run_tests.sh --test bot              # Run all bot tests"
+            echo "  tests/run_tests.sh --test bot telegram     # Run Telegram tests only"
+            echo "  tests/run_tests.sh --test bot list         # List bot modules"
+            echo "  tests/run_tests.sh --test bot list tg      # List Telegram test cases"
+            exit 1
+        fi
+    fi
+    
     # Pre-validate CLI test arguments (before building)
     # Only check for obviously invalid option flags, detailed validation is done by cli_test.sh
     if [[ "$TEST_TARGET" == "cli" ]] && [[ $# -ge 3 ]]; then
@@ -364,11 +408,19 @@ check_bot_env() {
 }
 
 # Check env vars before building (saves time if they're missing)
+# But skip for list/cases operations
 case "$ACTION" in
     all)         check_bot_env ;;
     --test)
         TEST_TARGET="${2:-}"
-        if [[ "$TEST_TARGET" == "bot" ]]; then check_bot_env; fi
+        FIRST_SUB_ARG="${3:-}"  # First argument after --test <target>
+        
+        # Skip env check for list/cases operations
+        if [[ "$FIRST_SUB_ARG" == "list" ]] || [[ "$FIRST_SUB_ARG" == "cases" ]]; then
+            : # No env check needed
+        elif [[ "$TEST_TARGET" == "bot" ]]; then
+            check_bot_env
+        fi
         ;;
 esac
 

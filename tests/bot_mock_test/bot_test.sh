@@ -189,7 +189,8 @@ setup_telegram_env() {
         },
         "allowed_senders": []
       }
-    ]
+    ],
+    "queue_mode": "interrupt"
   }
 }'
     return 0
@@ -219,7 +220,8 @@ setup_discord_env() {
         },
         "allowed_senders": []
       }
-    ]
+    ],
+    "queue_mode": "interrupt"
   }
 }'
     return 0
@@ -303,6 +305,52 @@ run_module() {
             fi
         done
     fi
+
+    # 🔥 CRITICAL: Clear Python cache to ensure fresh code is loaded
+    # This prevents stale .pyc files from causing issues after code changes
+    info "Clearing Python cache..."
+    
+    # Count files before deletion for logging
+    local pycache_count=$(find "$SCRIPT_DIR" -type d -name "__pycache__" 2>/dev/null | wc -l | tr -d ' ')
+    local pyc_count=$(find "$SCRIPT_DIR" -name "*.pyc" 2>/dev/null | wc -l | tr -d ' ')
+    local pytest_cache_exists=0
+    [[ -d "$SCRIPT_DIR/.pytest_cache" ]] && pytest_cache_exists=1
+    
+    # Clear __pycache__ directories
+    if [[ $pycache_count -gt 0 ]]; then
+        find "$SCRIPT_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+        info "  Removed $pycache_count __pycache__ directories"
+    fi
+    
+    # Clear .pyc files
+    if [[ $pyc_count -gt 0 ]]; then
+        find "$SCRIPT_DIR" -name "*.pyc" -delete 2>/dev/null || true
+        info "  Deleted $pyc_count .pyc files"
+    fi
+    
+    # Clear pytest cache
+    if [[ $pytest_cache_exists -eq 1 ]]; then
+        rm -rf "$SCRIPT_DIR/.pytest_cache" 2>/dev/null || true
+        info "  Removed .pytest_cache directory"
+    fi
+    
+    # Clear venv cache
+    if [[ -d "$SCRIPT_DIR/.venv" ]]; then
+        local venv_pycache_count=$(find "$SCRIPT_DIR/.venv" -type d -name "__pycache__" -path "*/bot_mock_test/*" 2>/dev/null | wc -l | tr -d ' ')
+        local venv_pyc_count=$(find "$SCRIPT_DIR/.venv" -name "*.pyc" -path "*/bot_mock_test/*" 2>/dev/null | wc -l | tr -d ' ')
+        
+        if [[ $venv_pycache_count -gt 0 ]]; then
+            find "$SCRIPT_DIR/.venv" -type d -name "__pycache__" -path "*/bot_mock_test/*" -exec rm -rf {} + 2>/dev/null || true
+            info "  Removed $venv_pycache_count venv __pycache__ directories"
+        fi
+        
+        if [[ $venv_pyc_count -gt 0 ]]; then
+            find "$SCRIPT_DIR/.venv" -name "*.pyc" -path "*/bot_mock_test/*" -delete 2>/dev/null || true
+            info "  Deleted $venv_pyc_count venv .pyc files"
+        fi
+    fi
+    
+    ok "Cache cleared (total: $((pycache_count + pyc_count + pytest_cache_exists)) items)"
 
     # ── 6. Start mock server ─────────────────────────────────────────────────
     # Start mock server
@@ -409,8 +457,19 @@ except Exception as e:
     export PYTHONPATH="$SCRIPT_DIR"
     export MOCK_BASE_URL="http://127.0.0.1:$MOD_PORT"
 
-    # Build pytest command
-    local pytest_cmd=("$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" -v --tb=short --no-header --color=yes --capture=no)
+    # 🔥 CRITICAL: Clear cache again before running tests to ensure latest code
+    # Mock server startup may have regenerated stale .pyc files
+    info "Clearing cache before test execution..."
+    find "$SCRIPT_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+    find "$SCRIPT_DIR" -name "*.pyc" -delete 2>/dev/null || true
+    rm -rf "$SCRIPT_DIR/.pytest_cache" 2>/dev/null || true
+    ok "Cache cleared before tests"
+
+    # Build pytest command (no separate log file, output captured by tee)
+    local pytest_cmd=("$VENV_PYTHON" -m pytest "$SCRIPT_DIR/$MOD_TEST_FILE" \
+        -v --tb=short --no-header --color=yes \
+        --capture=no \
+        --log-cli-level=INFO)
     
     # If specific test case provided, add it to the command
     if [[ -n "$TEST_CASE" ]]; then
@@ -418,9 +477,10 @@ except Exception as e:
         info "Running specific test: $TEST_CASE"
     fi
 
-    # Run tests - output goes to stdout (captured by outer tee if used)
-    "${pytest_cmd[@]}"
-    local test_exit=$?
+    # Run tests - output goes to stdout AND log file via tee
+    info "All test output will be saved to: $BOT_LOG"
+    "${pytest_cmd[@]}" 2>&1 | tee -a "$BOT_LOG"
+    local test_exit=${PIPESTATUS[0]}
 
     # ── 9. Cleanup ───────────────────────────────────────────────────────────
     section "Cleanup"
