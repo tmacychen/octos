@@ -2679,9 +2679,9 @@ impl SessionActor {
             }
             QueueMode::Collect => {
                 let mut combined_content = message.content.clone();
-                let mut combined_media = image_media;
-                let mut combined_attachment_media = attachment_media;
-                let mut combined_attachment_prompt = attachment_prompt;
+                let mut combined_media = image_media.clone();
+                let mut combined_attachment_media = attachment_media.clone();
+                let mut combined_attachment_prompt = attachment_prompt.clone();
                 let mut count = 0u32;
 
                 // Non-blocking drain of queued inbound messages
@@ -2696,7 +2696,18 @@ impl SessionActor {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling batch");
                                 self.cancelled.store(true, Ordering::Release);
-                                break;
+                                // Send abort response immediately
+                                let _ = self.out_tx.send(OutboundMessage {
+                                    channel: self.channel.clone(),
+                                    chat_id: self.chat_id.clone(),
+                                    content: octos_core::abort_response(&queued.content).to_string(),
+                                    reply_to: None,
+                                    media: vec![],
+                                    metadata: serde_json::json!({}),
+                                }).await;
+                                // Reset cancelled flag and return early to skip LLM processing
+                                self.cancelled.store(false, Ordering::Release);
+                                return (message, image_media, attachment_media, attachment_prompt);
                             }
                             count += 1;
                             combined_content
@@ -2745,10 +2756,10 @@ impl SessionActor {
                 // Coalescing delay: give rapid follow-up messages time to arrive
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                let mut latest_message = message;
-                let mut latest_media = image_media;
-                let mut latest_attachment_media = attachment_media;
-                let mut latest_attachment_prompt = attachment_prompt;
+                let mut latest_message = message.clone();
+                let mut latest_media = image_media.clone();
+                let mut latest_attachment_media = attachment_media.clone();
+                let mut latest_attachment_prompt = attachment_prompt.clone();
 
                 // Non-blocking drain: keep only the newest inbound message
                 loop {
@@ -2762,7 +2773,18 @@ impl SessionActor {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling");
                                 self.cancelled.store(true, Ordering::Release);
-                                break;
+                                // Send abort response immediately
+                                let _ = self.out_tx.send(OutboundMessage {
+                                    channel: self.channel.clone(),
+                                    chat_id: self.chat_id.clone(),
+                                    content: octos_core::abort_response(&queued.content).to_string(),
+                                    reply_to: None,
+                                    media: vec![],
+                                    metadata: serde_json::json!({}),
+                                }).await;
+                                // Reset cancelled flag and return early to skip LLM processing
+                                self.cancelled.store(false, Ordering::Release);
+                                return (message, image_media, attachment_media, attachment_prompt);
                             }
                             debug!(session = %self.session_key, "steer: replacing with newer message");
                             latest_message = queued;
@@ -3174,8 +3196,6 @@ impl SessionActor {
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
 
-        self.maybe_pre_activate_turn_tools(&inbound, &image_media, &attachment_media);
-
         // ── Setup (needs &mut self briefly for permit + reporter) ────────
 
         let _permit = match self.semaphore.acquire().await {
@@ -3563,7 +3583,7 @@ impl SessionActor {
         let supervisor = tools.supervisor();
         let bg_tasks = supervisor.task_count();
         let all_tasks = supervisor.get_all_tasks();
-        let had_bg_tasks = completion_has_bg_tasks(tools, &supervisor);
+        let had_bg_tasks = bg_tasks > 0;
         let bg_task_details: Vec<_> = supervisor.get_active_tasks();
         if !all_tasks.is_empty() {
             for t in &all_tasks {
@@ -4199,8 +4219,6 @@ impl SessionActor {
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
 
-        self.maybe_pre_activate_turn_tools(&inbound, &image_media, &attachment_media);
-
         // Get conversation history
         let max_history = self.max_history.load(Ordering::Acquire);
         let history: Vec<Message> = {
@@ -4539,12 +4557,17 @@ impl SessionActor {
                         let metadata = persisted_assistant_message
                             .as_ref()
                             .map(|persisted| {
-                                persisted_session_result_metadata(
-                                    &self.session_key,
-                                    persisted,
-                                    &final_content,
-                                    &assistant_media,
-                                )
+                                serde_json::json!({
+                                    "topic": self.session_key.topic(),
+                                    "_history_persisted": true,
+                                    "_session_result": {
+                                        "seq": persisted.seq,
+                                        "role": "assistant",
+                                        "content": final_content.clone(),
+                                        "timestamp": persisted.timestamp.to_rfc3339(),
+                                        "media": Vec::<String>::new(),
+                                    }
+                                })
                             })
                             .unwrap_or_else(|| serde_json::json!({}));
                         let _ = self
