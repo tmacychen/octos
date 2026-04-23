@@ -9,6 +9,10 @@ use eyre::{Result, WrapErr};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use crate::harness_events::{
+    OCTOS_EVENT_SINK_ENV, OCTOS_HARNESS_SESSION_ID_ENV, OCTOS_HARNESS_TASK_ID_ENV,
+    OCTOS_SESSION_ID_ENV, OCTOS_TASK_ID_ENV, lookup_event_sink_context,
+};
 use crate::progress::ProgressEvent;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 use crate::tools::{TOOL_CTX, Tool, ToolContext, ToolResult};
@@ -120,18 +124,18 @@ impl PluginTool {
                     continue;
                 }
             }
-            if key == "style"
-                && let Some(style) = value.as_str()
-            {
-                if self.tool_def.name.starts_with("mofa_")
-                    && let Some(normalized) = normalize_mofa_style_name(style)
-                {
-                    rewritten.insert(key.clone(), serde_json::Value::String(normalized));
-                    continue;
-                }
-                if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
-                    rewritten.insert(key.clone(), serde_json::Value::String(resolved));
-                    continue;
+            if key == "style" {
+                if let Some(style) = value.as_str() {
+                    if self.tool_def.name.starts_with("mofa_") {
+                        if let Some(normalized) = normalize_mofa_style_name(style) {
+                            rewritten.insert(key.clone(), serde_json::Value::String(normalized));
+                            continue;
+                        }
+                    }
+                    if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
+                        rewritten.insert(key.clone(), serde_json::Value::String(resolved));
+                        continue;
+                    }
                 }
             }
             if key == "slides" {
@@ -183,13 +187,15 @@ impl PluginTool {
                 .unwrap_or(false);
             if !has_audio_path
                 && input_schema_has_property(&self.tool_def.input_schema, "audio_path")
-                && let Some(ctx) = ctx
-                && ctx.audio_attachment_paths.len() == 1
             {
-                obj.insert(
-                    "audio_path".into(),
-                    serde_json::Value::String(ctx.audio_attachment_paths[0].clone()),
-                );
+                if let Some(ctx) = ctx {
+                    if ctx.audio_attachment_paths.len() == 1 {
+                        obj.insert(
+                            "audio_path".into(),
+                            serde_json::Value::String(ctx.audio_attachment_paths[0].clone()),
+                        );
+                    }
+                }
             }
 
             let has_file_path = obj
@@ -197,15 +203,16 @@ impl PluginTool {
                 .and_then(|value| value.as_str())
                 .map(|value| !value.is_empty())
                 .unwrap_or(false);
-            if !has_file_path
-                && input_schema_has_property(&self.tool_def.input_schema, "file_path")
-                && let Some(ctx) = ctx
-                && ctx.file_attachment_paths.len() == 1
+            if !has_file_path && input_schema_has_property(&self.tool_def.input_schema, "file_path")
             {
-                obj.insert(
-                    "file_path".into(),
-                    serde_json::Value::String(ctx.file_attachment_paths[0].clone()),
-                );
+                if let Some(ctx) = ctx {
+                    if ctx.file_attachment_paths.len() == 1 {
+                        obj.insert(
+                            "file_path".into(),
+                            serde_json::Value::String(ctx.file_attachment_paths[0].clone()),
+                        );
+                    }
+                }
             }
         }
 
@@ -466,6 +473,8 @@ impl Tool for PluginTool {
             cmd.env_remove(var);
         }
 
+        let ctx: Option<ToolContext> = TOOL_CTX.try_with(|c| c.clone()).ok();
+
         // Inject extra environment variables (e.g. provider base URLs, API keys)
         for (key, val) in &self.extra_env {
             if should_forward_env_name(key, &env_allowlist) {
@@ -475,8 +484,21 @@ impl Tool for PluginTool {
                     plugin = %self.plugin_name,
                     tool = %self.tool_def.name,
                     env = %key,
-                    "skipping non-allowlisted secret environment variable for plugin tool"
+                "skipping non-allowlisted secret environment variable for plugin tool"
                 );
+            }
+        }
+
+        if let Some(sink) = ctx
+            .as_ref()
+            .and_then(|ctx| ctx.harness_event_sink.as_deref())
+        {
+            cmd.env(OCTOS_EVENT_SINK_ENV, sink);
+            if let Some(context) = lookup_event_sink_context(sink) {
+                cmd.env(OCTOS_SESSION_ID_ENV, &context.session_id);
+                cmd.env(OCTOS_TASK_ID_ENV, &context.task_id);
+                cmd.env(OCTOS_HARNESS_SESSION_ID_ENV, &context.session_id);
+                cmd.env(OCTOS_HARNESS_TASK_ID_ENV, &context.task_id);
             }
         }
 
@@ -496,7 +518,6 @@ impl Tool for PluginTool {
             cmd.env("OCTOS_WORK_DIR", dir);
         }
 
-        let ctx: Option<ToolContext> = TOOL_CTX.try_with(|c| c.clone()).ok();
         let effective_args = self.prepare_effective_args(args, ctx.as_ref());
 
         let mut child = cmd.spawn().wrap_err_with(|| {
@@ -968,6 +989,7 @@ mod tests {
         let ctx = ToolContext {
             tool_id: "tool-1".to_string(),
             reporter: Arc::new(SilentReporter),
+            harness_event_sink: None,
             attachment_paths: vec![
                 "/workspace/voice.ogg".to_string(),
                 "/workspace/report.pdf".to_string(),
@@ -1024,6 +1046,77 @@ mod tests {
             "output should contain echoed input, got: {}",
             result.output
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_structured_progress_event_updates_task_supervisor() {
+        use crate::task_supervisor::TaskSupervisor;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_id = supervisor.register("structured_tool", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"schema\":\"octos.harness.event.v1\",\"kind\":\"progress\",\"session_id\":\"%s\",\"task_id\":\"%s\",\"workflow\":\"deep_research\",\"phase\":\"fetching_sources\",\"message\":\"Fetching source 3/12\",\"progress\":0.42}\\n' \"$OCTOS_SESSION_ID\" \"$OCTOS_TASK_ID\" >> \"$OCTOS_EVENT_SINK\"\nprintf '{\"output\":\"ok\",\"success\":true}'\n",
+        );
+
+        let def = make_tool_def("structured_tool", "writes harness events");
+        let tool = PluginTool::new("test-plugin".into(), def, script_path)
+            .with_timeout(Duration::from_secs(5));
+
+        let sink = crate::harness_events::HarnessEventSink::new(
+            supervisor.clone(),
+            task_id.clone(),
+            "api:session",
+        )
+        .expect("create sink");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        supervisor.set_on_change(move |task| {
+            let _ = tx.send(task.clone());
+        });
+
+        let ctx = ToolContext {
+            tool_id: "tool-1".to_string(),
+            reporter: Arc::new(SilentReporter),
+            harness_event_sink: Some(sink.path().display().to_string()),
+            attachment_paths: vec![],
+            audio_attachment_paths: vec![],
+            file_attachment_paths: vec![],
+        };
+
+        let result = crate::tools::TOOL_CTX
+            .scope(ctx, tool.execute(&json!({})))
+            .await
+            .expect("tool execution should succeed");
+        assert!(result.success);
+
+        let updated = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("callback should fire")
+            .expect("task snapshot should be sent");
+
+        let detail: serde_json::Value =
+            serde_json::from_str(updated.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["workflow_kind"], "deep_research");
+        assert_eq!(detail["current_phase"], "fetching_sources");
+        assert_eq!(detail["progress_message"], "Fetching source 3/12");
+        assert_eq!(updated.status, crate::task_supervisor::TaskStatus::Running);
+        assert_eq!(
+            updated.lifecycle_state(),
+            crate::task_supervisor::TaskLifecycleState::Running
+        );
+
+        let task = supervisor.get_task(&task_id).expect("task missing");
+        let task_detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(task_detail["current_phase"], "fetching_sources");
+        assert_eq!(task_detail["progress_message"], "Fetching source 3/12");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

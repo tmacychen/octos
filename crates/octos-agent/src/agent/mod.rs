@@ -10,6 +10,7 @@ mod loop_compaction;
 mod loop_runner;
 mod memory;
 mod message_repair;
+pub mod realtime;
 mod streaming;
 mod turn_state;
 
@@ -25,6 +26,8 @@ use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
 use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
+
+pub use realtime::RealtimeController;
 
 tokio::task_local! {
     /// Task-local reporter override.  When set (via `TASK_REPORTER.scope()`),
@@ -147,12 +150,18 @@ pub struct Agent {
     pub(super) hooks: Option<Arc<HookExecutor>>,
     /// Session-level context for hook payloads.
     pub(super) hook_context: std::sync::Mutex<Option<HookContext>>,
+    /// Local harness event sink path shared with child tools in this agent.
+    pub(super) harness_event_sink: Option<String>,
     /// Shutdown signal.
     pub(super) shutdown: Arc<AtomicBool>,
     /// Optional per-session runtime limits for tool rounds and per-tool calls.
     pub(super) session_limits: Option<SessionLimits>,
     /// Mutable usage tracked against `session_limits`.
     pub(super) session_usage: std::sync::Mutex<SessionUsage>,
+    /// Optional realtime controller (heartbeat + sensor context injector) for
+    /// robotics operators. Absent by default -- the agent loop behaves exactly
+    /// as before when this is `None`.
+    pub(super) realtime: Option<Arc<RealtimeController>>,
 }
 
 impl Agent {
@@ -176,9 +185,11 @@ impl Agent {
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
+            harness_event_sink: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
+            realtime: None,
         }
     }
 
@@ -203,9 +214,11 @@ impl Agent {
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
+            harness_event_sink: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
+            realtime: None,
         }
     }
 
@@ -286,11 +299,74 @@ impl Agent {
         self
     }
 
+    /// Set the local harness event sink path for child tools.
+    pub fn with_harness_event_sink(mut self, sink_path: impl Into<String>) -> Self {
+        self.harness_event_sink = Some(sink_path.into());
+        self
+    }
+
     /// Set per-session runtime limits for tool execution.
     pub fn with_session_limits(mut self, limits: SessionLimits) -> Self {
         self.session_limits = Some(limits);
         self.session_usage = std::sync::Mutex::new(SessionUsage::default());
         self
+    }
+
+    /// Attach a realtime controller so each loop iteration beats the
+    /// heartbeat, checks for stalls, and (if configured) injects a bounded
+    /// sensor summary into the system prompt.
+    pub fn with_realtime(mut self, controller: Arc<RealtimeController>) -> Self {
+        self.realtime = Some(controller);
+        self
+    }
+
+    /// Returns the attached realtime controller, if any. Tools and tests
+    /// reach through this to inspect heartbeat state.
+    pub fn realtime_controller(&self) -> Option<Arc<RealtimeController>> {
+        self.realtime.clone()
+    }
+
+    /// Beat the heartbeat once (if a realtime controller is attached) and
+    /// return `Err(AgentError::HeartbeatStalled)` when the controller reports
+    /// a stall. Callers invoke this at the top of each loop iteration so that
+    /// a hung LLM or I/O call can surface a typed error instead of silently
+    /// freezing the robot.
+    pub(super) fn beat_heartbeat(&self, iteration: u32) -> eyre::Result<()> {
+        use realtime::{AgentError, HeartbeatState};
+
+        let Some(controller) = self.realtime.as_ref() else {
+            return Ok(());
+        };
+        if !controller.config().enabled {
+            return Ok(());
+        }
+        match controller.beat_and_check() {
+            HeartbeatState::Alive => Ok(()),
+            HeartbeatState::Stalled => {
+                let timeout_ms = controller.config().heartbeat_timeout_ms;
+                tracing::warn!(
+                    iteration,
+                    timeout_ms,
+                    "realtime heartbeat stalled, aborting iteration"
+                );
+                Err(eyre::Report::new(AgentError::HeartbeatStalled {
+                    iteration,
+                    timeout_ms,
+                }))
+            }
+        }
+    }
+
+    /// Render the sensor context summary (bounded by the configured token
+    /// budget) for the current system prompt, if the realtime controller is
+    /// enabled and has an injector. Returns `None` when realtime is off, the
+    /// injector has no data, or the source is empty.
+    pub(super) fn realtime_sensor_summary(&self) -> Option<String> {
+        let controller = self.realtime.as_ref()?;
+        if !controller.config().enabled {
+            return None;
+        }
+        controller.sensor_summary()
     }
 
     /// Update the session ID in the hook context (call before each message).

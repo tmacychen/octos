@@ -23,6 +23,26 @@ fn should_auto_send_tool_files(
     !(suppress_auto_send_files || explicit_send_file_requested && tool_name != "send_file")
 }
 
+/// Produce the composite system-prompt text (worker prompt + realtime sensor
+/// summary) used at the top of every agent turn. Centralizing this in
+/// `execution.rs` keeps the message-building policy in a single location so
+/// the conversation loop and task loop compose the same prompt.
+///
+/// Returns the prompt text the caller should paste into the first system
+/// `Message`. When no realtime controller is attached this is byte-identical
+/// to the stored system prompt.
+pub(super) fn compose_system_prompt(agent: &Agent) -> String {
+    let mut content = agent.system_prompt_snapshot();
+    if let Some(summary) = agent.realtime_sensor_summary() {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(&summary);
+    }
+    content
+}
+
 impl Agent {
     pub(super) async fn execute_tools(
         &self,
@@ -70,6 +90,7 @@ impl Agent {
                 let tc_id = tool_call.id.clone();
                 let tc_args = tool_call.arguments.clone();
                 let attachment_ctx = turn_attachment_ctx.clone();
+                let harness_event_sink = self.harness_event_sink.clone();
 
                 tokio::spawn(async move {
                     let tool_start = Instant::now();
@@ -153,6 +174,7 @@ impl Agent {
                             let make_ctx = || ToolContext {
                                 tool_id: bg_tc_id.clone(),
                                 reporter: bg_reporter.clone(),
+                                harness_event_sink: harness_event_sink.clone(),
                                 attachment_paths: bg_attachment_ctx.attachment_paths.clone(),
                                 audio_attachment_paths: bg_attachment_ctx
                                     .audio_attachment_paths
@@ -475,6 +497,7 @@ impl Agent {
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),
+                        harness_event_sink: harness_event_sink.clone(),
                         attachment_paths: attachment_ctx.attachment_paths.clone(),
                         audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
                         file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),

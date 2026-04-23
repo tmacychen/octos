@@ -4,12 +4,26 @@ use std::path::{Path, PathBuf};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
+use crate::abi_schema::{
+    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported, default_workspace_policy_schema_version,
+};
 use crate::workspace_git::WorkspaceProjectKind;
 
 pub const WORKSPACE_POLICY_FILE: &str = ".octos-workspace.toml";
 
+/// Harness-facing workspace policy.
+///
+/// `schema_version` is the durable ABI version; see
+/// `docs/OCTOS_HARNESS_ABI_VERSIONING.md` for the stable and experimental
+/// fields per version. Older policy files that omit the field are accepted
+/// as v1 on deserialization.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspacePolicy {
+    /// Durable ABI schema version for this policy. Defaults to
+    /// [`WORKSPACE_POLICY_SCHEMA_VERSION`] when absent so pre-versioned
+    /// policies continue to load.
+    #[serde(default = "default_workspace_policy_schema_version")]
+    pub schema_version: u32,
     pub workspace: WorkspacePolicyWorkspace,
     pub version_control: WorkspaceVersionControlPolicy,
     pub tracking: WorkspaceTrackingPolicy,
@@ -33,6 +47,78 @@ pub struct ValidationPolicy {
     /// Tier 3: expensive checks run on completion/publish only (10-30s). e.g. Playwright.
     #[serde(default)]
     pub on_completion: Vec<String>,
+    /// Typed declarative validators (M4.3). Runs via `ValidatorRunner`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validators: Vec<Validator>,
+}
+
+/// Typed declarative validator spec.
+///
+/// Each validator is identified by a stable `id`, produces a typed
+/// [`crate::validators::ValidatorOutcome`], and may be `required` (a failure
+/// blocks terminal success) or optional (a failure produces a warning only).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Validator {
+    /// Stable identifier, unique within the validator list.
+    pub id: String,
+    /// Required validators block terminal success when they fail.
+    #[serde(default = "default_required")]
+    pub required: bool,
+    /// Optional per-validator timeout in milliseconds. Applies to command and
+    /// tool validators. File-existence validators ignore the timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Which lifecycle phase this validator runs in. Defaults to completion.
+    #[serde(default, skip_serializing_if = "is_default_phase")]
+    pub phase: ValidatorPhaseKind,
+    #[serde(flatten)]
+    pub spec: ValidatorSpec,
+}
+
+fn default_required() -> bool {
+    true
+}
+
+fn is_default_phase(phase: &ValidatorPhaseKind) -> bool {
+    *phase == ValidatorPhaseKind::default()
+}
+
+/// Lifecycle phase a validator runs in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatorPhaseKind {
+    /// Runs on every turn end (cheap checks).
+    TurnEnd,
+    /// Runs on completion / publish (expensive checks).
+    #[default]
+    Completion,
+}
+
+/// The typed body of a [`Validator`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValidatorSpec {
+    /// Run a subprocess command. Dispatched via the shell-safety layer and
+    /// existing `BLOCKED_ENV_VARS` sanitization. No direct `Command::new("sh")`
+    /// bypass.
+    Command {
+        cmd: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+    },
+    /// Invoke a registered agent tool. Outcome status follows the tool's
+    /// `ToolResult.success`.
+    ToolCall {
+        tool: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
+    /// Assert that a file exists (and optionally meets a minimum byte count).
+    FileExists {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_bytes: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +228,7 @@ impl WorkspacePolicy {
     pub fn for_kind(kind: WorkspaceProjectKind) -> Self {
         match kind {
             WorkspaceProjectKind::Slides => Self {
+                schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
                 workspace: WorkspacePolicyWorkspace {
                     kind: WorkspacePolicyKind::Slides,
                 },
@@ -172,6 +259,7 @@ impl WorkspacePolicy {
                         "file_exists:output/deck.pptx".into(),
                         "file_exists:output/**/slide-*.png".into(),
                     ],
+                    validators: Vec::new(),
                 },
                 artifacts: WorkspaceArtifactsPolicy {
                     entries: BTreeMap::from([
@@ -183,6 +271,7 @@ impl WorkspacePolicy {
                 spawn_tasks: BTreeMap::new(),
             },
             WorkspaceProjectKind::Sites => Self {
+                schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
                 workspace: WorkspacePolicyWorkspace {
                     kind: WorkspacePolicyKind::Sites,
                 },
@@ -248,6 +337,7 @@ impl WorkspacePolicy {
         spawn_tasks.insert("podcast_generate".into(), podcast_contract);
 
         Self {
+            schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
             workspace: WorkspacePolicyWorkspace {
                 kind: WorkspacePolicyKind::Session,
             },
@@ -276,6 +366,7 @@ impl WorkspacePolicy {
             ],
             on_source_change: Vec::new(),
             on_completion: vec![format!("file_exists:{build_output_dir}/index.html")],
+            validators: Vec::new(),
         };
         policy.artifacts = WorkspaceArtifactsPolicy {
             entries: BTreeMap::from([
@@ -304,6 +395,12 @@ pub fn read_workspace_policy(project_root: &Path) -> Result<Option<WorkspacePoli
         .wrap_err_with(|| format!("read workspace policy failed: {}", path.display()))?;
     let policy: WorkspacePolicy = toml::from_str(&raw)
         .wrap_err_with(|| format!("parse workspace policy failed: {}", path.display()))?;
+    check_supported(
+        "WorkspacePolicy",
+        policy.schema_version,
+        WORKSPACE_POLICY_SCHEMA_VERSION,
+    )
+    .wrap_err_with(|| format!("incompatible workspace policy: {}", path.display()))?;
     Ok(Some(policy))
 }
 
@@ -566,5 +663,124 @@ mod tests {
         assert!(
             upgrade_workspace_policy_if_legacy(&current, WorkspaceProjectKind::Slides).is_none()
         );
+    }
+
+    #[test]
+    fn should_stamp_current_schema_version_when_building_for_kind() {
+        let slides = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        let sites = WorkspacePolicy::for_kind(WorkspaceProjectKind::Sites);
+        let session = WorkspacePolicy::for_session();
+        assert_eq!(slides.schema_version, WORKSPACE_POLICY_SCHEMA_VERSION);
+        assert_eq!(sites.schema_version, WORKSPACE_POLICY_SCHEMA_VERSION);
+        assert_eq!(session.schema_version, WORKSPACE_POLICY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn should_default_missing_schema_version_to_v1_when_loading_legacy_toml() {
+        // A TOML emitted before M4.6 — no `schema_version` line.
+        let legacy = r#"
+[workspace]
+kind = "slides"
+
+[version_control]
+provider = "git"
+auto_init = true
+trigger = "turn_end"
+fail_on_error = true
+
+[tracking]
+ignore = ["output/**"]
+"#;
+        let parsed: WorkspacePolicy = toml::from_str(legacy).expect("legacy policy should parse");
+        assert_eq!(parsed.schema_version, WORKSPACE_POLICY_SCHEMA_VERSION);
+        assert_eq!(parsed.workspace.kind, WorkspacePolicyKind::Slides);
+    }
+
+    #[test]
+    fn should_reject_future_schema_version_with_actionable_error() {
+        // A TOML that claims a version the harness cannot understand.
+        let future = format!(
+            r#"
+schema_version = {}
+
+[workspace]
+kind = "slides"
+
+[version_control]
+provider = "git"
+auto_init = true
+trigger = "turn_end"
+fail_on_error = true
+
+[tracking]
+ignore = []
+"#,
+            WORKSPACE_POLICY_SCHEMA_VERSION + 99
+        );
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(WORKSPACE_POLICY_FILE), future).unwrap();
+
+        let err = read_workspace_policy(temp.path()).expect_err("future version should fail");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("schema_version"));
+        assert!(rendered.contains("upgrade octos"));
+    }
+
+    #[test]
+    fn should_roundtrip_typed_validators_through_toml() {
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.validation.validators = vec![
+            Validator {
+                id: "cmd".into(),
+                required: true,
+                timeout_ms: Some(3000),
+                phase: ValidatorPhaseKind::Completion,
+                spec: ValidatorSpec::Command {
+                    cmd: "echo".into(),
+                    args: vec!["hello".into()],
+                },
+            },
+            Validator {
+                id: "file".into(),
+                required: false,
+                timeout_ms: None,
+                phase: ValidatorPhaseKind::TurnEnd,
+                spec: ValidatorSpec::FileExists {
+                    path: "out.txt".into(),
+                    min_bytes: Some(128),
+                },
+            },
+            Validator {
+                id: "tool".into(),
+                required: true,
+                timeout_ms: Some(5000),
+                phase: ValidatorPhaseKind::Completion,
+                spec: ValidatorSpec::ToolCall {
+                    tool: "custom_tool".into(),
+                    args: serde_json::json!({"mode": "strict"}),
+                },
+            },
+        ];
+        let rendered = toml::to_string_pretty(&policy).unwrap();
+        assert!(rendered.contains("[[validation.validators]]"));
+        assert!(rendered.contains("kind = \"command\""));
+        assert!(rendered.contains("kind = \"file_exists\""));
+        assert!(rendered.contains("kind = \"tool_call\""));
+        let parsed: WorkspacePolicy = toml::from_str(&rendered).unwrap();
+        assert_eq!(parsed, policy);
+    }
+
+    #[test]
+    fn validator_defaults_to_required_and_completion_phase() {
+        let toml = r#"
+            id = "x"
+            kind = "file_exists"
+            path = "output.txt"
+        "#;
+        let parsed: Validator = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.id, "x");
+        assert!(parsed.required, "required defaults to true");
+        assert_eq!(parsed.phase, ValidatorPhaseKind::Completion);
+        assert!(parsed.timeout_ms.is_none());
     }
 }

@@ -17,6 +17,8 @@ use crate::progress::ProgressReporter;
 pub struct ToolContext {
     pub tool_id: String,
     pub reporter: Arc<dyn ProgressReporter>,
+    /// Local newline-delimited JSON sink for structured harness progress.
+    pub harness_event_sink: Option<String>,
     pub attachment_paths: Vec<String>,
     pub audio_attachment_paths: Vec<String>,
     pub file_attachment_paths: Vec<String>,
@@ -182,7 +184,11 @@ pub use registry::ToolRegistry;
 
 // Tool policy
 pub mod policy;
-pub use policy::ToolPolicy;
+pub use policy::{PolicyDecision, ToolPolicy};
+
+// Robot safety-tier groups consulted by ToolPolicy evaluation.
+pub mod robot_groups;
+pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_registry};
 
 // Shared SSRF protection
 pub mod ssrf;

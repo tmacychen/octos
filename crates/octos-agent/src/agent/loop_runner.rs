@@ -197,16 +197,13 @@ impl Agent {
                 // Reset per-run flags
                 self.tools.reset_spawn_only_invoked();
 
+                // Build the system prompt via the shared helper in
+                // execution.rs so conversation + task loops compose the same
+                // prompt. This is where realtime sensor summary gets appended
+                // once per turn (bounded by `sensor_budget_tokens`).
                 let mut messages = vec![Message {
                     role: MessageRole::System,
-                    content: self
-                        .system_prompt
-                        .read()
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("system prompt lock was poisoned, recovering");
-                            e.into_inner()
-                        })
-                        .clone(),
+                    content: super::execution::compose_system_prompt(self),
                     media: vec![],
                     tool_calls: None,
                     tool_call_id: None,
@@ -268,6 +265,11 @@ impl Agent {
                     }
 
                     let iteration = turn.advance_iteration();
+                    // Realtime heartbeat: beat first, then abort the iteration
+                    // with a typed error if the controller reports stalled.
+                    // A None controller / disabled config is a no-op so the
+                    // 830+ existing tests see identical behavior.
+                    self.beat_heartbeat(iteration)?;
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
@@ -581,6 +583,7 @@ impl Agent {
                     turn.record_budget_stop(&stop);
                     self.report_budget_stop(&stop, turn.iteration());
                     return Ok(TaskResult {
+                        schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
                         success: false,
                         output: stop.message(),
                         files_modified,
@@ -592,6 +595,9 @@ impl Agent {
 
                 let iteration = turn.advance_iteration();
                 let iter_start = Instant::now();
+                // Realtime heartbeat beat + stall check (no-op when realtime
+                // is disabled or unattached).
+                self.beat_heartbeat(iteration)?;
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
 
@@ -772,6 +778,7 @@ impl Agent {
     ) -> TaskResult {
         let success = response.stop_reason != StopReason::MaxTokens;
         TaskResult {
+            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success,
             output: response.content.clone().unwrap_or_default(),
             files_modified,
@@ -1545,7 +1552,7 @@ mod tests {
         let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
 
         let result = agent.process_message("do work", &[], vec![]).await.unwrap();
-        let roles: Vec<MessageRole> = result.messages.iter().map(|m| m.role.clone()).collect();
+        let roles: Vec<MessageRole> = result.messages.iter().map(|m| m.role).collect();
         assert_eq!(
             roles,
             vec![

@@ -7,6 +7,7 @@
 //! - Progress reporting for real-time updates
 //! - Integration with codex sandboxing (when enabled)
 
+pub mod abi_schema;
 mod agent;
 pub mod behaviour;
 pub mod bootstrap;
@@ -15,9 +16,11 @@ pub mod bundled_app_skills;
 mod compaction;
 pub mod event_bus;
 pub mod exec_env;
+pub mod harness_events;
 pub mod hooks;
 pub mod loop_detect;
 pub mod mcp;
+pub mod permissions;
 pub mod plugins;
 pub mod policy;
 pub mod progress;
@@ -33,19 +36,37 @@ mod subprocess_env;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
+pub mod validators;
 pub mod workspace_contract;
 pub mod workspace_git;
 pub mod workspace_policy;
 
+pub use abi_schema::{
+    HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION,
+    UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
+};
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
-    DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, TASK_REPORTER,
-    TokenTracker,
+    DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, RealtimeController,
+    TASK_REPORTER, TokenTracker,
+    realtime::{
+        AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
+        SensorContextInjector, SensorSnapshot, SensorSource,
+    },
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
-pub use hooks::{HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookResult};
+pub use harness_events::{
+    HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessEvent, HarnessEventError,
+    HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessPhaseEvent,
+    HarnessProgressEvent, HarnessRetryEvent, HarnessValidatorResultEvent,
+    MAX_HARNESS_EVENT_LINE_BYTES,
+};
+pub use hooks::{
+    HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,
+};
 pub use mcp::{McpClient, McpServerConfig};
+pub use permissions::{InvalidSafetyTier, SafetyTier};
 pub use plugins::{PluginLoadResult, PluginLoader};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use prompt_layer::PromptLayerBuilder;
@@ -61,12 +82,18 @@ pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
     CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DeepSearchTool,
     DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool,
-    ReadFileTool, RecallMemoryTool, SaveMemoryTool, SendFileTool, ShellTool, SpawnTool,
-    SynthesizeResearchTool, TakePhotoTool, Tool, ToolConfigStore, ToolPolicy, ToolRegistry,
-    ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
+    PolicyDecision, ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool,
+    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
+    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
+    WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
+    install_robot_registry,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
+pub use validators::{
+    VALIDATOR_RESULT_SCHEMA_VERSION, ValidatorInvocation, ValidatorLedger, ValidatorOutcome,
+    ValidatorPhase, ValidatorRunner, ValidatorStatus, run_workspace_validators,
+};
 pub use workspace_git::{
     WorkspaceArtifactStatus, WorkspaceCheckStatus, WorkspaceContractStatus, WorkspaceProjectKind,
     WorkspaceValidationFailure, WorkspaceValidationPhase, commit_all_if_dirty,
@@ -75,11 +102,11 @@ pub use workspace_git::{
     snapshot_workspace_change, snapshot_workspace_turn,
 };
 pub use workspace_policy::{
-    ValidationPolicy, WORKSPACE_POLICY_FILE, WorkspaceArtifactsPolicy, WorkspacePolicy,
-    WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceSpawnTaskPolicy,
-    WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider,
-    read_workspace_policy, upgrade_workspace_policy_if_legacy, workspace_policy_path,
-    write_workspace_policy,
+    ValidationPolicy, Validator, ValidatorPhaseKind, ValidatorSpec, WORKSPACE_POLICY_FILE,
+    WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
+    WorkspaceSpawnTaskPolicy, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
+    WorkspaceVersionControlProvider, read_workspace_policy, upgrade_workspace_policy_if_legacy,
+    workspace_policy_path, write_workspace_policy,
 };
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
+use crate::harness_events::HarnessEventSink;
 use crate::task_supervisor::TaskSupervisor;
 use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
@@ -960,15 +961,15 @@ fn resolve_background_terminal_files(
                 .collect()
         });
 
-    if terminal_files.is_empty()
-        && let Some(required_kind) = workflow_terminal_artifact_kind(workflow)
-    {
-        let workflow_kind = workflow
-            .map(|workflow| workflow.workflow_kind.as_str())
-            .unwrap_or("workflow");
-        return Err(format!(
-            "{workflow_kind} completed without required {required_kind} terminal artifact"
-        ));
+    if terminal_files.is_empty() {
+        if let Some(required_kind) = workflow_terminal_artifact_kind(workflow) {
+            let workflow_kind = workflow
+                .map(|workflow| workflow.workflow_kind.as_str())
+                .unwrap_or("workflow");
+            return Err(format!(
+                "{workflow_kind} completed without required {required_kind} terminal artifact"
+            ));
+        }
     }
 
     Ok(terminal_files)
@@ -1438,6 +1439,35 @@ impl Tool for SpawnTool {
                     );
                 }
 
+                let harness_event_sink = match (
+                    task_supervisor.as_ref(),
+                    tracked_task_id.as_ref(),
+                    parent_session_key.as_ref(),
+                ) {
+                    (Some(supervisor), Some(task_id), Some(session_key)) => {
+                        match HarnessEventSink::new(
+                            supervisor.clone(),
+                            task_id.clone(),
+                            session_key.clone(),
+                        ) {
+                            Ok(sink) => Some(sink),
+                            Err(error) => {
+                                warn!(
+                                    task_id = %task_id,
+                                    session_key = %session_key,
+                                    error = %error,
+                                    "failed to create harness event sink; continuing without structured child progress"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let harness_event_sink_path = harness_event_sink
+                    .as_ref()
+                    .map(|sink| sink.path().display().to_string());
+
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
                 // Load plugin tools so subagents can use fm_tts, etc.
                 if !plugin_dirs.is_empty() {
@@ -1465,6 +1495,9 @@ impl Tool for SpawnTool {
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
                 worker = worker.with_config(effective_config);
+                if let Some(ref sink_path) = harness_event_sink_path {
+                    worker = worker.with_harness_event_sink(sink_path.clone());
+                }
                 if let Some(ref hooks) = worker_hooks {
                     worker = worker.with_hooks(hooks.clone());
                 }
@@ -2960,6 +2993,7 @@ PY
     #[test]
     fn classify_child_session_failure_as_retryable_when_budget_exhausted() {
         let result = Ok::<octos_core::TaskResult, eyre::Report>(octos_core::TaskResult {
+            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success: false,
             output: "Token budget exceeded (120 of 100).".to_string(),
             files_modified: vec![],
