@@ -20,9 +20,13 @@ class BaseMockRunner:
     def __init__(self, base_url: str):
         self.base_url = base_url
 
-    def get_sent_messages(self) -> list[dict]:
-        """获取 bot 已发送的所有消息"""
-        resp = httpx.get(f"{self.base_url}/_sent_messages", timeout=5)
+    def get_sent_messages(self, timeout: int = 10) -> list[dict]:
+        """获取 bot 已发送的所有消息
+        
+        Args:
+            timeout: HTTP 请求超时时间（秒），默认 10s
+        """
+        resp = httpx.get(f"{self.base_url}/_sent_messages", timeout=timeout)
         resp.raise_for_status()
         return resp.json()
 

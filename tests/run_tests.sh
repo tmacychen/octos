@@ -34,7 +34,7 @@ TEST_DIR="/tmp/octos_test"
 LOG_DIR="$TEST_DIR/logs"
 OCTOS_BIN="$TEST_DIR/octos"
 CHECKSUM_FILE="$TEST_DIR/.octos_checksum"
-SOURCE_BIN="$PROJECT_ROOT/target/debug/octos"
+SOURCE_BIN="$PROJECT_ROOT/target/release/octos"
 FAILED=0
 MODULE_RESULTS=()   # tracks "module_name:PASS" or "module_name:FAIL"
 
@@ -99,7 +99,7 @@ sync_binary() {
 
 # ── Build ────────────────────────────────────────────────────────────────────
 build_octos() {
-    section "Building octos (all features)"
+    section "Building octos (telegram, discord)"
 
     mkdir -p "$TEST_DIR" "$LOG_DIR"
     info "Test directory: $TEST_DIR"
@@ -108,15 +108,12 @@ build_octos() {
     info "This may take a moment on first build..."
     info "Build log: $build_log"
 
-    if ! cargo build \
-        --manifest-path "$PROJECT_ROOT/Cargo.toml" \
-        --bin octos \
-        --all-features \
+    if ! (cd "$PROJECT_ROOT" && cargo build --release -p octos-cli --features telegram,discord) \
         2>&1 | tee "$build_log"; then
         err "Build failed (see log: $build_log)"
         exit 1
     fi
-    ok "Build complete (all features)"
+    ok "Build complete (telegram, discord)"
 
     sync_binary "$SOURCE_BIN" "$OCTOS_BIN" "$CHECKSUM_FILE"
 }
@@ -160,27 +157,9 @@ run_bot_tests() {
         return
     fi
 
-    # Determine which module(s) to test and set log file accordingly
-    local timestamp=$(date +%Y%m%d_%H%M%S)
-    local bot_log
-    
-    case "$first_arg" in
-        telegram|tg)
-            bot_log="$LOG_DIR/octos_telegram_bot_test_${timestamp}.log"
-            ;;
-        discord|dc)
-            bot_log="$LOG_DIR/octos_discord_bot_test_${timestamp}.log"
-            ;;
-        all|*)
-            bot_log="$LOG_DIR/octos_bot_test_${timestamp}.log"
-            ;;
-    esac
-
-    info "Bot test log: $bot_log"
-    
-    # Redirect output to module-specific log file AND terminal
-    bash "$bot_script" "${bot_args[@]}" 2>&1 | tee -a "$bot_log"
-    local bot_exit=${PIPESTATUS[0]}
+    # Pass sub-args to bot script (delegates logging to bot_test.sh)
+    bash "$bot_script" "${bot_args[@]}"
+    local bot_exit=$?
     if [[ $bot_exit -ne 0 ]]; then
         err "Bot tests failed"
         MODULE_RESULTS+=("bot:FAIL")

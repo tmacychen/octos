@@ -29,7 +29,7 @@ import sys
 
 # Simple logging to stderr
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  # Reduce log noise for performance
     format='%(levelname)s:%(name)s:%(message)s',
     stream=sys.stderr,
     force=True
@@ -156,7 +156,7 @@ class MockTelegramServer:
                 reply_to_message_id=reply_to_message_id,
             ))
             
-            logger.info(f"🤖 Bot sent message to {chat_id}: {text[:50]}...")
+            logger.debug(f"🤖 Bot sent message to {chat_id}: {text}")
             
             return {
                 "ok": True,
@@ -246,14 +246,14 @@ class MockTelegramServer:
         async def edit_message_text(token: str, request: Request):
             """Edit a message"""
             # Log raw request for debugging
-            logger.info(f"✏️ Edit request received - method={request.method}, url={request.url}")
+            logger.debug(f"✏️ Edit request received - method={request.method}, url={request.url}")
             
             data = {}
             
             # Try to parse as JSON first (POST with JSON body)
             try:
                 data = await request.json()
-                logger.info(f"✏️ Parsed as JSON: chat_id={data.get('chat_id')}, message_id={data.get('message_id')}")
+                logger.debug(f"✏️ Parsed as JSON: chat_id={data.get('chat_id')}, message_id={data.get('message_id')}")
             except Exception as e:
                 logger.debug(f"✏️ Not JSON: {e}")
             
@@ -262,7 +262,7 @@ class MockTelegramServer:
                 try:
                     form_data = await request.form()
                     data = dict(form_data)
-                    logger.info(f"✏️ Parsed as form data: keys={list(data.keys())}")
+                    logger.debug(f"✏️ Parsed as form data: keys={list(data.keys())}")
                 except Exception as e:
                     logger.debug(f"✏️ Not form data: {e}")
             
@@ -270,7 +270,7 @@ class MockTelegramServer:
             if not data:
                 data = dict(request.query_params)
                 if data:
-                    logger.info(f"✏️ Parsed as query params: chat_id={data.get('chat_id')}, message_id={data.get('message_id')}")
+                    logger.debug(f"✏️ Parsed as query params: chat_id={data.get('chat_id')}, message_id={data.get('message_id')}")
             
             if not data:
                 logger.error("✏️ No data found in request")
@@ -310,7 +310,7 @@ class MockTelegramServer:
             }
             self._edit_history.append(edit_record)
             
-            logger.info(f"✏️ Message edited successfully: chat_id={chat_id}, message_id={message_id}")
+            logger.debug(f"✏️ Message edited successfully: chat_id={chat_id}, message_id={message_id}")
             
             # Return a full Message object as per Telegram Bot API spec
             import time
@@ -370,7 +370,7 @@ class MockTelegramServer:
             except Exception:
                 data = {}
             self._commands_registered = data.get("commands", [])
-            logger.info(f"📝 Bot registered commands: {self._commands_registered}")
+            logger.debug(f"📝 Bot registered commands: {self._commands_registered}")
             return {"ok": True, "result": True}
 
         @app.api_route("/bot{token}/getMyCommands", methods=["GET", "POST"])
@@ -532,7 +532,7 @@ class MockTelegramServer:
         self._updates.append(update)
         # Truncate long messages in logs to avoid output explosion
         text_preview = text[:100] + "..." if len(text) > 100 else text
-        logger.info(f"💬 Injected message ({len(text)} bytes): {text_preview}")
+        logger.debug(f"💬 Injected message ({len(text)} bytes): {text_preview}")
         return update_id
     
     def inject_document(self, file_path: str, caption: str, chat_id: int = 123,
@@ -578,7 +578,7 @@ class MockTelegramServer:
         )
         self._updates.append(update)
         file_size_mb = dest_path.stat().st_size / (1024 * 1024)
-        logger.info(f"📎 Injected document: {filename} ({file_size_mb:.1f}MB) → {dest_path}")
+        logger.debug(f"📎 Injected document: {filename} ({file_size_mb:.1f}MB) → {dest_path}")
         return update_id
     
     def inject_callback_query(self, data: str, chat_id: int = 123,
@@ -607,7 +607,7 @@ class MockTelegramServer:
             }
         )
         self._updates.append(update)
-        logger.info(f"🎯 Injected callback query: {data}")
+        logger.debug(f"🎯 Injected callback query: {data}")
         return update_id
     
     def get_sent_messages(self) -> list[SentMessage]:
@@ -634,10 +634,48 @@ class MockTelegramServer:
         """Get the most recent message sent by the bot"""
         return self._sent_messages[-1] if self._sent_messages else None
     
-    def start_background(self):
-        """Start the server in a background thread"""
+    def start_background(self, log_file=None):
+        """Start the server in a background thread
+        
+        Args:
+            log_file: Optional path to log file. If provided, logs will be written to both file and stdout.
+        """
+        if log_file:
+            # Configure logging to both file and stdout
+            from pathlib import Path
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Create formatter
+            formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+            
+            # File handler
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(logging.INFO)
+            
+            # Stdout handler (ensure same output as file)
+            stdout_handler = logging.StreamHandler(sys.stdout)
+            stdout_handler.setFormatter(formatter)
+            stdout_handler.setLevel(logging.INFO)
+            
+            # Add handlers to root logger and uvicorn loggers
+            root_logger = logging.getLogger()
+            root_logger.addHandler(file_handler)
+            root_logger.addHandler(stdout_handler)
+            
+            uvicorn_logger = logging.getLogger("uvicorn")
+            uvicorn_logger.addHandler(file_handler)
+            uvicorn_logger.addHandler(stdout_handler)
+            uvicorn_logger.setLevel(logging.INFO)
+            
+            uvicorn_error_logger = logging.getLogger("uvicorn.error")
+            uvicorn_error_logger.addHandler(file_handler)
+            uvicorn_error_logger.addHandler(stdout_handler)
+            uvicorn_error_logger.setLevel(logging.INFO)
+        
         def run():
-            uvicorn.run(self.app, host=self.host, port=self.port, log_level="warning")
+            uvicorn.run(self.app, host=self.host, port=self.port, log_level="info")
         
         thread = Thread(target=run, daemon=True)
         thread.start()

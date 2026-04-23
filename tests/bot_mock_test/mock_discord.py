@@ -51,12 +51,12 @@ from fastapi.responses import JSONResponse, Response
 import uvicorn
 from threading import Thread
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)  # Reduce log noise for performance
 logger = logging.getLogger(__name__)
 
-# 🔥 MODULE LOAD VERIFICATION - This proves the module was reloaded
-logger.info("🔥🔥🔥 MOCK_DISCORD.PY MODULE LOADED AT IMPORT TIME 🔥🔥🔥")
-print("🔥🔥🔥 MOCK_DISCORD.PY MODULE LOADED AT IMPORT TIME 🔥🔥🔥", flush=True)
+# 🔥 MODULE LOAD VERIFICATION (only in debug mode)
+if __debug__:
+    logger.debug("Mock Discord module loaded")
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -127,16 +127,11 @@ class MockDiscordServer:
         self.port = port
         self.app = FastAPI(title="Discord Mock API")
         
-        # Add middleware to log ALL requests for debugging
-        @self.app.middleware("http")
-        async def log_all_requests(request: Request, call_next):
-            import sys
-            print(f"🔥 REQUEST: {request.method} {request.url.path} query={request.url.query}", flush=True, file=sys.stderr)
-            response = await call_next(request)
-            print(f"🔥 RESPONSE: {request.method} {request.url.path} -> {response.status_code}", flush=True, file=sys.stderr)
-            return response
-        
         self._setup_routes()
+        
+        # Performance optimization: disable request logging middleware in production
+        # Only enable when debugging
+        self._enable_request_logging = False
 
         # State
         self._sent_messages: List[SentMessage] = []
@@ -237,13 +232,11 @@ class MockDiscordServer:
         @app.get("/api/v10/gateway")
         async def get_gateway():
             """Return gateway URL (simpler version without bot-specific info)."""
-            logger.info("=== GATEWAY CALLED === returning ws URL")
             return {"url": f"ws://{self.host}:{self.port}"}
 
         @app.get("/api/v10/gateway/bot")
         async def get_gateway_bot():
             """Return gateway URL pointing to our own mock websocket."""
-            logger.info("=== GATEWAY/BOT CALLED === returning ws URL")
             return {
                 "url": f"ws://{self.host}:{self.port}",
                 "shards": 1,
@@ -291,7 +284,7 @@ class MockDiscordServer:
             )
             self._sent_messages.append(sent)
 
-            logger.info(f"🤖 Bot sent message to {channel_id}: {content[:80]}")
+            logger.debug(f"🤖 Bot sent message to {channel_id}: {content}")
 
             # 🔥 CRITICAL FIX: Dispatch MESSAGE_CREATE event via Gateway
             # This is what real Discord does - after REST API accepts the message,
@@ -355,10 +348,7 @@ class MockDiscordServer:
             """Edit an existing message."""
             body = await request.json()
             content = body.get("content", "")
-            # 🔥 DEBUG: Force flush to ensure this appears in logs
-            import sys
-            print(f"🔥🔥🔥 EDIT_MESSAGE CALLED: channel={channel_id}, msg={message_id}, content_len={len(content)}", flush=True, file=sys.stderr)
-            logger.info(f"✏️ Bot edited message {message_id} in {channel_id}: {content[:80]}")
+            logger.debug(f"✏️ Bot edited message {message_id} in {channel_id}: {content[:80]}")
 
             # Update existing message instead of appending (matches real Discord behavior)
             updated = False
@@ -380,17 +370,15 @@ class MockDiscordServer:
             # This is what real Discord does after a message is edited
             await self._dispatch_message_update_via_gateway(message_id, channel_id, content)
 
-            # 🔥 WORKAROUND: Serenity SDK expects 204 but Discord returns 200
-            # Return 204 to make serenity happy, even though it's not spec-compliant
-            logger.info(f"✅ EDIT_MESSAGE called: message_id={message_id}, returning 204 (workaround for serenity)")
+            # Return 204 for serenity compatibility
             from fastapi.responses import Response
             return Response(status_code=204)
         
-        # Catch-all for unmatched routes - for debugging
+        # Catch-all for unmatched routes - only log in debug mode
         @app.api_route("/api/v10/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
         async def catch_all(path: str, request: Request):
-            logger.warning(f"⚠️ UNMATCHED ROUTE: {request.method} /api/v10/{path}")
-            print(f"⚠️ UNMATCHED ROUTE: {request.method} /api/v10/{path}", flush=True, file=sys.stderr)
+            if self._enable_request_logging:
+                logger.warning(f"⚠️ UNMATCHED ROUTE: {request.method} /api/v10/{path}")
             return JSONResponse({"error": "not found"}, status_code=404)
 
         @app.delete("/api/v10/channels/{channel_id}/messages/{message_id}")
@@ -442,9 +430,8 @@ class MockDiscordServer:
               OP 3 PRESENCE_UPDATE → ignore (or store)
               OP 8 REQUEST_MEMBERS → ignore
             """
-            logger.info("=== WS CLIENT CONNECTING ===")
+            logger.debug("WS client connecting")
             await websocket.accept()
-            logger.info("=== WS CLIENT ACCEPTED ===")
             self._ws_clients.append(websocket)
             session_id = f"mock-session-{uuid.uuid4().hex[:12]}"
             seq: int = 0
@@ -459,7 +446,7 @@ class MockDiscordServer:
                     },
                 }
                 await websocket.send_json(hello_payload)
-                logger.info("WS: Sent HELLO")
+                logger.debug("WS: Sent HELLO")
 
                 # Main loop: handle incoming opcodes
                 while True:
@@ -479,7 +466,7 @@ class MockDiscordServer:
                     d = data.get("d", {})
 
                     if opcode == 2:  # IDENTIFY
-                        logger.info("WS: Received IDENTIFY, sending READY")
+                        logger.debug("WS: Received IDENTIFY, sending READY")
                         
                         # Use shared sequence counter
                         seq = self._next_seq()
@@ -534,7 +521,7 @@ class MockDiscordServer:
                         logger.debug(f"WS: Unhandled opcode {opcode}")
 
             except WebSocketDisconnect:
-                logger.info("WS: Client disconnected")
+                logger.debug("WS: Client disconnected")
             except Exception as e:
                 logger.error(f"WS error: {e}")
             finally:
@@ -565,7 +552,7 @@ class MockDiscordServer:
                 "d": event,
             }
             await websocket.send_json(payload)
-            logger.info(f"🔄 Dispatched MESSAGE_CREATE ({len(msg.content)} bytes): {msg.content[:50]}")
+            logger.debug(f"🔄 Dispatched MESSAGE_CREATE ({len(msg.content)} bytes): {msg.content[:50]}")
             self._injected_messages.remove(msg)
         return seq
 
@@ -623,7 +610,7 @@ class MockDiscordServer:
             "d": interaction_data,
         }
         await websocket.send_json(payload)
-        logger.info(f"Dispatched INTERACTION_CREATE: {list(inter.data.keys())}")
+        logger.debug(f"Dispatched INTERACTION_CREATE: {list(inter.data.keys())}")
         return seq + 1
 
     def _build_message_create(self, msg: InjectedMessage) -> dict:
@@ -1014,30 +1001,40 @@ class MockDiscordServer:
         import sys
 
         def run():
-            print(f"🚀🚀🚀 UVICORN STARTING on http://{self.host}:{self.port}", flush=True)
             if log_file:
-                # Configure uvicorn to write to log_file
+                # Configure logging to both file and stdout
                 import logging
-                # Create a file handler for uvicorn
-                file_handler = logging.FileHandler(log_file, mode='a')
-                file_handler.setLevel(logging.INFO)
-                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-                file_handler.setFormatter(formatter)
                 
-                # Add handler to uvicorn loggers
+                # Create formatter
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                
+                # File handler
+                file_handler = logging.FileHandler(log_file, mode='a')
+                file_handler.setFormatter(formatter)
+                file_handler.setLevel(logging.WARNING)  # Only warnings and errors
+                
+                # Stdout handler (ensure same output as file)
+                stdout_handler = logging.StreamHandler(sys.stdout)
+                stdout_handler.setFormatter(formatter)
+                stdout_handler.setLevel(logging.WARNING)
+                
+                # Add handlers to uvicorn loggers
                 uvicorn_logger = logging.getLogger("uvicorn")
                 uvicorn_logger.addHandler(file_handler)
-                uvicorn_logger.setLevel(logging.INFO)
+                uvicorn_logger.addHandler(stdout_handler)
+                uvicorn_logger.setLevel(logging.WARNING)
                 
                 uvicorn_access_logger = logging.getLogger("uvicorn.access")
                 uvicorn_access_logger.addHandler(file_handler)
-                uvicorn_access_logger.setLevel(logging.INFO)
+                uvicorn_access_logger.addHandler(stdout_handler)
+                uvicorn_access_logger.setLevel(logging.WARNING)
             
-            uvicorn.run(self.app, host=self.host, port=self.port, log_level="info")
+            # Use 'warning' level to reduce I/O overhead
+            uvicorn.run(self.app, host=self.host, port=self.port, log_level="warning")
 
         thread = Thread(target=run, daemon=True)
         thread.start()
-        logger.info(f"🚀 Mock Discord server started at http://{self.host}:{self.port} (WS at same address)")
+        logger.info(f"Mock Discord server started at http://{self.host}:{self.port}")
         return thread
 
 

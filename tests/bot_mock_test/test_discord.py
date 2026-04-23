@@ -36,7 +36,7 @@ ABORT_TEST_DELAY = 2.0  # Abort 测试后的等待时间（秒），确保完全
 @pytest.fixture(scope="session")
 def runner():
     r = DiscordTestRunner()
-    assert r.health(), "Discord Mock Server 未运行，请先启动 run_test.fish discord"
+    assert r.health(), "Discord Mock Server 未运行"
     return r
 
 
