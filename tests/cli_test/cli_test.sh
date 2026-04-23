@@ -343,9 +343,52 @@ list_categories() {
     echo -e "Total: ${BOLD}$total${NC} test cases"
     echo ""
     echo -e "${YELLOW}Usage examples:${NC}"
+    echo -e "  tests/run_tests.sh --test cli list             # List all categories"
+    echo -e "  tests/run_tests.sh --test cli list Init        # List Init test cases"
     echo -e "  tests/run_tests.sh --test cli -s Init          # Run only Init tests"
-    echo -e "  tests/run_tests.sh --test cli -s Completions   # Run only Completions tests"
     echo -e "  tests/run_tests.sh --test cli                  # Run all tests"
+}
+
+list_category_cases() {
+    local target_category="$1"
+    check_jq
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}[ERROR] Config file not found: $CONFIG_FILE${NC}"
+        exit 1
+    fi
+
+    # Check if category exists
+    local category_exists
+    category_exists=$(jq -r --arg cat "$target_category" '.tests[] | select(.category == $cat) | .category' "$CONFIG_FILE" | head -1)
+    
+    if [[ -z "$category_exists" ]]; then
+        echo -e "${RED}[ERROR] Unknown category: $target_category${NC}"
+        echo ""
+        list_categories
+        exit 1
+    fi
+
+    echo -e "${CYAN}Test cases in ${GREEN}${target_category}${NC}:${NC}"
+    echo -e "${GRAY}========================================${NC}"
+    echo ""
+
+    local idx=0
+    local total
+    total=$(jq --arg cat "$target_category" '[.tests[] | select(.category == $cat)] | length' "$CONFIG_FILE")
+    
+    jq -r --arg cat "$target_category" '.tests[] | select(.category == $cat) | "\(.id)|\(.name)|\(.command)|\(.timeout // 60)"' "$CONFIG_FILE" | while IFS='|' read -r id name cmd timeout; do
+        idx=$((idx + 1))
+        echo -e "  ${GRAY}${idx}${NC}  ${GREEN}${name}${NC}"
+        echo -e "     ${GRAY}ID: $id | Command: $cmd | Timeout: ${timeout}s${NC}"
+        echo ""
+    done
+
+    echo -e "${GRAY}========================================${NC}"
+    echo -e "Total: ${BOLD}${total}${NC} test case(s) in ${GREEN}${target_category}${NC}"
+    echo ""
+    echo -e "${YELLOW}Usage:${NC}"
+    echo -e "  tests/run_tests.sh --test cli -s ${target_category}   # Run ${target_category} tests"
 }
 
 load_tests_from_json() {
@@ -466,7 +509,12 @@ main() {
                 shift 2
                 ;;
             list)
-                list_categories
+                local list_target="${2:-}"
+                if [[ -n "$list_target" ]]; then
+                    list_category_cases "$list_target"
+                else
+                    list_categories
+                fi
                 exit 0
                 ;;
             -h|--help)

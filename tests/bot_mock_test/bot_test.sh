@@ -528,6 +528,7 @@ except Exception as e:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 ACTION="${1:-all}"
+ACTION2="${2:-}"
 
 case "$ACTION" in
     -h|--help)
@@ -542,33 +543,31 @@ case "$ACTION" in
         echo "    telegram, tg     Run Telegram tests"
         echo "    discord, dc      Run Discord tests"
         echo "    list             List available modules"
-        echo "    cases <mod>      List test cases in a module"
+        echo "    list <mod>       List test cases in a module"
         echo "    <mod> [case]     Run module or specific test case"
         echo ""
         echo "  Examples:"
         echo "    tests/run_tests.sh --test bot telegram"
+        echo "    tests/run_tests.sh --test bot list"
+        echo "    tests/run_tests.sh --test bot list tg"
         echo "    tests/run_tests.sh --test bot telegram test_concurrent_session_creation"
         echo ""
         exit 0
         ;;
     list|ls)
-        list_modules
-        exit 0
-        ;;
-    cases)
-        target="${2:-}"
-        if [[ -z "$target" ]]; then
-            err "Usage: tests/run_tests.sh --test bot cases <module>"
+        if [[ -n "$ACTION2" ]]; then
+            # list <mod> — list test cases for a specific module
+            resolved=$(resolve_module "$ACTION2" || true)
+            if [[ -z "$resolved" ]]; then
+                err "Unknown module: $ACTION2"
+                list_modules
+                exit 1
+            fi
+            list_cases "$resolved"
+        else
+            # list — list available modules
             list_modules
-            exit 1
         fi
-        resolved=$(resolve_module "$target" || true)
-        if [[ -z "$resolved" ]]; then
-            err "Unknown module: $target"
-            list_modules
-            exit 1
-        fi
-        list_cases "$resolved"
         exit 0
         ;;
     all)

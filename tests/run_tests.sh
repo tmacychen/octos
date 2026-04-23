@@ -123,6 +123,30 @@ build_octos() {
 
 # ── Bot test runner ─────────────────────────────────────────────────────────
 run_bot_tests() {
+    # Pass sub-args to bot script (default: all)
+    local bot_args=("$@")
+    if [[ ${#bot_args[@]} -eq 0 ]]; then
+        bot_args=("all")
+    fi
+
+    # Check if first argument is a list operation (not a test run)
+    local first_arg="${bot_args[0]:-all}"
+    if [[ "$first_arg" == "list" ]] || [[ "$first_arg" == "cases" ]]; then
+        # These are info commands, just delegate to bot_test.sh and return
+        local bot_script="$SCRIPT_DIR/bot_mock_test/bot_test.sh"
+        if [[ ! -f "$bot_script" ]]; then
+            err "Bot test script not found: $bot_script"
+            return 1
+        fi
+        # Set minimal env vars for list operations (no build needed)
+        export OCTOS_TEST_DIR="$TEST_DIR"
+        export OCTOS_LOG_DIR="$LOG_DIR"
+        export OCTOS_BIN="${OCTOS_BIN:-placeholder}"
+        bash "$bot_script" "${bot_args[@]}"
+        return
+    fi
+
+    # Actual test execution
     section "Running Bot Mock Tests"
 
     export OCTOS_TEST_DIR="$TEST_DIR"
@@ -136,14 +160,7 @@ run_bot_tests() {
         return
     fi
 
-    # Pass sub-args to bot script (default: all)
-    local bot_args=("$@")
-    if [[ ${#bot_args[@]} -eq 0 ]]; then
-        bot_args=("all")
-    fi
-
     # Determine which module(s) to test and set log file accordingly
-    local first_arg="${bot_args[0]:-all}"
     local timestamp=$(date +%Y%m%d_%H%M%S)
     local bot_log
     
@@ -182,6 +199,15 @@ run_cli_tests() {
     if [[ ! -f "$cli_script" ]]; then
         err "CLI test script not found: $cli_script"
         FAILED=1
+        return
+    fi
+
+    # Check if this is a list operation (no build needed)
+    local first_arg="${1:-}"
+    if [[ "$first_arg" == "list" ]]; then
+        export OCTOS_TEST_DIR="$TEST_DIR"
+        export OCTOS_LOG_DIR="$LOG_DIR"
+        bash "$cli_script" -b "${OCTOS_BIN:-placeholder}" "$@"
         return
     fi
 
@@ -228,7 +254,8 @@ show_help() {
     echo "    -v, --verbose              Verbose output"
     echo "    -o, --output-dir DIR       Output directory (default: test-results)"
     echo "    -s, --scope SCOPE          Test scope: all|CLI|Init|Clean|Status|Completions|Skills|Auth|Channels|Cron|Chat|Gateway|Serve|Docs"
-    echo "    list                       List available test categories and exit"
+    echo "    list                       List available test categories"
+    echo "    list <category>            List test cases in a category"
     echo ""
     echo "  Examples:"
     echo "    tests/run_tests.sh all                     # run everything"
@@ -236,11 +263,13 @@ show_help() {
     echo "    tests/run_tests.sh --test bot telegram     # Telegram only"
     echo "    tests/run_tests.sh --test bot list         # list bot modules"
     echo "    tests/run_tests.sh --test bot list tg      # list Telegram test cases"
+    echo "    tests/run_tests.sh --test bot list discord # list Discord test cases"
     echo "    tests/run_tests.sh --test bot tg           # run Telegram tests"
     echo "    tests/run_tests.sh --test bot tg test_concurrent_session_creation  # run single test"
     echo "    tests/run_tests.sh --test cli              # CLI tests"
     echo "    tests/run_tests.sh --test cli -v           # CLI tests, verbose"
     echo "    tests/run_tests.sh --test cli list         # List test categories"
+    echo "    tests/run_tests.sh --test cli list Init    # List Init test cases"
     echo "    tests/run_tests.sh --test cli -s Init      # Run only Init tests"
     echo "    tests/run_tests.sh --test cli -s Completions # Run only Completions tests"
     echo ""
@@ -315,7 +344,6 @@ if [[ "$ACTION" == "--test" ]]; then
             echo "  discord, dc          Run Discord tests only"
             echo "  list                 List available bot modules"
             echo "  list <mod>           List test cases in a module"
-            echo "  cases <mod>          Alias for 'list <mod>'"
             echo ""
             echo "For general help, use: tests/run_tests.sh --help"
             echo ""
@@ -349,13 +377,14 @@ if [[ "$ACTION" == "--test" ]]; then
                     echo "  -o, --output-dir DIR   Output directory"
                     echo "  -s, --scope SCOPE      Test scope (all|CLI|Init|Clean|...)"
                     echo "  list                   List available test categories"
+                    echo "  list <category>        List test cases in a category"
                     echo ""
                     echo "For general help, use: tests/run_tests.sh --help"
                     echo ""
                     echo "Examples:"
                     echo "  tests/run_tests.sh --test cli              # Run all CLI tests"
-                    echo "  tests/run_tests.sh --test cli -s Init      # Run Init tests only"
                     echo "  tests/run_tests.sh --test cli list         # List test categories"
+                    echo "  tests/run_tests.sh --test cli list Init    # List Init test cases"
                     exit 1
                 fi
                 
@@ -481,15 +510,19 @@ section "Test Summary"
 echo -e "  Date:    $(date '+%Y-%m-%d %H:%M:%S')"
 echo -e "  Result:  $([ $FAILED -eq 0 ] && echo 'PASSED' || echo 'FAILED')"
 echo -e "  Modules:"
-for result in "${MODULE_RESULTS[@]}"; do
-    mod_name="${result%%:*}"
-    mod_status="${result##*:}"
-    if [[ "$mod_status" == "PASS" ]]; then
-        echo -e "    ${GREEN}✅ ${mod_name}${RESET}"
-    else
-        echo -e "    ${RED}❌ ${mod_name}${RESET}"
-    fi
-done
+if [[ ${#MODULE_RESULTS[@]} -gt 0 ]]; then
+    for result in "${MODULE_RESULTS[@]}"; do
+        mod_name="${result%%:*}"
+        mod_status="${result##*:}"
+        if [[ "$mod_status" == "PASS" ]]; then
+            echo -e "    ${GREEN}✅ ${mod_name}${RESET}"
+        else
+            echo -e "    ${RED}❌ ${mod_name}${RESET}"
+        fi
+    done
+else
+    echo -e "    ${GRAY}(info mode, no tests run)${RESET}"
+fi
 echo -e "  Log:     $SESSION_LOG"
 echo ""
 
