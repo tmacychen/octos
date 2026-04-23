@@ -7,7 +7,6 @@ use eyre::{Result, WrapErr};
 use octos_core::OutboundMessage;
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
 
 use super::{Tool, ToolResult};
 
@@ -191,7 +190,7 @@ impl Tool for SendFileTool {
                 .iter()
                 .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
                 .collect();
-            match canonicalize_with_retry(&path).await {
+            match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
                     let allowed = canonical_path.starts_with(&canonical_base)
                         || canonical_path.starts_with(&tmp_dir)
@@ -211,8 +210,6 @@ impl Tool for SendFileTool {
                     canonical_path
                 }
                 Err(_) => {
-                    // Path can't be canonicalized (broken symlink, non-existent, etc.).
-                    // Reject rather than silently skip the check — prevents TOCTOU bypass.
                     return Ok(ToolResult {
                         output: format!("Error: Cannot resolve file path: {}", input.file_path),
                         success: false,

@@ -810,7 +810,7 @@ impl Channel for ApiChannel {
                 }
                 let done = serde_json::json!({
                     "type": "done",
-                    "content": content,
+                    "content": msg.content,
                     "model": msg.metadata.get("model").and_then(|v| v.as_str()).unwrap_or(""),
                     "provider": msg.metadata.get("provider").cloned().unwrap_or(serde_json::Value::Null),
                     "model_id": msg.metadata.get("model_id").cloned().unwrap_or(serde_json::Value::Null),
@@ -1157,61 +1157,6 @@ async fn handle_session_event_stream(
     record_replay("stream", "opened", 1);
 
     let live_stream = sse_stream_from_receiver(rx, max_replayed_session_seq);
-
-    let replay_stream = stream::iter(
-        replay_events
-            .into_iter()
-            .map(|data| Ok::<Event, Infallible>(Event::default().data(data))),
-    );
-    let stream = replay_stream.chain(live_stream);
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-async fn handle_session_event_stream(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    axum::extract::Query(params): axum::extract::Query<PaginationParams>,
-) -> Response {
-    if let Some(ref expected) = state.auth_token {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if provided != Some(expected.as_str()) {
-            return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
-        }
-    }
-
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
-    {
-        let mut watchers = state.watchers.lock().await;
-        watchers
-            .entry(watcher_key(&id, params.topic.as_deref()))
-            .or_default()
-            .push(tx);
-    }
-
-    let mut replay_events = replay_task_status_events(&state, &id, params.topic.as_deref()).await;
-    replay_events.extend(
-        replay_committed_session_results(&state, &id, params.since_seq, params.topic.as_deref())
-            .await,
-    );
-    replay_events.push(build_replay_complete_event(params.topic.as_deref()).to_string());
-    record_replay("stream", "opened", 1);
-
-    let live_stream = stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(data) => {
-                let event: Result<Event, Infallible> = Ok(Event::default().data(data));
-                Some((event, rx))
-            }
-            None => None,
-        }
-    });
 
     let replay_stream = stream::iter(
         replay_events
