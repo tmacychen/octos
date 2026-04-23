@@ -15,7 +15,7 @@ def inject_and_get_reply(runner, text: str, timeout: int = 15, **inject_kwargs) 
       - Discord:  channel_id="1039178386623557754"
     默认值由各 runner.inject() 方法定义。
     """
-    count_before = len(runner.get_sent_messages())
+    count_before = len(runner.get_sent_messages(timeout=5))  # 短超时避免卡住
     runner.inject(text, **inject_kwargs)
     
     # Extract identifier for filtering (supports both Telegram and Discord)

@@ -63,10 +63,10 @@ class BotTestRunner(BaseMockRunner):
         return resp.json()
 
     def get_edit_history(self) -> list[dict]:
-        """获取消息编辑历史（测试用）"""
-        # Mock Server 不直接暴露编辑历史，通过 clear() 间接验证
-        # 如果需要详细测试，可以直接访问 server._edit_history
-        return []
+        """获取消息编辑历史（测试流式编辑用）"""
+        resp = httpx.get(f"{self.base_url}/_edit_history", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
     
     def clear_edit_history(self):
         """清空编辑历史"""

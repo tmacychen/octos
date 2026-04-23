@@ -31,8 +31,9 @@ Examples:
     tests/test_run.py --test bot              # all bot tests
     tests/test_run.py --test bot telegram     # Telegram only
     tests/test_run.py --test bot list         # list bot modules
-    tests/test_run.py --test bot list tg      # list Telegram test cases
+    tests/test_run.py --test bot tg list      # list Telegram test cases
     tests/test_run.py --test bot tg           # run Telegram tests
+    tests/test_run.py --test bot tg test_new_default  # run specific test
     tests/test_run.py --test cli              # CLI tests
     tests/test_run.py --test cli -v           # CLI tests, verbose
     tests/test_run.py --test cli list         # List test categories
@@ -189,8 +190,9 @@ def print_help():
     tests/test_run.py --test bot              # all bot tests
     tests/test_run.py --test bot telegram     # Telegram only
     tests/test_run.py --test bot list         # list bot modules
-    tests/test_run.py --test bot list tg      # list Telegram test cases
+    tests/test_run.py --test bot tg list      # list Telegram test cases
     tests/test_run.py --test bot tg           # run Telegram tests
+    tests/test_run.py --test bot tg test_new_default  # run specific test
     tests/test_run.py --test cli              # CLI tests
     tests/test_run.py --test cli -v           # CLI tests, verbose
     tests/test_run.py --test cli list         # List test categories
@@ -1025,6 +1027,11 @@ def main() -> int:
             # Check if it's a valid module
             valid_modules = ["telegram", "tg", "discord", "dc"]
             if action in valid_modules:
+                # Special case: check for 'list' subcommand
+                if len(remaining) > 1 and remaining[1] == "list":
+                    list_bot_cases(action)
+                    return 0
+                
                 if not build_octos():
                     return 1
                 prepare_test_environment()

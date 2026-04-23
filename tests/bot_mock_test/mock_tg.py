@@ -472,7 +472,13 @@ class MockTelegramServer:
             """Clear stored messages only (not update_id counter)"""
             self._updates.clear()
             self._sent_messages.clear()
+            self._edit_history.clear()
             return {"ok": True}
+
+        @app.get("/_edit_history")
+        async def get_edit_history():
+            """Return all message edit operations (for stream edit tests)"""
+            return self._edit_history.copy()
 
         @app.api_route("/bot{token}/{path:path}", methods=["GET", "POST"])
         async def catch_all(token: str, path: str, request: Request):

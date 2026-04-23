@@ -43,12 +43,29 @@ def runner():
 @pytest.fixture(autouse=True)
 def cleanup_state(request, runner):
     """每个测试前清理 Mock Server 状态，并添加延迟缓解压力"""
+    import httpx
+    import os
+    import glob
+    from test_helpers import inject_and_get_reply
+    
     # Wait for any pending LLM responses to complete
     # This prevents cross-test contamination from slow LLM calls
-    # Increased to 5s to ensure LLM responses from previous test have time to arrive
     time.sleep(5.0)
+    
     runner.clear()
+    
+    # 注意：不要删除 session 文件！Gateway session actor 正在使用这些文件，删除会导致错误
+    
+    # 🔥 重置所有非默认状态（queue mode, adaptive routing, 等）
+    # 增加超时时间到 10s，避免 Gateway 繁忙时超时
+    try:
+        inject_and_get_reply(runner, "/reset", timeout=10)
+    except Exception as e:
+        # /reset 失败不影响测试，但记录警告
+        print(f"  ⚠ /reset failed: {type(e).__name__}: {str(e)[:80]}")
+    
     yield
+    
     # After abort tests or LLM-intensive tests, add extra delay to ensure full cleanup
     # This helps prevent message sending failures in subsequent tests
     if request.node.get_closest_marker('abort_test') or request.node.get_closest_marker('llm_intensive'):
@@ -202,6 +219,112 @@ class TestDiscordSessionActorCommands:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Queue Mode Steer/Discard 负向测试 — 防止误触发 abort
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.llm  # 这些测试发送普通文本消息，会触发 LLM 调用
+class TestDiscordQueueModeSteerNonAbort:
+    """验证 Steer/Interrupt 模式下，普通消息不会误触发 abort
+    
+    Steer/Interrupt 模式在队列处理时会检查 is_abort_trigger()。
+    此测试确保包含 abort 关键词但非独立命令的消息不会被误判。
+    
+    相关代码：octos-cli/src/session_actor.rs:2773-2787
+    """
+
+    def test_steer_mode_non_abort_messages_not_triggered(self, runner):
+        """验证 steer 模式下普通消息不会误触发 abort
+        
+        测试流程：
+        1. 设置 queue mode 为 steer
+        2. 发送包含 abort 关键词但不是独立命令的消息
+        3. 验证消息被正常处理，未返回 abort 响应
+        """
+        # Step 1: 设置为 steer 模式
+        text = inject_and_get_reply(runner, "/queue steer", timeout=TIMEOUT_COMMAND)
+        assert "Steer" in text or "steer" in text.lower(), f"Failed to set steer mode: {text}"
+        
+        # Step 2: 发送可能误触发的消息
+        non_triggers = [
+            "please stop talking about cats",  # 句子中的 stop
+            "stopping point is here",          # stopping 不是 stop
+            "I will exit now",                 # exit 不在触发词列表中
+            "cancel my subscription please",   # 句子中的 cancel
+        ]
+        
+        for msg in non_triggers:
+            count_before = len(runner.get_sent_messages())
+            runner.inject(msg)
+            
+            # 等待 bot 回复（steer 模式有 500ms coalescing delay）
+            time.sleep(2.0)
+            
+            msgs = runner.get_sent_messages()
+            # 应该有新的消息（bot 正常回复）
+            assert len(msgs) > count_before, \
+                f"Bot should reply to message: {msg}"
+            
+            # 获取最新的回复
+            latest_reply = msgs[-1]["content"]
+            
+            # 🔥 关键断言：不应包含 abort 特征
+            has_stop_emoji = "🛑" in latest_reply
+            has_cancel_keyword = any(kw in latest_reply.lower() 
+                                     for kw in ["cancelled", "取消", "キャンセル", "отменено"])
+            
+            assert not (has_stop_emoji or has_cancel_keyword), \
+                f"False abort trigger in steer mode for '{msg}': {latest_reply[:200]}"
+        
+        print(f"\n  ✓ Steer mode: Non-abort messages handled correctly")
+        
+        # Step 3: 恢复默认模式
+        inject_and_get_reply(runner, "/queue collect", timeout=TIMEOUT_COMMAND)
+
+    def test_interrupt_mode_non_abort_messages_not_triggered(self, runner):
+        """验证 interrupt 模式下普通消息不会误触发 abort
+        
+        Interrupt 模式与 Steer 类似，也会在队列中检查 abort 触发词。
+        """
+        # Step 1: 设置为 interrupt 模式
+        text = inject_and_get_reply(runner, "/queue interrupt", timeout=TIMEOUT_COMMAND)
+        assert "Interrupt" in text or "interrupt" in text.lower(), \
+            f"Failed to set interrupt mode: {text}"
+        
+        # Step 2: 发送可能误触发的消息
+        non_triggers = [
+            "don't stop the music",           # 否定句中的 stop
+            "the meeting was cancelled",      # 过去式的 cancelled
+            "abort mission failed",           # abort 作为名词修饰语
+        ]
+        
+        for msg in non_triggers:
+            count_before = len(runner.get_sent_messages())
+            runner.inject(msg)
+            
+            # 等待 bot 回复（interrupt 模式也有 500ms coalescing delay）
+            time.sleep(2.0)
+            
+            msgs = runner.get_sent_messages()
+            assert len(msgs) > count_before, \
+                f"Bot should reply to message: {msg}"
+            
+            latest_reply = msgs[-1]["text"]  # Mock Server 返回的字段是 "text"
+            
+            # 🔥 关键断言：不应包含 abort 特征
+            has_stop_emoji = "🛑" in latest_reply
+            has_cancel_keyword = any(kw in latest_reply.lower() 
+                                     for kw in ["cancelled", "取消", "キャンセル", "отменено"])
+            
+            assert not (has_stop_emoji or has_cancel_keyword), \
+                f"False abort trigger in interrupt mode for '{msg}': {latest_reply[:200]}"
+        
+        print(f"\n  ✓ Interrupt mode: Non-abort messages handled correctly")
+        
+        # Step 3: 恢复默认模式
+        inject_and_get_reply(runner, "/queue collect", timeout=TIMEOUT_COMMAND)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 多用户隔离测试
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -220,25 +343,6 @@ class TestDiscordMultiUser:
         text_b = inject_and_get_reply(runner, "/new topic-b",
                                       timeout=TIMEOUT_COMMAND, channel_id=CHANNEL_B)
         assert text_b == "Switched to session: topic-b"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LLM 消息测试（标记 @pytest.mark.llm）
-# ══════════════════════════════════════════════════════════════════════════════
-
-@pytest.mark.llm
-class TestDiscordLLMMessages:
-    """需要调用 LLM API，超时 TIMEOUT_LLM = 50s"""
-
-    def test_regular_message(self, runner):
-        """普通英文消息触发 LLM 回复"""
-        text = inject_and_get_reply(runner, "Hello!", timeout=TIMEOUT_LLM)
-        assert len(text) > 0
-
-    def test_chinese_message(self, runner):
-        """中文消息触发 LLM 回复"""
-        text = inject_and_get_reply(runner, "你好", timeout=TIMEOUT_LLM)
-        assert len(text) > 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -716,6 +820,52 @@ class TestDiscordFileLimits:
         assert msg is not None, "Bot did not respond to large message"
         print(f"\n  ✓ Large message handled: {len(msg['text'])} chars response")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LLM 消息测试（标记 @pytest.mark.llm）
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.llm
+class TestDiscordLLMMessages:
+    """需要调用 LLM API，超时 TIMEOUT_LLM = 50s"""
+
+    def test_regular_message(self, runner):
+        """普通英文消息触发 LLM 回复"""
+        text = inject_and_get_reply(runner, "Hello!", timeout=TIMEOUT_LLM)
+        assert len(text) > 0
+
+    def test_chinese_message(self, runner):
+        """中文消息触发 LLM 回复"""
+        text = inject_and_get_reply(runner, "你好", timeout=TIMEOUT_LLM)
+        assert len(text) > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Session 文件大小压力测试（必须放在最后执行）
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚠️ 重要：这个测试类必须在所有其他测试之后执行！
+#
+# 原因：
+# 1. test_session_accumulation_stability 会累积 session 数据到磁盘
+# 2. test_session_file_size_limit_enforcement 会创建 9.9MB 的大 session 文件
+# 3. 如果这些测试先执行，后续测试加载大 session 文件会导致 LLM 超时
+# 4. 即使有清理逻辑，也无法保证完全不影响其他测试
+#
+# pytest 默认按定义顺序执行测试类，所以这个类放在文件末尾确保最后执行。
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDiscordSessionSizeStress:
+    """Session 文件大小压力测试 — 验证 octos-bus 的 session 持久化机制
+    
+    测试 octos-bus/src/session.rs 中的核心功能：
+    - add_message(): 追加消息到 session 并持久化到 JSONL 文件
+    - append_to_disk(): 将消息写入磁盘，检查文件大小限制
+    - MAX_SESSION_FILE_SIZE = 10MB: session 文件大小上限
+    
+    ⚠️ 这个类必须在所有其他测试之后执行，避免大 session 文件污染后续测试。
+    """
+
+    @pytest.mark.slow
     def test_session_accumulation_stability(self, runner):
         """测试会话累积稳定性 - 多条消息后仍正常工作"""
         channel = "1039178386623557761"
@@ -732,6 +882,23 @@ class TestDiscordFileLimits:
         final = inject_and_get_reply(runner, "/sessions", timeout=TIMEOUT_COMMAND, channel_id=channel)
         assert len(final) > 0, "Sessions command failed after accumulation"
         print(f"\n  ✓ Session stable after 5 messages")
+        
+        # 🔥 关键清理：删除大 session 文件避免污染后续测试
+        import os
+        import glob
+        try:
+            data_dir = os.environ.get("OCTOS_TEST_DIR", "/tmp/octos_test")
+            session_files = glob.glob(f"{data_dir}/users/*/sessions/*.jsonl")
+            deleted_count = 0
+            for session_file in session_files:
+                file_size = os.path.getsize(session_file)
+                if file_size > 100_000:  # 只删除大于 100KB 的文件
+                    os.remove(session_file)
+                    deleted_count += 1
+            if deleted_count > 0:
+                print(f"  ✓ Cleaned up {deleted_count} large session files")
+        except Exception:
+            pass  # 清理失败不影响测试结果
 
     @pytest.mark.slow
     def test_session_file_size_limit_enforcement(self, runner):
@@ -802,3 +969,11 @@ class TestDiscordFileLimits:
         assert growth < 50_000, \
             f"Session at limit, append should be skipped (growth={growth} bytes)"
         print(f"  ✓ Append skipped correctly — session file stayed at {pre_size / 1024**2:.2f}MB")
+        
+        # 清理测试用的 session 文件（避免影响后续测试）
+        try:
+            if os.path.exists(session_path):
+                os.remove(session_path)
+                print(f"  ✓ Cleaned up test session file")
+        except Exception as e:
+            print(f"  ⚠ Failed to clean up session file: {e}")
