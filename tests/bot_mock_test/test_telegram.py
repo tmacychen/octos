@@ -366,46 +366,48 @@ class TestTelegramAbortCommands:
     @pytest.mark.parametrize(
         "language,chat_id,long_task,expected_keywords",
         [
-            # English - test all triggers: stop, cancel, abort, halt, quit, enough
+            # English - randomly pick one trigger
             ("english", 123, 
              "Please write a detailed technical article about Python async programming best practices...",
              ["🛑", "Cancelled"]),
             
-            # Chinese - test all triggers: 停, 停止, 取消, 停下, 别说了
+            # Chinese - randomly pick one trigger
             ("chinese", 126,
              "请帮我写一篇详细的技术文章，介绍 Python 异步编程的最佳实践...",
              ["🛑", "已取消"]),
             
-            # Japanese - test all triggers: やめて, 止めて, ストップ
+            # Japanese - randomly pick one trigger
             ("japanese", 134,
              "Pythonの非同期プログラミングのベストプラクティスについて詳細な技術記事を書いてください...",
              ["🛑", "キャンセル"]),
             
-            # Russian - test all triggers: стоп, отмена, хватит
+            # Russian - randomly pick one trigger
             ("russian", 137,
              "Напишите подробную техническую статью о лучших практиках асинхронного программирования на Python...",
              ["🛑", "Отменено"]),
         ],
         ids=[
-            "english_all_triggers",
-            "chinese_all_triggers",
-            "japanese_all_triggers",
-            "russian_all_triggers",
+            "english_random_trigger",
+            "chinese_random_trigger",
+            "japanese_random_trigger",
+            "russian_random_trigger",
         ]
     )
     def test_abort_multilanguage(self, runner, language, chat_id, long_task, expected_keywords):
-        """多语言 abort 命令测试 - 遍历所有触发词
+        """多语言 abort 命令测试 - 随机选择一个触发词
         
         测试流程：
         1. 发送一个长任务（触发 LLM 处理）
         2. 等待 5 秒，让任务开始执行
-        3. 每隔 5 秒发送一个触发词，直到收到 abort 响应或所有触发词用完
-        4. 如果收到 abort 响应，测试通过
-        5. 如果所有触发词都发送完了，再等 5 秒还没响应，测试失败
+        3. 从该语言的触发词中随机选择一个发送
+        4. 等待最多 10 秒检查是否收到 abort 响应
+        5. 如果收到 abort 响应，测试通过
         
         支持：英文、中文、日文、俄文。
+        每种语言只发送一次 abort 命令，减少测试负载。
         """
         import time
+        import random
         
         # Define trigger words for each language (from abort.rs)
         TRIGGERS = {
@@ -416,7 +418,9 @@ class TestTelegramAbortCommands:
         }
         
         triggers = TRIGGERS[language]
-        print(f"\n  Testing {language} with {len(triggers)} triggers: {triggers}")
+        # Randomly select one trigger word
+        abort_cmd = random.choice(triggers)
+        print(f"\n  Testing {language} - randomly selected: '{abort_cmd}' from {triggers}")
         
         # Step 1: 发送长任务，触发 LLM 处理
         count_before_task = len(runner.get_sent_messages())
@@ -427,50 +431,30 @@ class TestTelegramAbortCommands:
         time.sleep(5.0)
         print(f"  → Waited 5s for task to start")
         
-        # Step 3: 遍历所有触发词，每隔 5 秒发送一个
-        abort_reply = None
-        for i, abort_cmd in enumerate(triggers):
-            print(f"  → [{i+1}/{len(triggers)}] Sending abort command: '{abort_cmd}'")
-            runner.inject(abort_cmd, chat_id=chat_id)
-            
-            # 等待 5 秒，检查是否收到 abort 响应
-            poll_start = time.time()
-            while time.time() - poll_start < 5.0:
-                msgs = runner.get_sent_messages()
-                # 从后往前找，找到第一条包含 abort 特征的消息
-                for msg in reversed(msgs):
-                    msg_text = msg.get("text", "")
-                    if "🛑" in msg_text or any(kw.lower() in msg_text.lower() for kw in expected_keywords if not kw.startswith("🛑")):
-                        abort_reply = msg
-                        break
-                
-                if abort_reply is not None:
-                    break
-                
-                time.sleep(0.3)  # 短轮询间隔
-            
-            if abort_reply is not None:
-                print(f"  ✓ Abort response received after '{abort_cmd}'")
-                break
-            else:
-                print(f"  ✗ No response to '{abort_cmd}', trying next...")
+        # Step 3: 发送随机选择的 abort 命令
+        print(f"  → Sending abort command: '{abort_cmd}'")
+        runner.inject(abort_cmd, chat_id=chat_id)
         
-        # Step 4: 如果所有触发词都试过了，再等 5 秒
-        if abort_reply is None:
-            print(f"  → All triggers exhausted, waiting final 5s...")
-            time.sleep(5.0)
-            
-            # 最后一次检查
+        # Step 4: 等待最多 10 秒，检查是否收到 abort 响应
+        abort_reply = None
+        poll_start = time.time()
+        while time.time() - poll_start < 10.0:
             msgs = runner.get_sent_messages()
+            # 从后往前找，找到第一条包含 abort 特征的消息
             for msg in reversed(msgs):
                 msg_text = msg.get("text", "")
                 if "🛑" in msg_text or any(kw.lower() in msg_text.lower() for kw in expected_keywords if not kw.startswith("🛑")):
                     abort_reply = msg
                     break
+            
+            if abort_reply is not None:
+                break
+            
+            time.sleep(0.3)  # 短轮询间隔
         
         # Step 5: 断言
         assert abort_reply is not None, \
-            f"Bot did not respond to ANY abort command after trying all {len(triggers)} triggers: {triggers}"
+            f"Bot did not respond to abort command '{abort_cmd}' within 10s"
         
         text = abort_reply["text"]
         
