@@ -25,6 +25,11 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "llm_intensive: marks LLM-intensive tests that need extra delay between runs"
     )
+    
+    # Suppress httpx INFO logs to reduce noise
+    import logging
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def pytest_runtest_logstart(nodeid, location):
@@ -52,31 +57,17 @@ def event_loop():
 
 @pytest.fixture(autouse=True)
 def message_baseline(runner):
-    """记录测试开始前的消息总数，等待上一个测试可能的延迟回复稳定。
+    """记录测试开始前的消息总数。
 
     使用全局单调递增的消息计数，避免 clear() 导致的竞态条件。
     每个 test_*.py 只需定义自己的 runner fixture 即可。
     
-    🔥 OPTIMIZATION: Quick check first, only wait if messages are still arriving.
+    Note: cleanup_state fixture already waits for message stability,
+    so we just record the baseline here without additional waiting.
     """
+    # Just record the current count - cleanup_state already handled stabilization
     prev = len(runner.get_sent_messages())
-    
-    # Quick check: if no new messages in 0.1s, assume stable
-    time.sleep(0.1)
-    cur = len(runner.get_sent_messages())
-    
-    if cur == prev:
-        yield  # No delayed messages, continue immediately
-        return
-    
-    # Only enter stabilization loop if messages are still arriving
-    for _ in range(5):  # Reduced from 10 to 5 iterations
-        time.sleep(0.2)  # Reduced from 0.3s to 0.2s
-        cur = len(runner.get_sent_messages())
-        if cur == prev:
-            break
-        prev = cur
-    yield
+    yield prev
 
 
 @pytest.fixture(autouse=True)
