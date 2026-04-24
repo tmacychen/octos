@@ -914,19 +914,54 @@ class MockTelegramServer:
             from pathlib import Path
             log_path = Path(log_file)
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(message)s', filename=log_file, force=True)
+            
+            # Configure logging to both file and stdout
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            
+            # File handler
+            file_handler = logging.FileHandler(log_file, mode='a')
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(logging.INFO)
+            
+            # Stdout handler (for subprocess pipe capture by test_run.py)
+            stdout_handler = logging.StreamHandler(sys.stdout)
+            stdout_handler.setFormatter(formatter)
+            stdout_handler.setLevel(logging.INFO)
+            
+            # Configure root logger
+            root_logger = logging.getLogger()
+            root_logger.addHandler(file_handler)
+            root_logger.addHandler(stdout_handler)
+            root_logger.setLevel(logging.INFO)
+            
+            # Configure uvicorn loggers
+            uvicorn_logger = logging.getLogger("uvicorn")
+            uvicorn_logger.addHandler(file_handler)
+            uvicorn_logger.addHandler(stdout_handler)
+            uvicorn_logger.setLevel(logging.INFO)
+            
+            uvicorn_access_logger = logging.getLogger("uvicorn.access")
+            uvicorn_access_logger.addHandler(file_handler)
+            uvicorn_access_logger.addHandler(stdout_handler)
+            uvicorn_access_logger.setLevel(logging.INFO)
+            
+            uvicorn_error_logger = logging.getLogger("uvicorn.error")
+            uvicorn_error_logger.addHandler(file_handler)
+            uvicorn_error_logger.addHandler(stdout_handler)
+            uvicorn_error_logger.setLevel(logging.INFO)
         
         def run():
+            # Use simple log_level parameter for stability
             uvicorn.run(
                 self.app,
                 host=self.host,
                 port=self.port,
-                log_level="warning",
-                timeout_keep_alive=5,
-                limit_concurrency=50,
+                log_level="warning",  # Reduce noise
+                timeout_keep_alive=60,
+                limit_concurrency=100,
             )
         
-        thread = Thread(target=run, daemon=True)
+        thread = Thread(target=run, daemon=True)  # Keep as daemon thread, but with better error handling
         thread.start()
         logger.info(f"🚀 Mock Telegram server started at http://{self.host}:{self.port}")
         return thread

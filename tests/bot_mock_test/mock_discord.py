@@ -1001,36 +1001,15 @@ class MockDiscordServer:
         import sys
 
         def run():
-            if log_file:
-                # Configure logging to both file and stdout
-                import logging
-                
-                # Create formatter
-                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-                
-                # File handler
-                file_handler = logging.FileHandler(log_file, mode='a')
-                file_handler.setFormatter(formatter)
-                file_handler.setLevel(logging.WARNING)  # Only warnings and errors
-                
-                # Stdout handler (ensure same output as file)
-                stdout_handler = logging.StreamHandler(sys.stdout)
-                stdout_handler.setFormatter(formatter)
-                stdout_handler.setLevel(logging.WARNING)
-                
-                # Add handlers to uvicorn loggers
-                uvicorn_logger = logging.getLogger("uvicorn")
-                uvicorn_logger.addHandler(file_handler)
-                uvicorn_logger.addHandler(stdout_handler)
-                uvicorn_logger.setLevel(logging.WARNING)
-                
-                uvicorn_access_logger = logging.getLogger("uvicorn.access")
-                uvicorn_access_logger.addHandler(file_handler)
-                uvicorn_access_logger.addHandler(stdout_handler)
-                uvicorn_access_logger.setLevel(logging.WARNING)
-            
-            # Use 'warning' level to reduce I/O overhead
-            uvicorn.run(self.app, host=self.host, port=self.port, log_level="warning")
+            # Use simple log_level parameter for stability
+            uvicorn.run(
+                self.app, 
+                host=self.host, 
+                port=self.port, 
+                log_level="warning",  # Reduce noise
+                timeout_keep_alive=60,
+                limit_concurrency=100,
+            )
 
         thread = Thread(target=run, daemon=True)
         thread.start()

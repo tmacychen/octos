@@ -544,11 +544,7 @@ def run_bot_test(module: str, test_case: Optional[str] = None) -> bool:
     mock_code = f"""
 import time, signal, sys, logging
 from {mock_module} import {mock_class}
-
-# Suppress httpx INFO logs to reduce noise
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
 server = {mock_class}(port={port})
 server.start_background(log_file='{bot_log}')
 print('ready', flush=True)
@@ -789,13 +785,33 @@ while True:
     # Read pytest output line by line and log it
     # This ensures unified timestamp format and perfect ordering
     import sys
-    for line in iter(pytest_proc.stdout.readline, b''):
-        if line:
-            text = line.decode('utf-8', errors='ignore').rstrip()
-            if text:  # Skip empty lines
-                # Use module_logger to write pytest output with timestamp
-                # Logging will handle both file and stdout output
-                module_logger.info(f"[PYTEST] {text}")
+    while True:
+        # Check if Mock Server is still alive
+        if mock_proc.poll() is not None:
+            module_logger.error("❌ Mock Server process exited unexpectedly during tests!")
+            try:
+                stdout, _ = mock_proc.communicate(timeout=2)
+                if stdout:
+                    module_logger.error(f"Mock Server last output:\n{stdout.decode('utf-8', errors='ignore')}")
+            except Exception:
+                pass
+            break
+        
+        # Check if Bot is still alive
+        if bot_proc.poll() is not None:
+            module_logger.error("❌ Bot process exited unexpectedly during tests!")
+            break
+            
+        line = pytest_proc.stdout.readline()
+        if not line:
+            if pytest_proc.poll() is not None:
+                break
+            time.sleep(0.1)
+            continue
+            
+        text = line.decode('utf-8', errors='ignore').rstrip()
+        if text:
+            module_logger.info(f"[PYTEST] {text}")
     
     pytest_proc.wait()
     result = subprocess.CompletedProcess(
