@@ -207,6 +207,9 @@ class TestDiscordSessionCommands:
 class TestDiscordSessionActorCommands:
     """会话内控制命令 — 本地处理，无需 LLM"""
 
+    # 🔥 独立 channel_id
+    CHANNEL_ID = "20002"
+
     def test_adaptive_show(self, runner):
         """/adaptive → not enabled"""
         text = inject_and_get_reply(runner, "/adaptive", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
@@ -347,6 +350,9 @@ class TestDiscordQueueModeSteerNonAbort:
 class TestDiscordMultiUser:
     """多用户隔离 & 不同频道隔离"""
 
+    # 🔥 独立 channel_id
+    CHANNEL_ID = "20010"
+
     def test_two_channels_independent(self, runner):
         """两个不同 channel_id 的对话互不干扰"""
         CHANNEL_A = "1039178386623557754"
@@ -409,6 +415,9 @@ class TestDiscordSessionIsolation:
 @pytest.mark.llm
 class TestDiscordMessageSplitting:
     """验证 Agent 回复超过 Discord 限制时自动分片"""
+
+    # 🔥 独立 channel_id
+    CHANNEL_ID = "20006"
 
     def test_normal_message_within_limit(self, runner):
         """正常长度的消息应能成功发送"""
@@ -548,7 +557,7 @@ class TestDiscordAbortCommands:
     
     注意：abort 是本地命令识别（octos-core/src/abort.rs），不依赖 LLM。
     标记为 @pytest.mark.llm 仅因为需要完整的 gateway 环境。
-    
+
     Abort 工作原理：
     - 用户发送任务消息，octos 开始处理
     - 用户发送 abort 命令（“停” / “stop” / “cancel” 等）
@@ -744,6 +753,9 @@ class TestDiscordAbortCommands:
 class TestDiscordProfileMode:
     """验证多 profile 配置下的会话隔离"""
 
+    # 🔥 独立 channel_id
+    CHANNEL_ID = "20005"
+
     def test_profile_session_isolation(self, runner):
         """不同 channel 使用不同 profile，应该隔离"""
         CHANNEL_A = "1039178386623557754"
@@ -823,6 +835,9 @@ class TestDiscordProfileMode:
 class TestDiscordFileLimits:
     """验证 Discord 文件大小和消息长度限制"""
 
+    # 🔥 独立 channel_id
+    CHANNEL_ID = "20008"
+
     def test_large_message_handling(self, runner):
         """测试大消息处理 - Discord 限制 1900 字符"""
         # Create a message near the limit
@@ -876,10 +891,12 @@ class TestDiscordSessionSizeStress:
     测试 octos-bus/src/session.rs 中的核心功能：
     - add_message(): 追加消息到 session 并持久化到 JSONL 文件
     - append_to_disk(): 将消息写入磁盘，检查文件大小限制
-    - MAX_SESSION_FILE_SIZE = 10MB: session 文件大小上限
     
     ⚠️ 这个类必须在所有其他测试之后执行，避免大 session 文件污染后续测试。
     """
+
+    # 🔥 独立 channel_id
+    CHANNEL_ID = "20012"
 
     @pytest.mark.slow
     def test_session_accumulation_stability(self, runner):
