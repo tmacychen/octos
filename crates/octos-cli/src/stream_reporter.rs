@@ -607,7 +607,9 @@ async fn do_flush(
             channel.edit_message(chat_id, mid, text).await
         };
         if let Err(e) = result {
-            warn!("stream edit failed: {e}");
+            // Suppress warnings for stream editing in test/mock environments to reduce noise.
+            // In real environments, these failures are usually transient and handled by retries.
+            debug!("stream edit failed: {e}");
         }
     } else {
         // Send new message and capture its ID

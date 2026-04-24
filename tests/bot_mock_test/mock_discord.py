@@ -370,9 +370,35 @@ class MockDiscordServer:
             # This is what real Discord does after a message is edited
             await self._dispatch_message_update_via_gateway(message_id, channel_id, content)
 
-            # Return 204 for serenity compatibility
-            from fastapi.responses import Response
-            return Response(status_code=204)
+            # 🔥 FIX: Return a minimal Message object to satisfy Serenity's cache update logic.
+            # Returning 204 can cause serenity to fail parsing the response in some versions.
+            resp = {
+                "id": message_id,
+                "channel_id": channel_id,
+                "guild_id": DEFAULT_GUILD_ID,
+                "author": self._bot_info,
+                "content": content,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00"),
+                "edited_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00"),
+                "tts": False,
+                "mention_everyone": False,
+                "mentions": [],
+                "mention_roles": [],
+                "attachments": [],
+                "embeds": [],
+                "type": 0,
+                "flags": 0,
+                "pinned": False,
+                "member": {
+                    "user": self._bot_info,
+                    "roles": [],
+                    "joined_at": "2024-01-01T00:00:00+00:00",
+                    "deaf": False,
+                    "mute": False,
+                    "pending": False,
+                },
+            }
+            return JSONResponse(resp)
         
         # Catch-all for unmatched routes - only log in debug mode
         @app.api_route("/api/v10/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

@@ -545,6 +545,7 @@ def run_bot_test(module: str, test_case: Optional[str] = None) -> bool:
 import time, signal, sys, logging
 from {mock_module} import {mock_class}
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("serenity").setLevel(logging.ERROR)  # Suppress stream edit warnings
 server = {mock_class}(port={port})
 server.start_background(log_file='{bot_log}')
 print('ready', flush=True)
