@@ -478,6 +478,9 @@ class TestDiscordMessageSplitting:
 class TestDiscordNewCommand:
     """验证 /new 命令功能"""
 
+    # 🔥 独立 channel_id
+    CHANNEL_ID = "20003"
+
     def test_new_creates_session(self, runner):
         """发 /new → 新会话开始"""
         text = inject_and_get_reply(runner, "/new", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
