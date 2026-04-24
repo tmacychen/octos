@@ -1017,7 +1017,7 @@ class TestTelegramSessionSizeStress:
             # 清理失败不影响测试结果
 
     @pytest.mark.slow
-    @pytest.mark.skip(reason="LLM 处理大 session 文件（10MB+）超时，需要更快的 LLM 或增加 timeout")
+    #@pytest.mark.skip(reason="LLM 处理大 session 文件（10MB+）超时，需要更快的 LLM 或增加 timeout")
     def test_session_file_size_limit_enforcement(self, runner):
         """验证会话文件达到 10MB 限制后的追加行为
 

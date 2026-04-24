@@ -105,94 +105,97 @@ def cleanup_state(request, runner):
 class TestDiscordSessionCommands:
     """会话管理命令 — 本地处理，无需 LLM"""
 
+    # 🔥 独立 channel_id，避免与其他测试共享 session 状态
+    CHANNEL_ID = "20001"
+
     def test_new_default(self, runner):
         """/new → 'Session cleared.'"""
-        text = inject_and_get_reply(runner, "/new", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/new", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text == "Session cleared.", f"实际回复: {text}"
 
     def test_new_named(self, runner):
         """/new work → 'Switched to session: work'"""
-        text = inject_and_get_reply(runner, "/new work", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/new work", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text == "Switched to session: work", f"实际回复: {text}"
 
     def test_new_invalid_name(self, runner):
         """/new bad:name → 'Invalid session name:'"""
-        text = inject_and_get_reply(runner, "/new bad:name", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/new bad:name", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text.startswith("Invalid session name:"), f"实际回复: {text}"
 
     def test_switch_to_existing(self, runner):
         """/s <name> → 'Switched to session: <name>'"""
-        inject_and_get_reply(runner, "/new research", timeout=TIMEOUT_COMMAND)
-        text = inject_and_get_reply(runner, "/s research", timeout=TIMEOUT_COMMAND)
+        inject_and_get_reply(runner, "/new research", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
+        text = inject_and_get_reply(runner, "/s research", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text.startswith("Switched to session:"), f"实际回复: {text}"
 
     def test_switch_to_default(self, runner):
         """/s → 'Switched to default session.'"""
-        text = inject_and_get_reply(runner, "/s", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/s", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text == "Switched to default session.", f"实际回复: {text}"
 
     def test_sessions_list(self, runner):
         """/sessions → non-empty reply"""
-        text = inject_and_get_reply(runner, "/sessions", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/sessions", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert len(text) > 0, "Empty reply"
         print(f"\n  /sessions → {text[:100]}")
 
     def test_back_returns_session(self, runner):
         """/back → session-related reply"""
-        text = inject_and_get_reply(runner, "/back", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/back", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert "session" in text.lower(), f"Unexpected reply: {text}"
         print(f"\n  /back → {text}")
 
     def test_back_with_history(self, runner):
         """/back 在有历史会话时返回之前的会话"""
         # Create a named session first
-        inject_and_get_reply(runner, "/new history-test", timeout=TIMEOUT_COMMAND)
+        inject_and_get_reply(runner, "/new history-test", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         # Go back should return to previous or default
-        text = inject_and_get_reply(runner, "/back", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/back", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert "session" in text.lower(), f"Expected session info, got: {text}"
 
     def test_delete_session(self, runner):
         """/delete <name> → success"""
-        inject_and_get_reply(runner, "/new to-delete", timeout=TIMEOUT_COMMAND)
-        text = inject_and_get_reply(runner, "/delete to-delete", timeout=TIMEOUT_COMMAND)
+        inject_and_get_reply(runner, "/new to-delete", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
+        text = inject_and_get_reply(runner, "/delete to-delete", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text == "Deleted session: to-delete", f"实际回复: {text}"
 
     def test_delete_no_name(self, runner):
         """/delete 无名称时显示错误"""
-        text = inject_and_get_reply(runner, "/delete", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/delete", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         # 实际返回："Cannot delete the default session. Use /clear to reset it."
         assert "cannot delete" in text.lower() or "default session" in text.lower() or "clear" in text.lower(), \
             f"Expected error for /delete without name, got: {text}"
 
     def test_soul_show(self, runner):
         """/soul → non-empty reply"""
-        text = inject_and_get_reply(runner, "/soul", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/soul", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert len(text) > 0, "Empty reply"
         print(f"\n  /soul → {text[:80]}")
 
     def test_soul_set(self, runner):
         """/soul <text> → confirmation"""
-        text = inject_and_get_reply(runner, "/soul You are helpful.", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/soul You are helpful.", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text == "Soul updated. Takes effect in new sessions.", f"实际回复: {text}"
 
     def test_back_alias_b(self, runner):
         """/b 作为 /back 的别名"""
-        text = inject_and_get_reply(runner, "/b", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/b", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert "session" in text.lower(), f"Unexpected reply for /b: {text}"
 
     def test_delete_alias_d(self, runner):
         """/d 作为 /delete 的别名"""
-        inject_and_get_reply(runner, "/new temp-session", timeout=TIMEOUT_COMMAND)
-        text = inject_and_get_reply(runner, "/d temp-session", timeout=TIMEOUT_COMMAND)
+        inject_and_get_reply(runner, "/new temp-session", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
+        text = inject_and_get_reply(runner, "/d temp-session", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert "Deleted session: temp-session" in text or "deleted" in text.lower(), \
             f"Unexpected reply for /d: {text}"
 
     def test_soul_reset(self, runner):
         """/soul reset → 重置 soul"""
         # First set a soul
-        inject_and_get_reply(runner, "/soul Custom soul", timeout=TIMEOUT_COMMAND)
+        inject_and_get_reply(runner, "/soul Custom soul", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         # Then reset it
-        text = inject_and_get_reply(runner, "/soul reset", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/soul reset", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert "reset" in text.lower() or "cleared" in text.lower() or "default" in text.lower(), \
             f"Expected reset confirmation, got: {text}"
 
@@ -206,38 +209,38 @@ class TestDiscordSessionActorCommands:
 
     def test_adaptive_show(self, runner):
         """/adaptive → not enabled"""
-        text = inject_and_get_reply(runner, "/adaptive", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/adaptive", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text == "Adaptive routing is not enabled.", f"实际回复: {text}"
 
     def test_queue_show(self, runner):
         """/queue → Queue mode info"""
-        text = inject_and_get_reply(runner, "/queue", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/queue", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text.startswith("Queue mode:"), f"实际回复: {text}"
 
     def test_queue_set_followup(self, runner):
         """/queue followup → 'Queue mode set to: Followup'"""
-        text = inject_and_get_reply(runner, "/queue followup", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/queue followup", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert "Followup" in text, f"实际回复: {text}"
 
     def test_queue_set_invalid(self, runner):
         """/queue badmode → 'Unknown mode: ...'"""
-        text = inject_and_get_reply(runner, "/queue badmode", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/queue badmode", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert "Unknown mode" in text, f"实际回复: {text}"
 
     def test_status_show(self, runner):
         """/status → Status Config"""
-        text = inject_and_get_reply(runner, "/status", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/status", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert "Status Config" in text, f"实际回复: {text}"
 
     def test_reset_command(self, runner):
         """/reset → reset confirmation"""
-        text = inject_and_get_reply(runner, "/reset", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/reset", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text == "Reset: queue=collect, adaptive=off, history cleared.", \
             f"实际回复: {text}"
 
     def test_unknown_command_help(self, runner):
         """未知命令 → 帮助文本"""
-        text = inject_and_get_reply(runner, "/unknowncmd", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/unknowncmd", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text.startswith("Unknown command."), f"实际回复: {text}"
         for cmd in ["/new", "/s", "/sessions", "/back", "/delete", "/soul",
                     "/status", "/adaptive", "/reset"]:
@@ -468,12 +471,12 @@ class TestDiscordNewCommand:
 
     def test_new_creates_session(self, runner):
         """发 /new → 新会话开始"""
-        text = inject_and_get_reply(runner, "/new", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/new", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert text == "Session cleared.", f"实际回复: {text}"
 
     def test_new_named_session(self, runner):
         """发 /new <name> → 创建命名会话"""
-        text = inject_and_get_reply(runner, "/new my-test", timeout=TIMEOUT_COMMAND)
+        text = inject_and_get_reply(runner, "/new my-test", timeout=TIMEOUT_COMMAND, channel_id=self.CHANNEL_ID)
         assert "Switched to session: my-test" in text
 
 
