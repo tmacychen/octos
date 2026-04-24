@@ -25,7 +25,7 @@ class BotTestRunner(BaseMockRunner):
             "text": text,
             "chat_id": chat_id,
             "username": username,
-        })
+        }, timeout=10)
         resp.raise_for_status()
         return resp.json()
 
@@ -36,7 +36,7 @@ class BotTestRunner(BaseMockRunner):
             "data": data,
             "chat_id": chat_id,
             "message_id": message_id,
-        })
+        }, timeout=10)
         resp.raise_for_status()
         return resp.json()
 

@@ -42,7 +42,11 @@ class BaseMockRunner:
         """
         # 🔥 OPTIMIZATION: Check immediately before waiting
         # This avoids unnecessary delay if message is already available
-        msgs = self.get_sent_messages()
+        # Use short timeout to avoid blocking if Mock Server is slow
+        try:
+            msgs = self.get_sent_messages(timeout=5)
+        except httpx.HTTPError:
+            msgs = []
         if len(msgs) > count_before:
             if chat_id is not None:
                 for msg in reversed(msgs[count_before:]):
@@ -56,7 +60,10 @@ class BaseMockRunner:
         while elapsed < timeout:
             time.sleep(poll_interval)
             elapsed += poll_interval
-            msgs = self.get_sent_messages()
+            try:
+                msgs = self.get_sent_messages(timeout=5)
+            except httpx.HTTPError:
+                continue  # Mock Server 暂时不可达，继续轮询
             if len(msgs) > count_before:
                 # If chat_id specified, filter messages for this chat
                 if chat_id is not None:

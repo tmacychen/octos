@@ -17,6 +17,11 @@ Usage:
 """
 
 import asyncio
+import json
+import logging
+import os
+import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,8 +29,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 from threading import Thread
-import logging
-import sys
+import httpx
 
 # Simple logging to stderr
 logging.basicConfig(
@@ -55,6 +59,259 @@ class SentMessage:
     parse_mode: str = "Markdown"
     reply_markup: dict = field(default_factory=dict)
     reply_to_message_id: int = None
+    message_id: int = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Shared file for multi-worker uvicorn
+# All workers append to the same JSONL file; /_all_messages reads it.
+# ══════════════════════════════════════════════════════════════════════════════
+import tempfile
+_shared_msg_file = None
+
+
+def _get_msg_file() -> str:
+    global _shared_msg_file
+    if _shared_msg_file is None:
+        _shared_msg_file = tempfile.mktemp(suffix=".jsonl", prefix="mock_tg_")
+    return _shared_msg_file
+
+
+def create_app():
+    """Factory function for uvicorn multi-worker mode.
+    
+    Each worker appends sent messages to a shared JSONL file.
+    /_all_messages reads and aggregates all messages from that file.
+    """
+    import json
+    import os
+    import threading
+
+    # Per-worker storage
+    worker_updates: list = []
+    worker_next_update_id = 1
+    worker_edit_history: list = []
+    _file_lock = threading.Lock()
+    msg_file = _get_msg_file()
+    
+    app = FastAPI(title="Telegram Mock API")
+    
+    def serialize_updates(updates):
+        result = []
+        for u in updates:
+            update_dict = {"update_id": u.update_id}
+            if u.message:
+                update_dict["message"] = u.message
+            elif u.callback_query:
+                update_dict["callback_query"] = u.callback_query
+            result.append(update_dict)
+        return result
+    
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+    
+    @app.get("/_sent_messages")
+    async def get_sent_messages():
+        """Return this worker's messages (reads from shared file)"""
+        msgs = []
+        if os.path.exists(msg_file):
+            with _file_lock:
+                try:
+                    with open(msg_file) as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                msgs.append(json.loads(line))
+                except (json.JSONDecodeError, IOError):
+                    pass
+        return msgs
+    
+    @app.get("/_all_messages")
+    async def get_all_messages():
+        """Read all messages from the shared file."""
+        msgs = []
+        if os.path.exists(msg_file):
+            with _file_lock:
+                try:
+                    with open(msg_file) as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                msgs.append(json.loads(line))
+                except (json.JSONDecodeError, IOError):
+                    pass
+        return msgs
+    
+    @app.post("/_clear")
+    async def clear_state():
+        # Clear both file and in-memory state
+        with _file_lock:
+            if os.path.exists(msg_file):
+                os.remove(msg_file)
+        worker_updates.clear()
+        worker_edit_history.clear()
+        return {"ok": True}
+    
+    @app.get("/_edit_history")
+    async def get_edit_history():
+        return worker_edit_history
+    
+    @app.api_route("/bot{token}/getUpdates", methods=["GET", "POST"])
+    @app.api_route("/bot{token}/GetUpdates", methods=["GET", "POST"])
+    async def get_updates(token: str, request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        offset = data.get("offset", 0)
+        timeout = data.get("timeout", 30)
+        
+        updates = [u for u in worker_updates if u.update_id >= offset]
+        
+        if not updates and timeout > 0:
+            waited = 0.0
+            while waited < timeout:
+                await asyncio.sleep(0.2)
+                updates = [u for u in worker_updates if u.update_id >= offset]
+                if updates:
+                    break
+                waited += 0.2
+        
+        return {"ok": True, "result": serialize_updates(updates)}
+    
+    @app.api_route("/bot{token}/sendMessage", methods=["GET", "POST"])
+    @app.api_route("/bot{token}/SendMessage", methods=["GET", "POST"])
+    async def send_message(token: str, request: Request):
+        nonlocal worker_next_update_id
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        text = data.get("text", "")
+        chat_id = data.get("chat_id", 0)
+        reply_to_message_id = data.get("reply_to_message_id")
+        parse_mode = data.get("parse_mode")
+        reply_markup = data.get("reply_markup")
+        
+        msg_id = worker_next_update_id
+        worker_next_update_id += 1
+        
+        # Append to shared file (thread-safe + process-safe via file lock)
+        entry = {"chat_id": chat_id, "text": text}
+        with _file_lock:
+            with open(msg_file, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        
+        return {
+            "ok": True,
+            "result": {
+                "message_id": msg_id,
+                "chat": {"id": chat_id, "type": "private"},
+                "text": text,
+            }
+        }
+    
+    @app.api_route("/bot{token}/editMessageText", methods=["GET", "POST"])
+    async def edit_message_text(token: str, request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        text = data.get("text", "")
+        chat_id = data.get("chat_id", 0)
+        message_id = data.get("message_id", 0)
+        
+        worker_edit_history.append({
+            "type": "editMessageText",
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        })
+        
+        # Update text in shared file (re-write)
+        with _file_lock:
+            if os.path.exists(msg_file):
+                lines = []
+                with open(msg_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            obj = json.loads(line)
+                            if obj.get("message_id") == message_id:
+                                obj["text"] = text
+                            lines.append(json.dumps(obj) + "\n")
+                with open(msg_file, "w") as f:
+                    f.writelines(lines)
+        
+        return {"ok": True, "result": True}
+    
+    @app.api_route("/bot{token}/editMessageText", methods=["PATCH", "PUT"])
+    async def edit_message_text_alt(token: str, request: Request):
+        return await edit_message_text(token, request)
+    
+    @app.api_route("/bot{token}/getMe", methods=["GET", "POST"])
+    async def get_me(token: str):
+        return {
+            "ok": True,
+            "result": {
+                "id": 123456789,
+                "is_bot": True,
+                "first_name": "TestBot",
+                "username": "test_octos_bot",
+            }
+        }
+    
+    @app.post("/_inject")
+    async def inject(request: Request):
+        nonlocal worker_next_update_id
+        data = await request.json()
+        update_id = worker_next_update_id
+        worker_next_update_id += 1
+        
+        update = {
+            "update_id": update_id,
+            "message": {
+                "message_id": update_id,
+                "from": {"id": data.get("chat_id", 123), "is_bot": False},
+                "chat": {"id": data.get("chat_id", 123), "type": "private"},
+                "text": data.get("text", ""),
+                "date": 1234567890,
+            }
+        }
+        worker_updates.append(type('Update', (), update)())
+        
+        return {"ok": True, "update_id": update_id}
+    
+    @app.post("/_inject_document")
+    async def inject_document(request: Request):
+        return {"ok": True, "update_id": worker_next_update_id}
+    
+    @app.post("/_inject_callback")
+    async def inject_callback(request: Request):
+        nonlocal worker_next_update_id
+        data = await request.json()
+        update_id = worker_next_update_id
+        worker_next_update_id += 1
+        
+        update = {
+            "update_id": update_id,
+            "callback_query": {
+                "id": f"cb_{update_id}",
+                "from": {"id": data.get("chat_id", 123)},
+                "message": {"message_id": data.get("message_id", 100), "chat": {"id": data.get("chat_id", 123)}},
+                "data": data.get("data", ""),
+            }
+        }
+        worker_updates.append(type('Update', (), update)())
+        
+        return {"ok": True, "update_id": update_id}
+    
+    @app.api_route("/bot{token}/{path:path}", methods=["GET", "POST"])
+    async def catch_all(token: str, path: str, request: Request):
+        return {"ok": True, "path": path}
+    
+    return app
 
 
 class MockTelegramServer:
@@ -66,16 +323,18 @@ class MockTelegramServer:
     """
     
     def __init__(self, host: str = "127.0.0.1", port: int = 5000, 
-                 max_message_length: int = 4096):
+                 max_message_length: int = 4096, setup_routes: bool = True):
         self.host = host
         self.port = port
         self.max_message_length = max_message_length  # Telegram limit: 4096 chars
-        self.app = FastAPI(title="Telegram Mock API")
-        self._setup_routes()
         
-        # Storage
-        self._updates: list[Update] = []
-        self._sent_messages: list[SentMessage] = []
+        if setup_routes:
+            self.app = FastAPI(title="Telegram Mock API")
+            self._setup_routes()
+        
+        # Storage (only used in single-worker mode; multi-worker uses shared dict)
+        self._updates: list = []
+        self._sent_messages: list = []
         self._next_update_id = 1
         self._bot_info = {
             "id": 123456789,
@@ -87,7 +346,7 @@ class MockTelegramServer:
             "supports_inline_queries": False,
         }
         self._commands_registered = []
-        self._edit_history: list[dict] = []  # Record all edit operations for testing
+        self._edit_history: list = []  # Record all edit operations for testing
         
         # Media directory for file uploads
         import tempfile
@@ -127,7 +386,12 @@ class MockTelegramServer:
         @app.api_route("/bot{token}/sendMessage", methods=["GET", "POST"])
         @app.api_route("/bot{token}/SendMessage", methods=["GET", "POST"])
         async def send_message(token: str, request: Request):
-            """Send a message - bot calls this to reply to users"""
+            """Send a message - bot calls this to reply to users
+            
+            Messages exceeding max_message_length are automatically split into
+            multiple SentMessage entries, mirroring what the real Telegram API
+            expects and what the gateway's split_message() produces.
+            """
             data = await request.json()
             
             chat_id = data.get("chat_id")
@@ -139,29 +403,32 @@ class MockTelegramServer:
             if not chat_id:
                 raise HTTPException(status_code=400, detail="chat_id is required")
             
-            # Check message length limit (simulate Telegram's 4096 char limit)
-            if len(text) > self.max_message_length:
-                logger.warning(f"⚠️ Message too long: {len(text)} > {self.max_message_length}")
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Message is too long. Maximum length is {self.max_message_length} characters, got {len(text)}"
-                )
+            # Auto-split messages exceeding the length limit instead of rejecting.
+            # The gateway already splits via split_message() (4000 chars), but
+            # as a safety net we handle oversize messages gracefully here too.
+            chunks = [text[i:i + self.max_message_length]
+                      for i in range(0, len(text), self.max_message_length)]
             
-            message_id = self._next_update_id + 1000
-            self._sent_messages.append(SentMessage(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup or {},
-                reply_to_message_id=reply_to_message_id,
-            ))
-            
-            logger.debug(f"🤖 Bot sent message to {chat_id}: {text}")
+            first_message_id = None
+            for chunk_text in chunks:
+                self._next_update_id += 1
+                message_id = self._next_update_id + 1000
+                self._sent_messages.append(SentMessage(
+                    chat_id=chat_id,
+                    text=chunk_text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup or {},
+                    reply_to_message_id=reply_to_message_id,
+                    message_id=message_id,
+                ))
+                if first_message_id is None:
+                    first_message_id = message_id
+                logger.debug(f"🤖 Bot sent message to {chat_id}: {chunk_text[:80]}...")
             
             return {
                 "ok": True,
                 "result": {
-                    "message_id": message_id,
+                    "message_id": first_message_id,
                     "from": self._bot_info,
                     "chat": {"id": chat_id, "type": "private"},
                     "text": text,
@@ -463,6 +730,8 @@ class MockTelegramServer:
                     "chat_id": m.chat_id,
                     "text": m.text,
                     "parse_mode": m.parse_mode,
+                    "reply_to_message_id": m.reply_to_message_id,
+                    "message_id": m.message_id,
                 }
                 for m in self._sent_messages
             ]
@@ -616,72 +885,46 @@ class MockTelegramServer:
         logger.debug(f"🎯 Injected callback query: {data}")
         return update_id
     
-    def get_sent_messages(self) -> list[SentMessage]:
+    def get_sent_messages(self) -> list:
         """Get all messages sent by the bot"""
-        return self._sent_messages.copy()
+        return [{"chat_id": m.chat_id, "text": m.text} for m in self._sent_messages]
     
     def clear(self):
         """Clear all stored updates and messages"""
         self._updates.clear()
         self._sent_messages.clear()
         self._edit_history.clear()
-        # 注意：不重置 _next_update_id
-        # bot 的长轮询基于 update_id offset，重置会导致新消息被 bot 忽略
     
-    def get_edit_history(self) -> list[dict]:
-        """Get all message edit operations (for testing)"""
-        return self._edit_history.copy()
+    def get_edit_history(self) -> list:
+        resp = httpx.get(f"http://{self.host}:{self.port}/_edit_history", timeout=5)
+        return resp.json()
     
     def clear_edit_history(self):
         """Clear edit history"""
         self._edit_history.clear()
     
-    def get_last_message(self) -> SentMessage | None:
-        """Get the most recent message sent by the bot"""
-        return self._sent_messages[-1] if self._sent_messages else None
+    def get_last_message(self) -> dict | None:
+        """Get the most recent message sent by the bot (multi-worker aware)"""
+        msgs = self.get_sent_messages()
+        return msgs[-1] if msgs else None
     
     def start_background(self, log_file=None):
-        """Start the server in a background thread
-        
-        Args:
-            log_file: Optional path to log file. If provided, logs will be written to both file and stdout.
-        """
+        """Start the server in a background thread"""
         if log_file:
-            # Configure logging to both file and stdout
             from pathlib import Path
             log_path = Path(log_file)
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Create formatter
-            formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-            
-            # File handler
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setFormatter(formatter)
-            file_handler.setLevel(logging.INFO)
-            
-            # Stdout handler (ensure same output as file)
-            stdout_handler = logging.StreamHandler(sys.stdout)
-            stdout_handler.setFormatter(formatter)
-            stdout_handler.setLevel(logging.INFO)
-            
-            # Add handlers to root logger and uvicorn loggers
-            root_logger = logging.getLogger()
-            root_logger.addHandler(file_handler)
-            root_logger.addHandler(stdout_handler)
-            
-            uvicorn_logger = logging.getLogger("uvicorn")
-            uvicorn_logger.addHandler(file_handler)
-            uvicorn_logger.addHandler(stdout_handler)
-            uvicorn_logger.setLevel(logging.INFO)
-            
-            uvicorn_error_logger = logging.getLogger("uvicorn.error")
-            uvicorn_error_logger.addHandler(file_handler)
-            uvicorn_error_logger.addHandler(stdout_handler)
-            uvicorn_error_logger.setLevel(logging.INFO)
+            logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(message)s', filename=log_file, force=True)
         
         def run():
-            uvicorn.run(self.app, host=self.host, port=self.port, log_level="info")
+            uvicorn.run(
+                self.app,
+                host=self.host,
+                port=self.port,
+                log_level="warning",
+                timeout_keep_alive=5,
+                limit_concurrency=50,
+            )
         
         thread = Thread(target=run, daemon=True)
         thread.start()
