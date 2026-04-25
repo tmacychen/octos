@@ -794,6 +794,7 @@ while True:
     # This ensures unified timestamp format and perfect ordering
     import sys
     failed_tests = []  # Collect failed test names
+    error_messages = []  # Collect error messages for unknown failures
     while True:
         # Check if Mock Server is still alive
         if mock_proc.poll() is not None:
@@ -833,6 +834,9 @@ while True:
                         if test_name not in failed_tests:
                             failed_tests.append(test_name)
                         break
+            # Also capture ERROR lines that might indicate setup failures
+            elif 'ERROR' in text and ('test_' in text or 'setup' in text.lower()):
+                error_messages.append(text)
     
     pytest_proc.wait()
     result = subprocess.CompletedProcess(
@@ -848,8 +852,14 @@ while True:
         module_logger.error(f"❌ Some {module} tests failed")
         if failed_tests:
             module_logger.error(f"Failed tests: {', '.join(failed_tests)}")
+        elif error_messages:
+            # If we have error messages but no specific test names, use those
+            module_logger.error(f"Errors detected: {len(error_messages)} issues")
+            for err_msg in error_messages[:5]:  # Show first 5 errors
+                module_logger.error(f"  - {err_msg}")
     
-    return result.returncode == 0, failed_tests
+    # Return failed tests, or error messages if no tests were captured
+    return result.returncode == 0, failed_tests if failed_tests else error_messages
 
 
 def run_all_bot_tests() -> Tuple[bool, List[str]]:
@@ -867,15 +877,21 @@ def run_all_bot_tests() -> Tuple[bool, List[str]]:
     errors = []
     
     for module in modules:
-        passed, failed_tests = run_bot_test(module)
+        passed, failures = run_bot_test(module)
         if not passed:
             all_passed = False
             # Add detailed error messages for each failed test
-            if failed_tests:
-                for test_name in failed_tests:
-                    errors.append(f"{module}: {test_name}")
+            if failures:
+                for failure in failures:
+                    # If it's an error message (not a test name), format it differently
+                    if '::' in failure or failure.startswith('test_'):
+                        errors.append(f"{module}: {failure}")
+                    else:
+                        # It's an error message, truncate if too long
+                        error_summary = failure[:100] + "..." if len(failure) > 100 else failure
+                        errors.append(f"{module}: {error_summary}")
             else:
-                errors.append(f"{module}: (unknown failures)")
+                errors.append(f"{module}: (unknown failures - check logs)")
     
     return all_passed, errors
 
