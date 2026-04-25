@@ -294,17 +294,21 @@ def has_directory_changed(directory: Path, hash_file: Path) -> bool:
     return current_hashes != saved_hashes
 
 
-def build_octos() -> bool:
-    """Build octos binary with required features."""
+def build_octos(features: str = "telegram,discord,api") -> bool:
+    """Build octos binary with required features.
+    
+    Args:
+        features: Comma-separated list of features to enable (default: telegram,discord,api)
+    """
     log.info("=" * 60)
-    log.info("Building octos (telegram, discord)")
+    log.info(f"Building octos ({features})")
     log.info("=" * 60)
     
     build_log = LOG_DIR / "build.log"
     
     cmd = [
         "cargo", "build", "--release", "-p", "octos-cli",
-        "--features", "telegram,discord"
+        "--features", features
     ]
     
     try:
@@ -1049,11 +1053,6 @@ def run_serve_tests(verbose: bool = False, test_ids: Optional[List[str]] = None)
     serve_logger.info("=" * 60)
     serve_logger.info("Running Serve tests")
     serve_logger.info("=" * 60)
-    
-    # Check if binary exists
-    if not BINARY_PATH.exists():
-        serve_logger.error(f"Octos binary not found: {BINARY_PATH}")
-        return False, [f"Binary not found: {BINARY_PATH}"]
     
     # Create serve tester
     tester = OctosServeTester(BINARY_PATH, LOG_DIR)
