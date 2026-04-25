@@ -6,9 +6,10 @@ Usage:
     tests/test_run.py <command> [args...]
 
 Commands:
-    all                          Run all test suites (bot + cli)
+    all                          Run all test suites (bot + cli + serve)
     --test bot [bot-args...]     Run bot mock tests
     --test cli [cli-args...]     Run CLI tests
+    --test serve [serve-args...] Run serve tests
     -h, --help                   Show this help message
 
 Bot test arguments (after --test bot):
@@ -26,6 +27,11 @@ CLI test arguments (after --test cli):
     list                       List available test categories
     list <category>            List test cases in a category
 
+Serve test arguments (after --test serve):
+    -v, --verbose              Verbose output
+    list                       List available serve tests
+    <test_id>                  Run specific test (e.g., 8.1, server_startup)
+
 Examples:
     tests/test_run.py all                     # run everything
     tests/test_run.py --test bot              # all bot tests
@@ -37,6 +43,9 @@ Examples:
     tests/test_run.py --test cli              # CLI tests
     tests/test_run.py --test cli -v           # CLI tests, verbose
     tests/test_run.py --test cli list         # List test categories
+    tests/test_run.py --test serve            # Serve tests
+    tests/test_run.py --test serve -v         # Serve tests, verbose
+    tests/test_run.py --test serve list       # List serve tests
 
 Environment:
     ANTHROPIC_API_KEY    Required for bot LLM tests
@@ -63,9 +72,6 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-# Import CLI test module
-from cli_test.test_cli import run_cli_tests as run_cli_tests_module
-
 # Constants
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -74,9 +80,21 @@ LOG_DIR = TEST_DIR / "logs"
 BINARY_PATH = PROJECT_ROOT / "target" / "release" / "octos"
 BOT_TEST_DIR = SCRIPT_DIR / "bot_mock_test"
 CLI_TEST_DIR = SCRIPT_DIR / "cli_test"
+SERVE_TEST_DIR = SCRIPT_DIR / "serve"
 
 # Ensure directories exist
 os.makedirs(LOG_DIR, exist_ok=True)
+
+# Import CLI test module
+from cli_test.test_cli import run_cli_tests as run_cli_tests_module
+
+# Import Serve test module
+try:
+    from serve.test_serve import OctosServeTester
+    SERVE_TEST_AVAILABLE = True
+except (ImportError, ModuleNotFoundError) as e:
+    SERVE_TEST_AVAILABLE = False
+    # Don't log here, will be logged when actually used
 
 
 class LoggerManager:
@@ -168,9 +186,10 @@ def print_help():
     tests/test_run.py <command> [args...]
 
   Commands:
-    all                          Run all test suites (bot + cli)
+    all                          Run all test suites (bot + cli + serve)
     --test bot [bot-args...]     Run bot mock tests
     --test cli [cli-args...]     Run CLI tests
+    --test serve [serve-args...] Run serve tests
     -h, --help                   Show this help message
 
   Bot test arguments (after --test bot):
@@ -188,6 +207,11 @@ def print_help():
     list                       List available test categories
     list <category>            List test cases in a category
 
+  Serve test arguments (after --test serve):
+    -v, --verbose              Verbose output
+    list                       List available serve tests
+    <test_id>                  Run specific test (e.g., 8.1, server_startup)
+
   Examples:
     tests/test_run.py all                     # run everything
     tests/test_run.py --test bot              # all bot tests
@@ -199,6 +223,9 @@ def print_help():
     tests/test_run.py --test cli              # CLI tests
     tests/test_run.py --test cli -v           # CLI tests, verbose
     tests/test_run.py --test cli list         # List test categories
+    tests/test_run.py --test serve            # Serve tests
+    tests/test_run.py --test serve -v         # Serve tests, verbose
+    tests/test_run.py --test serve list       # List serve tests
 
   Environment:
     ANTHROPIC_API_KEY    Required for bot LLM tests
@@ -986,6 +1013,113 @@ def run_cli_tests(verbose: bool = False, output_dir: Optional[str] = None, scope
         return False, [f"CLI tests exception: {str(e)}"]
 
 
+def list_serve_tests():
+    """List available serve tests."""
+    print("\nAvailable Serve tests:")
+    print("  8.1  server_startup          - Server startup verification")
+    print("  8.2  rest_api_sessions       - REST API /api/sessions endpoint")
+    print("  8.3  sse_streaming           - SSE streaming response")
+    print("  8.4  dashboard_webui         - Dashboard Web UI loading")
+    print("  8.5  auth_token_required     - Auth token required (401)")
+    print("  8.6  bind_address_external   - Bind address --host 0.0.0.0 ⚠️")
+    print("  8.7  bind_address_local_default - Default bind to 127.0.0.1 ⚠️")
+    print("\n⚠️  Tests 8.6 and 8.7 have environment limitations. See README.md for details.\n")
+
+
+def run_serve_tests(verbose: bool = False, test_ids: Optional[List[str]] = None) -> Tuple[bool, List[str]]:
+    """Run serve tests.
+    
+    Args:
+        verbose: Enable verbose output
+        test_ids: Specific test IDs to run (e.g., ['8.1', '8.2']). None means all.
+    
+    Returns:
+        Tuple of (all_passed, error_messages)
+    """
+    if not SERVE_TEST_AVAILABLE:
+        log.error("Serve test module not available.")
+        log.error("Please install required dependencies:")
+        log.error("  pip install httpx pytest")
+        log.error("")
+        log.error("Or run from tests directory with proper PYTHONPATH")
+        return False, ["Serve test module import failed - missing dependencies"]
+    
+    serve_logger = logger_mgr.get_module_logger("serve")
+    
+    serve_logger.info("=" * 60)
+    serve_logger.info("Running Serve tests")
+    serve_logger.info("=" * 60)
+    
+    # Check if binary exists
+    if not BINARY_PATH.exists():
+        serve_logger.error(f"Octos binary not found: {BINARY_PATH}")
+        return False, [f"Binary not found: {BINARY_PATH}"]
+    
+    # Create serve tester
+    tester = OctosServeTester(BINARY_PATH, LOG_DIR)
+    
+    try:
+        # Start server
+        serve_logger.info("Starting octos serve...")
+        if not tester.start_server(port=8080, host="127.0.0.1"):
+            serve_logger.error("Failed to start octos serve")
+            return False, ["Failed to start server"]
+        
+        # Define all tests
+        all_tests = [
+            ("8.1", "Server Startup", tester.test_server_startup),
+            ("8.2", "REST API (/api/sessions)", tester.test_rest_api_sessions),
+            ("8.3", "SSE Streaming", tester.test_sse_streaming),
+            ("8.4", "Dashboard Web UI", tester.test_dashboard_webui),
+            ("8.5", "Auth Token Required", tester.test_auth_token_required),
+            ("8.6", "Bind Address (--host 0.0.0.0)", tester.test_bind_address_external),
+            ("8.7", "Default Bind Address (127.0.0.1)", tester.test_bind_address_local_default),
+        ]
+        
+        # Filter tests if specific IDs provided
+        if test_ids:
+            tests_to_run = []
+            for test_id in test_ids:
+                # Support both numeric (8.1) and name (server_startup) formats
+                matched = False
+                for tid, tname, tfunc in all_tests:
+                    if tid == test_id or tname.lower().replace(' ', '_') == test_id.lower():
+                        tests_to_run.append((tid, tname, tfunc))
+                        matched = True
+                        break
+                if not matched:
+                    serve_logger.warning(f"Test not found: {test_id}")
+            
+            if not tests_to_run:
+                serve_logger.error("No valid tests to run")
+                return False, [f"Invalid test IDs: {', '.join(test_ids)}"]
+        else:
+            tests_to_run = all_tests
+        
+        # Run tests
+        for test_id, test_name, test_func in tests_to_run:
+            tester.run_test(test_id, test_name, test_func)
+        
+        # Generate and save report
+        tester.save_report()
+        tester.print_report_to_stdout()
+        
+        # Determine result
+        all_passed = tester.failed == 0
+        errors = [f"{r.test_id} {r.name}: {r.details}" for r in tester.results if r.status == "FAIL"]
+        
+        if all_passed:
+            serve_logger.info("✅ All serve tests passed!")
+        else:
+            serve_logger.error(f"❌ {tester.failed} serve test(s) failed")
+        
+        return all_passed, errors
+        
+    finally:
+        # Cleanup
+        tester.stop_server()
+
+
 def parse_args():
     """Parse command line arguments."""
     # Manual parsing to handle complex nested arguments
@@ -1055,7 +1189,7 @@ def main() -> int:
             print_help()
             return 1
         
-        if test_target not in ["bot", "cli"]:
+        if test_target not in ["bot", "cli", "serve"]:
             log.error(f"Unknown test target: {test_target}")
             print_help()
             return 1
@@ -1155,6 +1289,40 @@ def main() -> int:
             prepare_test_environment()
             passed, _ = run_cli_tests(verbose, output_dir, scope)
             return 0 if passed else 1
+        
+        # Handle Serve tests
+        elif test_target == "serve":
+            if not remaining:
+                # Default: run all serve tests
+                if not build_octos():
+                    return 1
+                prepare_test_environment()
+                passed, _ = run_serve_tests()
+                return 0 if passed else 1
+            
+            action = remaining[0]
+            
+            # Help for serve
+            if action in ["-h", "--help"]:
+                print_help()
+                return 0
+            
+            # List tests
+            if action == "list":
+                list_serve_tests()
+                return 0
+            
+            # Parse options
+            verbose = "-v" in remaining or "--verbose" in remaining
+            
+            # Collect test IDs (skip flags)
+            test_ids = [arg for arg in remaining if not arg.startswith('-')]
+            
+            if not build_octos():
+                return 1
+            prepare_test_environment()
+            passed, _ = run_serve_tests(verbose, test_ids if test_ids else None)
+            return 0 if passed else 1
     
     # Handle 'all' command
     if args.command == "all":
@@ -1168,6 +1336,7 @@ def main() -> int:
             print("  tests/test_run.py all                    # Run all tests")
             print("  tests/test_run.py --test bot [args...]   # Run bot tests with options")
             print("  tests/test_run.py --test cli [args...]   # Run CLI tests with options")
+            print("  tests/test_run.py --test serve [args...] # Run serve tests with options")
             print("")
             print_help()
             return 1
@@ -1175,7 +1344,7 @@ def main() -> int:
         # Use print instead of log for final report
         print("")
         print("=" * 70)
-        print("🚀 Running ALL Test Suites (CLI + Bot)")
+        print("🚀 Running ALL Test Suites (CLI + Bot + Serve)")
         print("=" * 70)
         print("")
         
@@ -1184,8 +1353,9 @@ def main() -> int:
         
         prepare_test_environment()
         
-        # Run tests in order: CLI first, then Bot
+        # Run tests in order: CLI first, then Serve, then Bot
         cli_passed, cli_errors = run_cli_tests()
+        serve_passed, serve_errors = run_serve_tests()
         bot_passed, bot_errors = run_all_bot_tests()
         
         # Generate comprehensive report using print (not log)
@@ -1200,11 +1370,12 @@ def main() -> int:
         # Module status
         print("🔹 Module Status:")
         print(f"   • CLI Tests:   {'✅ PASSED' if cli_passed else '❌ FAILED'}")
+        print(f"   • Serve Tests: {'✅ PASSED' if serve_passed else '❌ FAILED'}")
         print(f"   • Bot Tests:   {'✅ PASSED' if bot_passed else '❌ FAILED'}")
         print("")
         
         # Overall result
-        overall_passed = cli_passed and bot_passed
+        overall_passed = cli_passed and serve_passed and bot_passed
         print(f"🎯 Overall Result: {'✅ ALL TESTS PASSED' if overall_passed else '❌ SOME TESTS FAILED'}")
         print("")
         
@@ -1228,7 +1399,13 @@ def main() -> int:
                     print(f"   • {error}")
                 print("")
             
-            print(f"📝 Total Failures: {len(bot_errors) + len(cli_errors)}")
+            if serve_errors:
+                print("🔸 Serve Test Failures:")
+                for error in serve_errors:
+                    print(f"   • {error}")
+                print("")
+            
+            print(f"📝 Total Failures: {len(cli_errors) + len(bot_errors) + len(serve_errors)}")
             print("")
         
         # Log location
