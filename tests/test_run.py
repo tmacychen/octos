@@ -390,8 +390,12 @@ def list_bot_cases(module: str):
         print(f"\nTotal: {count} test(s)\n")
 
 
-def run_bot_test(module: str, test_case: Optional[str] = None) -> bool:
-    """Run bot tests for a specific module."""
+def run_bot_test(module: str, test_case: Optional[str] = None) -> Tuple[bool, List[str]]:
+    """Run bot tests for a specific module.
+    
+    Returns:
+        Tuple of (passed, failed_test_names)
+    """
     module_logger = logger_mgr.get_module_logger(f"bot_{module}")
     
     module_logger.info("=" * 60)
@@ -404,7 +408,7 @@ def run_bot_test(module: str, test_case: Optional[str] = None) -> bool:
         required_vars.append("TELEGRAM_BOT_TOKEN")
     
     if not check_environment(required_vars):
-        return False
+        return False, []
     
     # Clean up any lingering octos processes from previous runs
     module_logger.info("Cleaning up lingering processes...")
@@ -451,7 +455,7 @@ def run_bot_test(module: str, test_case: Optional[str] = None) -> bool:
     info = module_info.get(module)
     if not info:
         module_logger.error(f"Unknown module: {module}")
-        return False
+        return False, []
     
     port = info["port"]
     test_file = info["test_file"]
@@ -461,7 +465,7 @@ def run_bot_test(module: str, test_case: Optional[str] = None) -> bool:
     test_path = BOT_TEST_DIR / test_file
     if not test_path.exists():
         module_logger.error(f"Test file not found: {test_path}")
-        return False
+        return False, []
     
     # Prepare config
     config_dir = TEST_DIR / ".octos"
@@ -602,7 +606,7 @@ while True:
         except Exception:
             pass
         
-        return False
+        return False, []
     
     mock_pid = mock_proc.pid
     module_logger.info(f"{module} Mock server running on port {port} (PID {mock_pid})")
@@ -611,7 +615,7 @@ while True:
     if not BINARY_PATH.exists():
         module_logger.error(f"Octos binary not found: {BINARY_PATH}")
         mock_proc.terminate()
-        return False
+        return False, []
     
     bot_env = {**os.environ, **extra_env}
     
@@ -758,7 +762,7 @@ while True:
         except FileNotFoundError:
             pass
         cleanup()
-        return False
+        return False, []
     
     module_logger.info("Gateway ready!")
     
@@ -789,6 +793,7 @@ while True:
     # Read pytest output line by line and log it
     # This ensures unified timestamp format and perfect ordering
     import sys
+    failed_tests = []  # Collect failed test names
     while True:
         # Check if Mock Server is still alive
         if mock_proc.poll() is not None:
@@ -816,6 +821,18 @@ while True:
         text = line.decode('utf-8', errors='ignore').rstrip()
         if text:
             module_logger.info(f"[PYTEST] {text}")
+            # Detect failed tests from pytest output
+            # Format: "test_file.py::test_name FAILED"
+            if 'FAILED' in text and '::' in text:
+                # Extract test name
+                parts = text.split()
+                for part in parts:
+                    if '::' in part and part.endswith('.py') == False:
+                        # Get the test function name
+                        test_name = part.split('::')[-1]
+                        if test_name not in failed_tests:
+                            failed_tests.append(test_name)
+                        break
     
     pytest_proc.wait()
     result = subprocess.CompletedProcess(
@@ -829,8 +846,10 @@ while True:
         module_logger.info(f"✅ All {module} tests passed!")
     else:
         module_logger.error(f"❌ Some {module} tests failed")
+        if failed_tests:
+            module_logger.error(f"Failed tests: {', '.join(failed_tests)}")
     
-    return result.returncode == 0
+    return result.returncode == 0, failed_tests
 
 
 def run_all_bot_tests() -> Tuple[bool, List[str]]:
@@ -848,9 +867,15 @@ def run_all_bot_tests() -> Tuple[bool, List[str]]:
     errors = []
     
     for module in modules:
-        if not run_bot_test(module):
+        passed, failed_tests = run_bot_test(module)
+        if not passed:
             all_passed = False
-            errors.append(f"Bot test failed: {module}")
+            # Add detailed error messages for each failed test
+            if failed_tests:
+                for test_name in failed_tests:
+                    errors.append(f"{module}: {test_name}")
+            else:
+                errors.append(f"{module}: (unknown failures)")
     
     return all_passed, errors
 
@@ -1066,7 +1091,8 @@ def main() -> int:
                     return 1
                 prepare_test_environment()
                 test_case = remaining[1] if len(remaining) > 1 else None
-                return 0 if run_bot_test(action, test_case) else 1
+                passed, _ = run_bot_test(action, test_case)
+                return 0 if passed else 1
             
             log.error(f"Unknown bot argument: {action}")
             print_help()
