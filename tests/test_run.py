@@ -63,6 +63,9 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
+# Import CLI test module
+from cli_test.test_cli import run_cli_tests as run_cli_tests_module
+
 # Constants
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -830,20 +833,26 @@ while True:
     return result.returncode == 0
 
 
-def run_all_bot_tests() -> bool:
-    """Run all bot tests (telegram + discord)."""
+def run_all_bot_tests() -> Tuple[bool, List[str]]:
+    """Run all bot tests (telegram + discord).
+    
+    Returns:
+        Tuple of (all_passed, error_messages)
+    """
     log.info("=" * 60)
     log.info("Running ALL bot tests")
     log.info("=" * 60)
     
     modules = ["telegram", "discord"]
     all_passed = True
+    errors = []
     
     for module in modules:
         if not run_bot_test(module):
             all_passed = False
+            errors.append(f"Bot test failed: {module}")
     
-    return all_passed
+    return all_passed, errors
 
 
 def list_cli_categories():
@@ -897,41 +906,43 @@ def list_cli_category_cases(category: str):
     print(f"\nTotal: {len(cases)} test(s)\n")
 
 
-def run_cli_tests(verbose: bool = False, output_dir: Optional[str] = None, scope: Optional[str] = None) -> bool:
-    """Run CLI tests."""
+def run_cli_tests(verbose: bool = False, output_dir: Optional[str] = None, scope: Optional[str] = None) -> Tuple[bool, List[str]]:
+    """Run CLI tests using the Python implementation.
+    
+    Returns:
+        Tuple of (all_passed, error_messages)
+    """
     cli_logger = logger_mgr.get_module_logger("cli")
     
     cli_logger.info("=" * 60)
     cli_logger.info("Running CLI tests")
     cli_logger.info("=" * 60)
     
-    cli_script = CLI_TEST_DIR / "cli_test.sh"
-    if not cli_script.exists():
-        cli_logger.error(f"CLI test script not found: {cli_script}")
-        return False
+    # Convert output_dir to Path if provided
+    output_path = Path(output_dir) if output_dir else None
     
-    # Build arguments
-    cli_args = ["-b", str(BINARY_PATH)]
-    if verbose:
-        cli_args.append("-v")
-    if output_dir:
-        cli_args.extend(["-o", output_dir])
-    if scope:
-        cli_args.extend(["-s", scope])
-    
-    cli_logger.info(f"Executing: bash {cli_script} {' '.join(cli_args)}")
-    
-    result = subprocess.run(
-        ["bash", str(cli_script)] + cli_args,
-        env={**os.environ, "OCTOS_TEST_DIR": str(TEST_DIR), "OCTOS_LOG_DIR": str(LOG_DIR)},
-    )
-    
-    if result.returncode == 0:
-        cli_logger.info("✅ CLI tests passed")
-    else:
-        cli_logger.error("❌ CLI tests failed")
-    
-    return result.returncode == 0
+    try:
+        # Call the Python CLI test module
+        all_passed, errors = run_cli_tests_module(
+            binary_path=BINARY_PATH,
+            test_dir=TEST_DIR,
+            log_dir=LOG_DIR,
+            verbose=verbose,
+            output_dir=output_path,
+            scope=scope
+        )
+        
+        if all_passed:
+            cli_logger.info("✅ CLI tests passed")
+        else:
+            cli_logger.error("❌ CLI tests failed")
+        
+        return all_passed, errors
+    except Exception as e:
+        cli_logger.error(f"CLI tests failed with exception: {e}")
+        import traceback
+        cli_logger.error(traceback.format_exc())
+        return False, [f"CLI tests exception: {str(e)}"]
 
 
 def parse_args():
@@ -1017,7 +1028,8 @@ def main() -> int:
                 if not build_octos():
                     return 1
                 prepare_test_environment()
-                return 0 if run_all_bot_tests() else 1
+                passed, _ = run_all_bot_tests()
+                return 0 if passed else 1
             
             action = remaining[0]
             
@@ -1039,7 +1051,8 @@ def main() -> int:
                 if not build_octos():
                     return 1
                 prepare_test_environment()
-                return 0 if run_all_bot_tests() else 1
+                passed, _ = run_all_bot_tests()
+                return 0 if passed else 1
             
             # Check if it's a valid module
             valid_modules = ["telegram", "tg", "discord", "dc"]
@@ -1066,7 +1079,8 @@ def main() -> int:
                 if not build_octos():
                     return 1
                 prepare_test_environment()
-                return 0 if run_cli_tests() else 1
+                passed, _ = run_cli_tests()
+                return 0 if passed else 1
             
             action = remaining[0]
             
@@ -1097,7 +1111,8 @@ def main() -> int:
             if not build_octos():
                 return 1
             prepare_test_environment()
-            return 0 if run_cli_tests(verbose, output_dir, scope) else 1
+            passed, _ = run_cli_tests(verbose, output_dir, scope)
+            return 0 if passed else 1
     
     # Handle 'all' command
     if args.command == "all":
@@ -1115,30 +1130,72 @@ def main() -> int:
             print_help()
             return 1
         
-        log.info("=" * 60)
-        log.info("Running ALL test suites (bot + cli)")
-        log.info("=" * 60)
+        # Use print instead of log for final report
+        print("")
+        print("=" * 70)
+        print("🚀 Running ALL Test Suites (CLI + Bot)")
+        print("=" * 70)
+        print("")
         
         if not build_octos():
             return 1
         
         prepare_test_environment()
         
-        bot_passed = run_all_bot_tests()
-        cli_passed = run_cli_tests()
+        # Run tests in order: CLI first, then Bot
+        cli_passed, cli_errors = run_cli_tests()
+        bot_passed, bot_errors = run_all_bot_tests()
         
-        log.info("")
-        log.info("=" * 60)
-        log.info("Test Summary")
-        log.info("=" * 60)
-        log.info(f"Date:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        log.info(f"Bot:     {'✅ PASSED' if bot_passed else '❌ FAILED'}")
-        log.info(f"CLI:     {'✅ PASSED' if cli_passed else '❌ FAILED'}")
-        log.info(f"Overall: {'✅ PASSED' if bot_passed and cli_passed else '❌ FAILED'}")
-        log.info(f"Logs:    {LOG_DIR}")
-        log.info("")
+        # Generate comprehensive report using print (not log)
+        print("")
+        print("=" * 70)
+        print("📊 TEST SUMMARY REPORT")
+        print("=" * 70)
+        print("")
+        print(f"📅 Test Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("")
         
-        return 0 if (bot_passed and cli_passed) else 1
+        # Module status
+        print("🔹 Module Status:")
+        print(f"   • CLI Tests:   {'✅ PASSED' if cli_passed else '❌ FAILED'}")
+        print(f"   • Bot Tests:   {'✅ PASSED' if bot_passed else '❌ FAILED'}")
+        print("")
+        
+        # Overall result
+        overall_passed = cli_passed and bot_passed
+        print(f"🎯 Overall Result: {'✅ ALL TESTS PASSED' if overall_passed else '❌ SOME TESTS FAILED'}")
+        print("")
+        
+        # Error details
+        has_errors = len(cli_errors) > 0 or len(bot_errors) > 0
+        if has_errors:
+            print("=" * 70)
+            print("❌ FAILED TESTS DETAILS")
+            print("=" * 70)
+            print("")
+            
+            if cli_errors:
+                print("🔸 CLI Test Failures:")
+                for error in cli_errors:
+                    print(f"   • {error}")
+                print("")
+            
+            if bot_errors:
+                print("🔸 Bot Test Failures:")
+                for error in bot_errors:
+                    print(f"   • {error}")
+                print("")
+            
+            print(f"📝 Total Failures: {len(bot_errors) + len(cli_errors)}")
+            print("")
+        
+        # Log location
+        print("=" * 70)
+        print(f"📁 Logs: {LOG_DIR}")
+        print("=" * 70)
+        print("")
+        
+        return 0 if overall_passed else 1
     
     return 1
 

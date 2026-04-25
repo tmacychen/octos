@@ -79,14 +79,14 @@
       "id": "2.9",
       "category": "Chat",
       "name": "cwd option",
-      "command": "chat --cwd \"{testDir}\" -m \"hello\"",
+      "command": "chat --cwd {testDir} -m \"hello\"",
       "timeout": 60
     },
     {
       "id": "2.10",
       "category": "Chat",
       "name": "data dir option",
-      "command": "chat --data-dir \"{tempDir}/.octos\" -m \"hello\"",
+      "command": "chat --data-dir {tempDir}/.octos -m \"hello\"",
       "timeout": 60
     },
     {
@@ -460,7 +460,7 @@
       "id": "5.1",
       "category": "Init",
       "name": "init defaults",
-      "command": "init --defaults --cwd \"{testDir}\"",
+      "command": "init --defaults --cwd {testDir}",
       "expected": "Created|.octos",
       "timeout": 30
     },
@@ -710,7 +710,7 @@
   "platform_overrides": {
     "windows": {
       "5.1": {
-        "command": "init --defaults --cwd \"{testDir}\"",
+        "command": "init --defaults --cwd {testDir}",
         "note": "Same command on Windows"
       },
       "16.1": {
