@@ -2967,6 +2967,7 @@ impl SessionActor {
                      /sessions — list all sessions\n\
                      /back — return to default session\n\
                      /delete — delete current session\n\
+                     /queue — view or change the queue mode\n\
                      /soul [text] — view or set persona\n\
                      /status — show agent status\n\
                      /adaptive — view adaptive routing\n\
