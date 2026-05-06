@@ -84,13 +84,18 @@ impl SlackChannel {
 
     /// Resolve the bot's own user ID via auth.test.
     async fn resolve_bot_id(&self) -> Result<String> {
+        // Allow overriding the Slack API base URL for testing (e.g., local mock server)
+        let api_base = std::env::var("SLACK_API_BASE_URL")
+            .unwrap_or_else(|_| "https://slack.com/api".to_string());
+        let api_url = format!("{}/auth.test", api_base);
+
         let resp: serde_json::Value = self
             .http
-            .post("https://slack.com/api/auth.test")
+            .post(&api_url)
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .send()
             .await
-            .wrap_err("failed to call auth.test")?
+            .wrap_err(format!("failed to call auth.test at {}", api_url))?
             .json()
             .await?;
 
@@ -102,6 +107,11 @@ impl SlackChannel {
 
     /// Post a message via chat.postMessage.
     async fn post_message(&self, channel: &str, text: &str, thread_ts: Option<&str>) -> Result<()> {
+        // Allow overriding the Slack API base URL for testing (e.g., local mock server)
+        let api_base = std::env::var("SLACK_API_BASE_URL")
+            .unwrap_or_else(|_| "https://slack.com/api".to_string());
+        let api_url = format!("{}/chat.postMessage", api_base);
+
         let mut body = serde_json::json!({
             "channel": channel,
             "text": text,
@@ -112,13 +122,13 @@ impl SlackChannel {
 
         let resp: serde_json::Value = self
             .http
-            .post("https://slack.com/api/chat.postMessage")
+            .post(&api_url)
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
             .await
-            .wrap_err("failed to call chat.postMessage")?
+            .wrap_err(format!("failed to call chat.postMessage at {}", api_url))?
             .json()
             .await?;
 
