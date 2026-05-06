@@ -52,14 +52,18 @@ impl SlackChannel {
 
     /// Get WebSocket URL via apps.connections.open.
     async fn get_ws_url(&self) -> Result<String> {
+        // Allow overriding the Slack API URL for testing (e.g., local mock server)
+        let api_url = std::env::var("SLACK_API_URL")
+            .unwrap_or_else(|_| "https://slack.com/api/apps.connections.open".to_string());
+
         let resp: serde_json::Value = self
             .http
-            .post("https://slack.com/api/apps.connections.open")
+            .post(&api_url)
             .header("Authorization", format!("Bearer {}", self.app_token))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .send()
             .await
-            .wrap_err("failed to call apps.connections.open")?
+            .wrap_err(format!("failed to call apps.connections.open at {}", api_url))?
             .json()
             .await
             .wrap_err("failed to parse apps.connections.open response")?;
