@@ -37,6 +37,13 @@ pub fn register(
         .get("verification_token")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let custom_base_url = entry
+        .settings
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
     channel_mgr.register(Arc::new(
         octos_bus::FeishuChannel::new(
             &app_id,
@@ -48,6 +55,7 @@ pub fn register(
         )
         .with_mode(&mode)
         .with_webhook_port(webhook_port)
+        .with_custom_base_url(custom_base_url)
         .with_encrypt_key(encrypt_key)
         .with_verification_token(verification_token),
     ));

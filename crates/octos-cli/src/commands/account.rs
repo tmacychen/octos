@@ -312,6 +312,7 @@ impl Executable for AccountCommand {
                         app_secret_env: secret_env.clone(),
                         mode: "webhook".to_string(),
                         region: String::new(),
+                        base_url: None,
                         webhook_port: None,
                         verification_token_env: String::new(),
                         encrypt_key_env: String::new(),

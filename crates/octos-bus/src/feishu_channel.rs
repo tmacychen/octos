@@ -618,6 +618,8 @@ pub struct FeishuChannel {
     app_id: String,
     app_secret: String,
     base_url: String,
+    /// If set, overrides the region-derived base_url (for testing).
+    custom_base_url: Option<String>,
     /// Domain root (no /open-apis path) for the WS gateway endpoint.
     domain: String,
     allowed_senders: HashSet<String>,
@@ -649,6 +651,7 @@ impl FeishuChannel {
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
             base_url: base_url_for_region(region),
+            custom_base_url: None,
             domain: domain_for_region(region),
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
@@ -684,6 +687,15 @@ impl FeishuChannel {
     /// Set verification token for event validation.
     pub fn with_verification_token(mut self, token: Option<String>) -> Self {
         self.verification_token = token;
+        self
+    }
+
+    /// Override base_url (for testing with mock servers).
+    pub fn with_custom_base_url(mut self, url: Option<String>) -> Self {
+        if let Some(url) = url {
+            self.custom_base_url = Some(url.clone());
+            self.base_url = url;
+        }
         self
     }
 

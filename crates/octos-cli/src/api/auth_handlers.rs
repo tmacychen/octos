@@ -3443,6 +3443,7 @@ pub async fn my_wechat_qr_poll(
                         .channels
                         .push(crate::profiles::ChannelCredentials::WeChat {
                             token_env: "WECHAT_BOT_TOKEN".into(),
+                            bridge_url: None,
                             base_url: "https://ilinkai.weixin.qq.com".into(),
                         });
                 }

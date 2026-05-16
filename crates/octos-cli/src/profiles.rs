@@ -843,6 +843,8 @@ pub enum ChannelCredentials {
         #[serde(default)]
         region: String,
         #[serde(default)]
+        base_url: Option<String>,
+        #[serde(default)]
         webhook_port: Option<u16>,
         #[serde(default)]
         verification_token_env: String,
@@ -911,6 +913,8 @@ pub enum ChannelCredentials {
     WeChat {
         #[serde(default = "default_wechat_token_env")]
         token_env: String,
+        #[serde(default)]
+        bridge_url: Option<String>,
         #[serde(default = "default_wechat_base_url")]
         base_url: String,
     },
@@ -1633,6 +1637,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             app_secret_env,
             mode,
             region,
+            base_url,
             webhook_port,
             verification_token_env,
             encrypt_key_env,
@@ -1646,6 +1651,9 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             }
             if !region.is_empty() {
                 settings["region"] = serde_json::json!(region);
+            }
+            if let Some(url) = base_url {
+                settings["base_url"] = serde_json::json!(url);
             }
             if let Some(port) = webhook_port {
                 settings["webhook_port"] = serde_json::json!(port);
@@ -1744,14 +1752,21 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
         }),
         ChannelCredentials::WeChat {
             token_env,
+            bridge_url,
             base_url,
-        } => serde_json::json!({
-            "type": "wechat",
-            "settings": {
+        } => {
+            let mut settings = serde_json::json!({
                 "token_env": token_env,
                 "base_url": base_url,
+            });
+            if let Some(url) = bridge_url {
+                settings["bridge_url"] = serde_json::json!(url);
             }
-        }),
+            serde_json::json!({
+                "type": "wechat",
+                "settings": settings,
+            })
+        },
         ChannelCredentials::Line {
             channel_secret_env,
             channel_access_token_env,
@@ -3261,6 +3276,7 @@ mod tests {
                 app_secret_env: "FSE".into(),
                 mode: String::new(),
                 region: String::new(),
+                base_url: None,
                 webhook_port: None,
                 verification_token_env: String::new(),
                 encrypt_key_env: String::new(),
