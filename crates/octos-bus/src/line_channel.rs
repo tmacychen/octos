@@ -34,6 +34,21 @@ use crate::media::{download_media, is_image};
 const LINE_API_BASE: &str = "https://api.line.me";
 const LINE_DATA_API_BASE: &str = "https://api-data.line.me";
 
+/// Read `LINE_API_BASE_URL` env var for testing against a mock server.
+fn line_api_base() -> String {
+    std::env::var("LINE_API_BASE_URL").unwrap_or_else(|_| LINE_API_BASE.to_string())
+}
+
+fn line_data_api_base() -> String {
+    let base = line_api_base();
+    if base != LINE_API_BASE {
+        // Mock mode: use the same base for data API
+        base
+    } else {
+        LINE_DATA_API_BASE.to_string()
+    }
+}
+
 /// HMAC-SHA256 for LINE webhook signature validation
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     const BLOCK_SIZE: usize = 64;
@@ -161,7 +176,7 @@ impl LineChannel {
     async fn fetch_bot_user_id(&self) -> Result<String> {
         let resp: serde_json::Value = self
             .http
-            .get(format!("{LINE_API_BASE}/v2/bot/info"))
+            .get(format!("{}/v2/bot/info", line_api_base()))
             .header("Authorization", self.auth_header())
             .send()
             .await
@@ -284,7 +299,7 @@ impl LineChannel {
 
     /// Download binary content for a user-sent message
     async fn download_line_content(&self, message_id: &str, ext: &str) -> Result<PathBuf> {
-        let url = format!("{LINE_DATA_API_BASE}/v2/bot/message/{message_id}/content");
+        let url = format!("{}/v2/bot/message/{message_id}/content", line_data_api_base());
         let filename = format!("line_{}{ext}", Utc::now().timestamp_millis());
         download_media(
             &self.http,
@@ -313,7 +328,7 @@ impl LineChannel {
 
         let resp: serde_json::Value = self
             .http
-            .post(format!("{LINE_DATA_API_BASE}/v2/bot/message/upload"))
+            .post(format!("{}/v2/bot/message/upload", line_data_api_base()))
             .header("Authorization", self.auth_header())
             .multipart(form)
             .send()
@@ -488,7 +503,7 @@ impl LineChannel {
 
         let resp = self
             .http
-            .post(format!("{LINE_API_BASE}/v2/bot/message/push"))
+            .post(format!("{}/v2/bot/message/push", line_api_base()))
             .header("Authorization", self.auth_header())
             .header("Content-Type", "application/json")
             .json(&body)
