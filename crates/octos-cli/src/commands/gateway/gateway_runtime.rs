@@ -1576,30 +1576,39 @@ impl GatewayRuntime {
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
-            let shutdown_notified = shutdown_notify.notified();
-            tokio::pin!(shutdown_notified);
-            if self.shutdown.load(Ordering::Acquire) {
-                break;
+
+            // Drain session deletions without blocking
+            loop {
+                let sid = tokio::time::timeout(
+                    std::time::Duration::ZERO,
+                    self.session_delete_rx.recv(),
+                )
+                .await;
+                match sid {
+                    Ok(Some(id)) => {
+                        tracing::debug!(session = %id, "stopping actor for deleted session");
+                        self.actor_registry.remove_session(&id);
+                        continue;
+                    }
+                    _ => break,
+                }
             }
 
+            // Wait for inbound message or shutdown signal.
+            // NOTE: Creates a fresh `Notified` each iteration — reusing a pinned
+            // future (via `tokio::pin!` + `&mut`) caused the select to stall
+            // because the one-shot Notified stayed resolved after a spurious
+            // wake, starving the `recv_inbound` arm.
             let mut inbound = tokio::select! {
-                biased;
-                _ = &mut shutdown_notified => {
+                _ = shutdown_notify.notified() => {
                     if self.shutdown.load(Ordering::Acquire) {
                         break;
                     }
                     continue;
                 }
-                session_id = self.session_delete_rx.recv() => {
-                    if let Some(id) = session_id {
-                        tracing::debug!(session = %id, "stopping actor for deleted session");
-                        self.actor_registry.remove_session(&id);
-                    }
-                    continue;
-                }
-                inbound = self.agent_handle.recv_inbound() => {
-                    match inbound {
-                        Some(inbound) => inbound,
+                msg = self.agent_handle.recv_inbound() => {
+                    match msg {
+                        Some(m) => m,
                         None => break,
                     }
                 }

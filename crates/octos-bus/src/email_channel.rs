@@ -76,6 +76,7 @@ impl Channel for EmailChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("Re: Message");
 
+        info!(to = %msg.chat_id, subject = %subject, "email_channel.send: sending SMTP reply");
         smtp_send(&self.config, &msg.chat_id, subject, &msg.content).await
     }
 
@@ -184,13 +185,22 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
     // Stream dropped — session is free again.
 
     // Mark all fetched as seen
-    session.store(&seq_set, "+FLAGS (\\Seen)").await.ok();
+    if let Err(e) = session.store(&seq_set, "+FLAGS (\\Seen)").await {
+        warn!("Failed to mark emails as seen: {e}");
+    }
     session.logout().await.ok();
-
-    // Send parsed emails as inbound messages
     let mut count = 0;
     for (from, subject, text_body) in parsed_emails {
         let sender_email = extract_email_address(&from);
+
+        // Skip messages that are replies sent by the bot itself (SMTP outbound
+        // echoes back as UNSEEN) to prevent infinite reply loops.
+        let is_bot_sender = sender_email.eq_ignore_ascii_case(&config.username)
+            || sender_email.eq_ignore_ascii_case(&config.from_address);
+        if is_bot_sender && subject.trim().to_lowercase().starts_with("re:") {
+            info!(sender = %sender_email, subject = %subject, "email_channel: skipping self-sent reply");
+            continue;
+        }
 
         let content = if subject.is_empty() {
             text_body
@@ -198,18 +208,20 @@ async fn imap_poll(config: &EmailConfig, tx: &mpsc::Sender<InboundMessage>) -> R
             format!("[Subject: {subject}]\n{text_body}")
         };
 
+        info!(sender = %sender_email, subject = %subject, "email_channel: forwarding to agent");
+
         let inbound = InboundMessage {
             channel: "email".into(),
             sender_id: sender_email.clone(),
-            chat_id: sender_email,
+            chat_id: sender_email.clone(),
             content,
             timestamp: Utc::now(),
             media: vec![],
             metadata: serde_json::json!({ "subject": subject }),
             message_id: None,
         };
-
         if tx.send(inbound).await.is_err() {
+            warn!("email_channel: inbound receiver dropped, stopping");
             break;
         }
         count += 1;
